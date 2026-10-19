@@ -168,7 +168,7 @@ void ap2_mrp_stop(struct ap2_mrp_ctx *m);
  * new bytes stage under a fresh identifier, a rejected image clears staging,
  * and no artwork drops the retained image only when the track changed.
  *
- * :param duration_ms: track duration in milliseconds (0 = unknown/live).
+ * :param duration_ms: track duration in milliseconds (0 = unknown; not a live flag).
  * :param item_id: sender's stable per-track identity ("" or NULL = none).
  * :param mime: artwork MIME type; must be "image/jpeg".
  * :param art: artwork bytes (copied); NULL/empty = no artwork for this track.
@@ -182,13 +182,24 @@ bool ap2_mrp_set_track(struct ap2_mrp_ctx *m, const char *title,
                        const char *mime, const uint8_t *art, int art_len,
                        bool *track_changed_out, ap2_mrp_artwork_info_t *info);
 
+/* Explicit-live variant of set_track. Live clears any retained finite duration
+ * even for the same item and ignores subsequent finite progress totals. The
+ * flag and track/artwork are applied together under the caller's state lock.
+ * Legacy set_track/set_metadata calls select non-live behavior. */
+bool ap2_mrp_set_track_live(struct ap2_mrp_ctx *m, const char *title,
+                            const char *artist, const char *album,
+                            int duration_ms, bool is_live, const char *item_id,
+                            const char *mime, const uint8_t *art, int art_len,
+                            bool *track_changed_out,
+                            ap2_mrp_artwork_info_t *info);
+
 /*
  * Set the now-playing track metadata without artwork: ap2_mrp_set_track with
  * no image, so a track change drops the retained artwork. Values are copied;
  * NULL is treated as empty. Takes effect on the next feedback-worker state
  * push.
  *
- * :param duration_ms: track duration in milliseconds (0 = unknown/live).
+ * :param duration_ms: track duration in milliseconds (0 = unknown; not a live flag).
  * :param item_id: sender's stable per-track identity ("" or NULL = none).
  */
 bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
@@ -234,7 +245,7 @@ const char *ap2_mrp_artwork_result_name(ap2_mrp_artwork_result_t result);
  * Set playback progress and state.
  *
  * :param elapsed_ms: elapsed position in milliseconds.
- * :param duration_ms: track duration in milliseconds (0 = unknown/live).
+ * :param duration_ms: total in milliseconds (0 = unknown; ignored while live).
  * :param playing: true = Playing, false = Paused.
  */
 bool ap2_mrp_set_progress(struct ap2_mrp_ctx *m, int elapsed_ms,

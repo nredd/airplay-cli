@@ -1718,6 +1718,65 @@ static void test_mrp_identical_metadata_skip(void)
     puts("ap2_client identical metadata skip tests passed");
 }
 
+/* Live-only changes must bypass identical-bundle dedupe and re-advertise
+ * controls on the real RTSP publication path, in both directions. */
+static void test_mrp_live_transition_publication(void)
+{
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    command_peer_t *peer = calloc(1, sizeof(*peer));
+    assert(peer);
+    peer->fd = sockets[1];
+    peer->expected_requests = 16; /* initial six, then five per transition */
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, run_command_peer, peer) == 0);
+    ap2_device_info_t device = {.name = "live", .address = "127.0.0.1", .port = 7000};
+    ap2_audio_format_t format = {.sample_rate = 44100, .bit_depth = 16, .channels = 2};
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 600, 50);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+    struct ap2_mrp_ctx *mrp = ap2_mrp_create(
+        "127.0.0.1", 7000, NULL, "0011223344556677", "live", NULL, NULL, NULL, 0);
+    assert(mrp);
+    ap2cl_test_set_mrp(client, mrp);
+    for (int i = 0; i < 3; i++) {
+        ap2_mrp_push_result_t push;
+        assert(ap2cl_set_metadata_live_ex(client, "Station", "", "", 0,
+            i == 1, "station-id", NULL, NULL, 0, NULL, NULL, &push));
+        assert(push.overall_status == 200);
+        /* An identical resend within the same mode remains a no-op. */
+        assert(ap2cl_set_metadata_live_ex(client, "Station", "", "", 0,
+            i == 1, "station-id", NULL, NULL, 0, NULL, NULL, &push));
+        assert(push.overall_status == -1);
+    }
+    assert(pthread_join(thread, NULL) == 0);
+    assert(peer->ok && peer->request_count == 16);
+    int npi = 0, commands = 0;
+    for (int i = 0; i < peer->request_count; i++) {
+        command_peer_request_t *req = &peer->requests[i];
+        if (request_has(req, "updateMRNowPlayingInfo")) {
+            assert(request_has(req, "kMRMediaRemoteNowPlayingInfoIsAlwaysLive") == (npi == 1));
+            assert(!request_has(req, "kMRMediaRemoteNowPlayingInfoDuration"));
+            npi++;
+        }
+        if (request_has(req, "updateMRSupportedCommands")) {
+            size_t count = 0;
+            assert(ap2_bplist_find_array_count(req->body, (size_t)req->body_len,
+                "mrSupportedCommandsFromSender", &count));
+            assert(count == (commands == 1 ? 5 : 15));
+            commands++;
+        }
+    }
+    assert(npi == 3 && commands == 3);
+    ap2cl_test_detach_rtsp_socket(client);
+    assert(close(sockets[0]) == 0 && close(sockets[1]) == 0);
+    assert(ap2cl_destroy(client));
+    free(peer);
+    puts("ap2_client live transition publication tests passed");
+}
+
 /* An explicit --protocol airplay2 reaches the native flow on exactly the same
  * terms as auto, so an AirPlay-2-only receiver (no _raop service to fall back
  * on) is not routed into a RAOP-compatible flow it cannot answer. Only a real
@@ -2679,6 +2738,7 @@ int main(void)
     test_stock_pause_resume_reanchors();
     test_mrp_bundle_and_pause_publish();
     test_mrp_identical_metadata_skip();
+    test_mrp_live_transition_publication();
     test_feedback_miss_tolerated_then_recovered();
     test_dead_channel_writes_farewell_teardown();
     test_apple_model_resolution();

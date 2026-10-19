@@ -326,6 +326,15 @@ class NativeSenderProbeTest(unittest.TestCase):
         self.assertEqual(
             probe.safe_fields(b"[EVENT] remote command=hidden", "remote"), {}
         )
+        self.assertEqual(
+            probe.safe_fields(
+                b'[STATUS] error code=auth_required http=403 detail="hidden"', "error"
+            ),
+            {"code": "auth_required", "http": "403"},
+        )
+        self.assertEqual(
+            probe.safe_fields(b"[STATUS] error code=hidden http=hidden", "error"), {}
+        )
 
     def test_reader_bounds_and_terminal_latches(self) -> None:
         """Flooding and oversized secret lines cannot hide a terminal error."""

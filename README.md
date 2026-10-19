@@ -423,7 +423,9 @@ session SETUP; `CLIAIRPLAY_PROBE_MULTISELECT=1` adds only
 malformed values preserve the original SETUP bytes in both PTP and NTP flows.
 The helper exposes `--sender-relay {0,1}` and `--multiselect {0,1}` (both default
 `0`), never inherits these overrides, and records fixed safe configuration
-values as JSON, not addresses, paths, keys, or raw child logs. These declarations
+values as JSON, not addresses, paths, keys, or raw child logs. Failure reports
+retain only fixed error codes and bounded HTTP statuses, never detail strings.
+These declarations
 may provoke unsupported relay messages: there is NO semantic relay handler,
 full native UI claim, or release intent.
 

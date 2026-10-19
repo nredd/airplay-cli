@@ -25,8 +25,23 @@ VERSION = re.compile(rb"cliairplay v[0-9A-Za-z][0-9A-Za-z.+_-]{0,127} check\r?\n
 MACHINE = re.compile(rb"\[(STATUS|EVENT)\] ([A-Za-z][A-Za-z0-9_]{0,63})(?: |\r?$)")
 AUDIO = re.compile(rb"buffered_ms=[1-9][0-9]{0,19}$")
 MRP_STATUS = re.compile(rb"(?:-1|0|1|[1-5][0-9]{2})$")
+HTTP_STATUS = re.compile(rb"(?:0|[1-5][0-9]{2})$")
 SAFE_FIELDS: dict[str, dict[bytes, set[bytes]]] = {
     "mrp": {b"path": {b"channel", b"command"}},
+    "error": {
+        b"code": {
+            b"auth_required",
+            b"auth_failed",
+            b"connect_failed",
+            b"start_failed",
+            b"flush_failed",
+            b"standby_failed",
+            b"play_failed",
+            b"pause_failed",
+            b"stop_failed",
+            b"announce_failed",
+        },
+    },
     "clock_ready": {
         b"mode": {b"ptp", b"ntp"},
         b"state": {b"cold", b"probing", b"ready", b"stalled"},
@@ -55,8 +70,10 @@ def safe_fields(chunk: bytes, name: str) -> dict[str, str]:
     allowed = SAFE_FIELDS.get(name, {})
     for field in chunk.split()[2:]:
         key, _, value = field.partition(b"=")
-        if value in allowed.get(key, set()) or (
-            name == "mrp" and key == b"status" and MRP_STATUS.fullmatch(value)
+        if (
+            value in allowed.get(key, set())
+            or (name == "mrp" and key == b"status" and MRP_STATUS.fullmatch(value))
+            or (name == "error" and key == b"http" and HTTP_STATUS.fullmatch(value))
         ):
             result[key.decode("ascii")] = value.decode("ascii")
     return result

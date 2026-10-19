@@ -127,9 +127,28 @@ def stop(child: subprocess.Popen[bytes]) -> None:
     child.wait()
 
 
-def child_env(type130: int) -> dict[str, str]:
-    """Pass only platform runtime variables, never inherited auth or tokens."""
-    return {
+def child_env(
+    type130: int, sender_relay: int = 0, multiselect: int = 0, ptp_follow: str = "auto"
+) -> dict[str, str]:
+    """Allowlist runtime variables; opt into declarations and clock role explicitly.
+
+    Parameters:
+        type130 (int): Fixed channel toggle, 0 or 1.
+        sender_relay (int): Experimental relay declaration, 0 or 1.
+        multiselect (int): Experimental multiselect declaration, 0 or 1.
+        ptp_follow (str): Pre-SETUP clock role, auto, 0 or 1.
+
+    Returns:
+        dict[str, str]: Child environment without inherited probe overrides.
+    """
+    if (
+        type130 not in (0, 1)
+        or sender_relay not in (0, 1)
+        or multiselect not in (0, 1)
+        or ptp_follow not in ("auto", "0", "1")
+    ):
+        raise ValueError("Expected fixed probe enums")
+    env = {
         key: os.environ[key]
         for key in ("PATH", "SYSTEMROOT", "TMPDIR")
         if key in os.environ
@@ -138,6 +157,13 @@ def child_env(type130: int) -> dict[str, str]:
         "CLIAIRPLAY_MRP_TYPE130": str(type130),
         "CLIAIRPLAY_BUFFERED": "0",
     }
+    if sender_relay == 1:
+        env["CLIAIRPLAY_PROBE_SENDER_RELAY"] = "1"
+    if multiselect == 1:
+        env["CLIAIRPLAY_PROBE_MULTISELECT"] = "1"
+    if ptp_follow != "auto":
+        env["CLIAIRPLAY_PTP_FOLLOW"] = ptp_follow
+    return env
 
 
 def check_binary(binary: str, env: dict[str, str], deadline: float) -> None:
@@ -159,7 +185,7 @@ def check_binary(binary: str, env: dict[str, str], deadline: float) -> None:
 def probe(opts: argparse.Namespace) -> bool:
     """Run one sender within one absolute TTL; always clean up the FIFO and child."""
     deadline = time.monotonic() + opts.duration
-    env = child_env(opts.type130)
+    env = child_env(opts.type130, opts.sender_relay, opts.multiselect, opts.ptp_follow)
     check_binary(str(opts.binary), env, deadline)
     if time.monotonic() >= deadline:
         return False
@@ -252,7 +278,7 @@ def probe(opts: argparse.Namespace) -> bool:
                 return (
                     ready
                     and not reader.failed.is_set()
-                    and exited in (None, 0)
+                    and exited is None
                     and not (opts.timing == "ptp" and reader.ntp_seen.is_set())
                 )
         finally:
@@ -285,6 +311,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--duration", type=int, choices=range(1, 121), default=45)
     result.add_argument("--debug", type=int, choices=(0, 1), default=0)
     result.add_argument("--timing", choices=("ntp", "ptp"), default="ntp")
+    result.add_argument("--sender-relay", type=int, choices=(0, 1), default=0)
+    result.add_argument("--multiselect", type=int, choices=(0, 1), default=0)
+    result.add_argument("--ptp-follow", choices=("auto", "0", "1"), default="auto")
     return result
 
 
@@ -296,6 +325,16 @@ def interrupted(signum: int, frame: object) -> None:
 def main(argv: list[str] | None = None) -> int:
     """Emit a sanitized final result even for runtime failure or interruption."""
     opts = parser().parse_args(argv)
+    emit(
+        "configuration",
+        type130=opts.type130,
+        timing=opts.timing,
+        debug=opts.debug,
+        duration=opts.duration,
+        sender_relay=opts.sender_relay,
+        multiselect=opts.multiselect,
+        ptp_follow=opts.ptp_follow,
+    )
     previous = signal.signal(signal.SIGTERM, interrupted)
     success = False
     reason = "not_started"

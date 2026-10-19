@@ -19,6 +19,7 @@
 #include "ap2_client.h"
 #include "ap2_hap.h"
 #include "ap2_io.h"
+#include "ap2_plist.h"
 #include "cross_log.h"
 #include "host_clock.h"
 #include "raop_client.h"
@@ -2715,8 +2716,62 @@ static void test_libraop_ntp_follows_host_clock(void)
     puts("ap2_client libraop host clock test passed");
 }
 
+/* Full byte comparison against the original writers catches extra fields,
+ * wrong scalar types, reordered defaults, and accidental writer replacement. */
+int ap2cl_test_probe_setup(bool ptp, uint8_t **out);
+
+static void test_probe_setup_declarations(void)
+{
+    static const char *const values[] = {
+        NULL, "0", "", "true", "yes", "01", "1 ", " 1", "-1", "2", "1"
+    };
+    for (int ptp = 0; ptp <= 1; ptp++) {
+        for (size_t r = 0; r < sizeof(values) / sizeof(values[0]); r++) {
+            for (size_t m = 0; m < sizeof(values) / sizeof(values[0]); m++) {
+                const char *relay = values[r], *multi = values[m];
+                if (relay) assert(setenv("CLIAIRPLAY_PROBE_SENDER_RELAY", relay, 1) == 0);
+                else assert(unsetenv("CLIAIRPLAY_PROBE_SENDER_RELAY") == 0);
+                if (multi) assert(setenv("CLIAIRPLAY_PROBE_MULTISELECT", multi, 1) == 0);
+                else assert(unsetenv("CLIAIRPLAY_PROBE_MULTISELECT") == 0);
+                bool want_relay = relay && strcmp(relay, "1") == 0;
+                bool want_multi = multi && strcmp(multi, "1") == 0;
+                uint8_t *expected = NULL, *actual = NULL;
+                int expected_len;
+                if (ptp) {
+                    ap2_pl_node *root = ap2_pl_dict();
+                    ap2_pl_dict_set(root, "timingProtocol", ap2_pl_string("PTP"));
+                    if (want_relay)
+                        ap2_pl_dict_set(root, "senderSupportsRelay", ap2_pl_bool(true));
+                    if (want_multi)
+                        ap2_pl_dict_set(root, "isMultiSelectAirPlay", ap2_pl_bool(true));
+                    expected_len = ap2_pl_serialize(root, &expected);
+                    ap2_pl_free(root);
+                } else {
+                    struct ap2_plist *root = ap2_plist_create();
+                    ap2_plist_add_string(root, "timingProtocol", "NTP");
+                    if (want_relay)
+                        ap2_plist_add_bool(root, "senderSupportsRelay", true);
+                    if (want_multi)
+                        ap2_plist_add_bool(root, "isMultiSelectAirPlay", true);
+                    expected_len = ap2_plist_serialize(root, &expected);
+                    ap2_plist_free(root);
+                }
+                int actual_len = ap2cl_test_probe_setup(ptp, &actual);
+                assert(expected_len > 0 && actual_len == expected_len);
+                assert(memcmp(actual, expected, (size_t)expected_len) == 0);
+                free(actual);
+                free(expected);
+            }
+        }
+    }
+    assert(unsetenv("CLIAIRPLAY_PROBE_SENDER_RELAY") == 0);
+    assert(unsetenv("CLIAIRPLAY_PROBE_MULTISELECT") == 0);
+    puts("ap2_client experimental SETUP declarations test passed");
+}
+
 int main(void)
 {
+    test_probe_setup_declarations();
     test_host_clock_defaults_to_realtime();
     test_retransmit_responder();
     test_route_with_password();

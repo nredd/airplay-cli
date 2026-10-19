@@ -1900,6 +1900,24 @@ static bool ap2_native_pair(struct ap2cl_s *p)
     return false;
 }
 
+/* Experimental declarations only, not relay-message support. Exactly one
+ * writer is supplied: keep both existing session writers byte-identical when
+ * disabled. Unlike general toggles, ONLY the literal "1" opts into this probe. */
+static void ap2_probe_setup_declarations(ap2_pl_node *ptp, struct ap2_plist *ntp)
+{
+    if (!ptp && !ntp) return;
+    static const struct { const char *env; const char *key; } fields[] = {
+        { "CLIAIRPLAY_PROBE_SENDER_RELAY", "senderSupportsRelay" },
+        { "CLIAIRPLAY_PROBE_MULTISELECT", "isMultiSelectAirPlay" },
+    };
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+        const char *value = getenv(fields[i].env);
+        if (!value || strcmp(value, "1") != 0) continue;
+        if (ptp) ap2_pl_dict_set(ptp, fields[i].key, ap2_pl_bool(true));
+        else ap2_plist_add_bool(ntp, fields[i].key, true);
+    }
+}
+
 static bool ap2_native_connect(struct ap2cl_s *p)
 {
     /* Default outcome for every failure path below; the auth-aware sites
@@ -2067,6 +2085,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         ap2_pl_array_append(peer_list, ap2_make_timing_peer(peer_id, timeline_id, our_addr));
         ap2_pl_dict_set(root, "timingPeerList", peer_list);
 
+        ap2_probe_setup_declarations(root, NULL);
         plist_len = ap2_pl_serialize(root, &plist_data);
         ap2_pl_free(root);
         LOG_INFO("[AP2] PTP session SETUP (%d bytes, timelineID=%016llx%s, addr=%s)",
@@ -2078,6 +2097,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         ap2_plist_add_string(sp, "sessionUUID", p->session_uuid);
         ap2_plist_add_int(sp, "timingPort", timing_port);
         ap2_plist_add_string(sp, "timingProtocol", "NTP");
+        ap2_probe_setup_declarations(NULL, sp);
         plist_len = ap2_plist_serialize(sp, &plist_data);
         ap2_plist_free(sp);
     }
@@ -5655,6 +5675,26 @@ bool ap2cl_is_playing(struct ap2cl_s *p)
 }
 
 #ifdef AP2_TESTING
+/* Serialize a fixed session-shaped body to exercise declaration additions
+ * without pairing, clocks, sockets, or random session identifiers. */
+int ap2cl_test_probe_setup(bool ptp, uint8_t **out)
+{
+    if (ptp) {
+        ap2_pl_node *root = ap2_pl_dict();
+        ap2_pl_dict_set(root, "timingProtocol", ap2_pl_string("PTP"));
+        ap2_probe_setup_declarations(root, NULL);
+        int len = ap2_pl_serialize(root, out);
+        ap2_pl_free(root);
+        return len;
+    }
+    struct ap2_plist *root = ap2_plist_create();
+    ap2_plist_add_string(root, "timingProtocol", "NTP");
+    ap2_probe_setup_declarations(NULL, root);
+    int len = ap2_plist_serialize(root, out);
+    ap2_plist_free(root);
+    return len;
+}
+
 /* Hand the client a ready MRP context without a paired session, so a test can
  * drive the /command now-playing path against a scripted RTSP peer. The
  * client takes ownership (ap2cl_destroy frees it). */

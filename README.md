@@ -379,6 +379,45 @@ MRP artwork is omitted without withholding it from DMAP and clears stale state.
 matrix or records/sends any existing JPEG cache path with its SHA-256, profile,
 dimensions, and full Pillow/libjpeg decode result; see `DESIGN.md` §8.
 
+## Native sender diagnostic
+
+`scripts/native_sender_probe.py` is a standalone stdlib-only diagnostic, not a
+passive observer. **It replaces the selected receiver session.** Get explicit
+authorization and use an idle target, never a receiver playing another session.
+It sends 44.1 kHz signed 16-bit stereo silence at volume zero, forces native AP2
+with `--timing ntp` by default (no shared PTP conflict), and uses a separate fixed
+DACP identity. `CLIAIRPLAY_BUFFERED=0` forces controlled realtime streaming.
+It does not inspect or make claims about receiver UI state.
+
+Authorized idle-target example (run by the operator on the HA host only):
+
+```bash
+python3 scripts/native_sender_probe.py \
+  --binary /data/airplay-native-probe/cliairplay-linux-aarch64 \
+  --host 192.168.1.50 --bind 192.168.1.10 --type130 1 --duration 45
+```
+
+Use only an independently verified binary. `--host` and `--bind` require literal
+IPv4; `--type130` is required (`0` or `1`). `--duration` is 1..120 seconds (default
+45), including the three-second `--check` and connection/setup wait (at most 20
+seconds). `--timing ptp` requires `clock_ready mode=ptp state=ready`; an NTP
+fallback fails the test. Both modes require connected + buffered audio before
+metadata and START. PTP needs exclusive access to ports 319/320: the operator may
+briefly stop stable MA, run both type-130 values under the same PTP flow, and MUST
+restart MA in their cleanup. This helper neither stops nor restarts MA.
+There are no retries or TTL extensions. Teardown may take three extra seconds
+before KILL. `--debug 0` (default) or `1` does not suppress machine status.
+Metadata and START are sent atomically only after setup readiness. JSON stdout emits
+bounded status/event names plus allowlisted route, clock and MRP-path enums/status
+codes, one `ready` on `started`, and a final `result`;
+exit zero requires connected + started with no terminal failure. Neither raw
+child output nor metadata fields/pairing material are emitted or persisted;
+credentials are not accepted and inherited auth/token environment is excluded.
+SIGTERM, Ctrl-C and failures reap the child and remove the FIFO.
+
+Keep any Apple-source reference playing on a different receiver. This helper
+does not authorize live playback by itself.
+
 ## Building
 
 ```bash

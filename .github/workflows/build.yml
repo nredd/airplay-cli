@@ -83,14 +83,14 @@ jobs:
         run: |
           uv venv --python 3.13 "$VIRTUAL_ENV"
           uv pip install --python "$VIRTUAL_ENV/bin/python" pyatv==0.18.0 ruff==0.17.1 ty==0.0.89
-      - name: Run updater and session probe unit tests
+      - name: Run all Python unit tests
         run: uv run --active --no-project python -m unittest discover -s tests -v
-      - name: Check session probe formatting and lint
+      - name: Check probe formatting and lint
         run: |
-          uv run --active --no-project ruff format --check tests/apple_session_probe.py tests/test_apple_session_probe.py
-          uv run --active --no-project ruff check tests/apple_session_probe.py tests/test_apple_session_probe.py
-      - name: Type check session probe
-        run: uv run --active --no-project ty check --python "$VIRTUAL_ENV/bin/python" --extra-search-path tests tests/apple_session_probe.py tests/test_apple_session_probe.py
+          uv run --active --no-project ruff format --check tests/apple_session_probe.py tests/test_apple_session_probe.py scripts/native_sender_probe.py tests/test_native_sender_probe.py
+          uv run --active --no-project ruff check tests/apple_session_probe.py tests/test_apple_session_probe.py scripts/native_sender_probe.py tests/test_native_sender_probe.py
+      - name: Type check probes
+        run: uv run --active --no-project ty check --python "$VIRTUAL_ENV/bin/python" --extra-search-path tests tests/apple_session_probe.py tests/test_apple_session_probe.py scripts/native_sender_probe.py tests/test_native_sender_probe.py
 
   build-linux:
     # Keep release binaries on a stable libc baseline that runs on Debian 12+.

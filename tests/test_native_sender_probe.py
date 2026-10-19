@@ -75,6 +75,9 @@ class NativeSenderProbeTest(unittest.TestCase):
                 if mode == 'never_started':
                     time.sleep(10)
                 print('[STATUS] started at_unix_ms=123', flush=True)
+                if mode == 'clean_exit_after_start':
+                    time.sleep(0.1)
+                    sys.exit(0)
                 if mode == 'error':
                     print('[STATUS] error detail=do-not-emit', flush=True)
                 time.sleep(10)
@@ -185,6 +188,17 @@ class NativeSenderProbeTest(unittest.TestCase):
                 if expected:
                     self.assertNotIn("commands", data)
                     self.assertNotIn('"kind": "ready"', output)
+
+    def test_clean_exit_after_start_fails(self) -> None:
+        """A silent sender must stay alive for the whole TTL, even after START."""
+        self.make_binary("clean_exit_after_start")
+        code, output = self.run_probe()
+        self.assertEqual(code, 1, output)
+        records = [json.loads(line) for line in output.splitlines()]
+        self.assertTrue(any(record["kind"] == "ready" for record in records))
+        self.assertFalse(records[-1]["success"])
+        self.assertEqual(records[-1]["reason"], "not_ready_or_terminal_error")
+        self.assert_cleaned()
 
     def test_check_timeout(self) -> None:
         """A hanging check is killed and never launches a sender."""

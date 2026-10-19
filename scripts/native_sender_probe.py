@@ -252,7 +252,7 @@ def probe(opts: argparse.Namespace) -> bool:
                 return (
                     ready
                     and not reader.failed.is_set()
-                    and exited in (None, 0)
+                    and exited is None
                     and not (opts.timing == "ptp" and reader.ntp_seen.is_set())
                 )
         finally:

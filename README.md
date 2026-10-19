@@ -410,10 +410,31 @@ before KILL. `--debug 0` (default) or `1` does not suppress machine status.
 Metadata and START are sent atomically only after setup readiness. JSON stdout emits
 bounded status/event names plus allowlisted route, clock and MRP-path enums/status
 codes, one `ready` on `started`, and a final `result`;
-exit zero requires connected + started with no terminal failure. Neither raw
+exit zero requires connected + started with no terminal failure and the child
+still running at the full TTL (even a clean early exit fails). Neither raw
 child output nor metadata fields/pairing material are emitted or persisted;
 credentials are not accepted and inherited auth/token environment is excluded.
 SIGTERM, Ctrl-C and failures reap the child and remove the FIFO.
+
+EXPERIMENTAL `relay-admission-probe` branch only, isolated muted tests ONLY:
+`CLIAIRPLAY_PROBE_SENDER_RELAY=1` adds only `senderSupportsRelay:true` to
+session SETUP; `CLIAIRPLAY_PROBE_MULTISELECT=1` adds only
+`isMultiSelectAirPlay:true`. Only literal `1` enables either; missing, `0`, or
+malformed values preserve the original SETUP bytes in both PTP and NTP flows.
+The helper exposes `--sender-relay {0,1}` and `--multiselect {0,1}` (both default
+`0`), never inherits these overrides, and records fixed safe configuration
+values as JSON, not addresses, paths, keys, or raw child logs. Failure reports
+retain only fixed error codes and bounded HTTP statuses, never detail strings.
+These declarations
+may provoke unsupported relay messages: there is NO semantic relay handler,
+full native UI claim, or release intent.
+
+`--ptp-follow {auto,0,1}` defaults to `auto` (no child override); only an explicit
+`0` or `1` sets `CLIAIRPLAY_PTP_FOLLOW`. The helper still advertises HomePod TXT
+`igl=1`, and the clock role is chosen BEFORE SETUP. A declaration-induced role
+flip may stop receiver Sync. If clock readiness fails, repeat the SAME declaration
+with only `--ptp-follow 0` changed; there is no live clock hot-switching. Change
+one declaration at a time, not channel control types, group IDs, or timing code.
 
 Keep any Apple-source reference playing on a different receiver. This helper
 does not authorize live playback by itself.

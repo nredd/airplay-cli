@@ -71,7 +71,7 @@ jobs:
     name: Test release updater
     runs-on: ubuntu-latest
     env:
-      VIRTUAL_ENV: ${{ runner.temp }}/airplay-cli-tests
+      VIRTUAL_ENV: ${{ github.workspace }}/build/python-tests
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

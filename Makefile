@@ -182,6 +182,7 @@ RAOP_LIFECYCLE_TEST_DEFINES = \
 	-Draopcl_sample_rate=ap2_test_raopcl_sample_rate
 RAOP_SESSION_TEST = build/tests/test_raop_session
 ANNOUNCE_TEST = build/tests/test_announce
+LIVE_METADATA_TEST = build/tests/test_live_metadata
 
 all: directory $(EXECUTABLE)
 
@@ -238,7 +239,7 @@ no_sanitizer_report = case "$(1)" in *Sanitizer*|*"runtime error:"*) \
 
 test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT_TEST) \
 		$(SESSION_TEST) $(PTP_TEST) $(TEST_EXECUTABLE) $(RAOP_LIFECYCLE_TEST_EXECUTABLE) \
-		$(RAOP_SESSION_TEST) $(ANNOUNCE_TEST)
+		$(RAOP_SESSION_TEST) $(ANNOUNCE_TEST) $(LIVE_METADATA_TEST)
 	$(TIMELINE_TEST)
 	$(EVENT_TEST)
 	$(IO_TEST)
@@ -249,6 +250,7 @@ test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT
 	$(RAOP_LIFECYCLE_TEST_EXECUTABLE)
 	$(RAOP_SESSION_TEST)
 	$(ANNOUNCE_TEST)
+	$(LIVE_METADATA_TEST)
 	python3 tests/mrp_artwork_matrix.py --help >/dev/null
 	@missing_pipe="$$($(EXECUTABLE) --protocol raop \
 		127.0.0.1 2>&1 || true)"; \
@@ -362,6 +364,20 @@ $(CLIENT_TEST): build/tests/test_ap2_client_main.o build/tests/ap2_client.o \
 		build/tests/cross_ssl.o \
 		$(CLIENT_TEST_OBJECTS) $(LIBCODECS_PATCHED) \
 		$(MDNS)/$(HOST)/$(PLATFORM)/libmdns.a \
+		$(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
+
+# Include CLI/MRP implementations to exercise their private parser/serializers.
+build/tests/test_live_metadata.o: tests/test_live_metadata.c src/cliairplay.c \
+		src/ap2_mrp.c src/ap2_mrp.h src/ap2_client.h Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
+
+$(LIVE_METADATA_TEST): build/tests/test_live_metadata.o build/tests/ap2_client.o \
+		build/tests/cross_ssl.o $(CLIENT_TEST_OBJECTS) $(LIBCODECS_PATCHED) Makefile
+	$(CXX) build/tests/test_live_metadata.o build/tests/ap2_client.o \
+		build/tests/cross_ssl.o \
+		$(filter-out $(BUILDDIR)/ap2_mrp.o,$(CLIENT_TEST_OBJECTS)) \
+		$(LIBCODECS_PATCHED) $(MDNS)/$(HOST)/$(PLATFORM)/libmdns.a \
 		$(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
 
 .PHONY: all directory clean test

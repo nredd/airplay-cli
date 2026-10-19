@@ -273,6 +273,7 @@ struct ap2cl_s {
     char *meta_album;
     char *meta_item_id;
     int meta_duration;
+    bool metadata_is_live;   /* active bundle intent; protected by mrp_lock */
     bool meta_delivered;
     ap2_remote_command_cb_t remote_command_cb;
     void *remote_command_userdata;
@@ -5306,9 +5307,9 @@ static bool ap2_send_dmap_artwork(struct ap2cl_s *p, const char *content_type,
     return false;
 }
 
-bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
+bool ap2cl_set_metadata_live_ex(struct ap2cl_s *p, const char *title,
                            const char *artist, const char *album,
-                           int duration, const char *item_id,
+                           int duration, bool is_live, const char *item_id,
                            const char *content_type, const uint8_t *art_data,
                            int art_len, bool *track_changed_out,
                            ap2_mrp_artwork_info_t *mrp_info,
@@ -5328,11 +5329,17 @@ bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
     ap2_mrp_ready(p);
     bool have_mrp = p->mrp != NULL;
     bool track_changed = false;
+    bool live_changed = p->metadata_is_live != is_live;
+    p->metadata_is_live = is_live;
+    if (is_live) duration = 0;
     if (p->mrp)
-        ap2_mrp_set_track(p->mrp, title, artist, album, duration * 1000,
-                          item_id, content_type, art_data, art_len,
+        ap2_mrp_set_track_live(p->mrp, title, artist, album, duration * 1000,
+                          is_live, item_id, content_type, art_data, art_len,
                           &track_changed, mrp_info);
     pthread_mutex_unlock(&p->mrp_lock);
+    /* Re-advertise controls on either live transition, including retries if
+     * the extended sequence fails. This flag is owned by mrp_publish_lock. */
+    if (live_changed) p->mrp_extended_registered = false;
     if (track_changed_out) *track_changed_out = track_changed;
 
     /* Byte-identical bundle: the receiver already holds exactly this state,
@@ -5343,7 +5350,7 @@ bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
      * field is compared. Only a fully delivered previous bundle is
      * skippable, and artwork riding along must itself be unchanged — without
      * MRP to judge the bytes, the push goes out. */
-    if (p->meta_delivered && p->meta_duration == duration &&
+    if (p->meta_delivered && !live_changed && p->meta_duration == duration &&
         ap2_meta_str_eq(p->meta_title, title) &&
         ap2_meta_str_eq(p->meta_artist, artist) &&
         ap2_meta_str_eq(p->meta_album, album) &&
@@ -5390,6 +5397,19 @@ bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
      * gating a retry on this (the first-START placeholder skip) must not
      * read a DMAP-only success with a failed MRP push as delivered. */
     return delivered;
+}
+
+bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
+                           const char *artist, const char *album,
+                           int duration, const char *item_id,
+                           const char *content_type, const uint8_t *art_data,
+                           int art_len, bool *track_changed_out,
+                           ap2_mrp_artwork_info_t *mrp_info,
+                           ap2_mrp_push_result_t *mrp_push)
+{
+    return ap2cl_set_metadata_live_ex(p, title, artist, album, duration, false,
+                                      item_id, content_type, art_data, art_len,
+                                      track_changed_out, mrp_info, mrp_push);
 }
 
 bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist,
@@ -5462,6 +5482,7 @@ bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s)
     pthread_mutex_lock(&p->mrp_lock);
     ap2_mrp_ready(p);
     bool have_mrp = p->mrp != NULL;
+    if (p->metadata_is_live) duration_s = 0;
     /* The content flags, not the wire state, decide the published rate: a
      * splice pause keeps the client AP2_STREAMING with content_paused set. */
     if (p->mrp)

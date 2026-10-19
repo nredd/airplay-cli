@@ -696,6 +696,54 @@ Inner keys: `Title`, `Artist`, `Album`, `Duration`, `ElapsedTime`,
 track's progress pushes), `ArtworkData` (JPEG bytes), `ArtworkMIMEType`,
 `ArtworkIdentifier`.
 
+**Explicit live-radio metadata.** Cmdpipe `IS_LIVE=0|1` stages a boolean
+(default `0`) like `TITLE`; `ACTION=SENDMETA` applies it with the next metadata
+and artwork bundle. Only the literal values `0` and `1` are accepted; malformed
+values are ignored without changing staged or active intent. A pending flag
+does not affect intervening progress updates. `DURATION=0` alone remains
+unknown duration, not a live-stream signal, preserving existing non-radio
+behavior. The initial START metadata bundle uses staged values like TITLE.
+
+Native capability status advertises `live_metadata=1`. MA records this per
+stream as `supports_live_metadata`; only an explicit `1` enables emission of
+`IS_LIVE` for its configurable `radio_station_first` metadata policy. A missing
+or unknown capability means an older binary and must not enable the field.
+Send `IS_LIVE=0` with a subsequent non-live bundle to leave live mode.
+
+`ap2cl_set_metadata_live_ex` passes explicit intent through the protocol-neutral
+bundle API to `ap2_mrp_set_track_live`. Mutation stays inside the existing short
+`mrp_lock`; blocking publication stays outside it under `mrp_publish_lock`.
+Legacy metadata APIs select non-live behavior. Live bundles clear any retained
+finite duration, including a previous finite total under the same ITEMID, and
+live progress updates cannot restore one. The CLI also clears the staged total
+when sending a live bundle, so a later unknown-duration non-live item cannot
+inherit it. A replace now-playing push omits Duration and carries the plist
+boolean `kMRMediaRemoteNowPlayingInfoIsAlwaysLive=true`. Leaving live mode
+omits the live key on the next replace and restores the original duration and
+command behavior. Programme refinements retain item/artwork identity when MA
+keeps a stable station ITEMID and unchanged image bytes.
+
+The live command list contains only the existing event parser's mapped
+Play/Pause/Toggle/Next/Previous controls (Apple command numbers `0,1,2,4,5`),
+not stop, seek/scrub, shuffle/repeat, scan or skip-interval controls. A live
+transition re-arms extended registration to publish that list, retrying failed
+registration as before. The optional type-130 SET_STATE agrees: no duration,
+`isAlwaysLive=true` in ContentItemMetadata field 37 and NowPlayingInfo field
+17, and the same five controls in its distinct protobuf command numbering.
+
+Evidence: the local Apple MediaRemote framework exports
+`kMRMediaRemoteNowPlayingInfoIsAlwaysLive` (`xcrun dyld_info -exports
+/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote`), not
+`kMRMediaRemoteNowPlayingInfoIsLiveStream`. pyatv names the corresponding fields
+[`isAlwaysLive` in ContentItemMetadata](https://github.com/postlund/pyatv/blob/master/pyatv/protocols/mrp/protobuf/ContentItemMetadata.proto)
+and [NowPlayingInfo](https://github.com/postlund/pyatv/blob/master/pyatv/protocols/mrp/protobuf/NowPlayingInfo.proto).
+This is preparatory sender-side radio semantics, NOT a fix for native iPhone
+session visibility: the owner's baseline already has controls available but
+still lacks those sessions. No volume/control relay behavior changes here.
+Hardware confirmation remains required for bridge acceptance of the live key,
+receiver duration clearing and pyatv SetPosition/SetShuffle/SetRepeat becoming
+unavailable, plus live -> non-live restoration and programme/artwork stability.
+
 **Artwork evidence, probing, and per-push bytes.** AirPlaySender requests
 600x600 artwork from MediaRemote, and the captured iPhone command used a
 600x600, three-component baseline JPEG of about 43 KB. These establish a known
@@ -1179,7 +1227,7 @@ goes to stderr precisely so the credentials line stays clean.
 
 ```
 [STATUS] route protocol=<raop|airplay2> flow=<legacy|native|raop-compat> timing=<ptp|ntp> buffered=0
-[STATUS] capabilities requested=0x<hex> realtime_formats=0x<hex> realtime_known=<0|1> buffered_formats=0x<hex> buffered_known=<0|1>
+[STATUS] capabilities requested=0x<hex> realtime_formats=0x<hex> realtime_known=<0|1> buffered_formats=0x<hex> buffered_known=<0|1> live_metadata=1
 ```
 
 `route` reports the resolved route (§2) before the first connect attempt, so it

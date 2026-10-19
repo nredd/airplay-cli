@@ -60,6 +60,43 @@ process lifetime. The format is selected with
 `--bitdepth 24` the input must be **s32le**; the binary truncates it to the
 24-bit samples the ALAC encoder consumes.
 
+### Read-only Apple session probe
+
+```bash
+uv run tests/apple_session_probe.py --host 192.168.1.50
+uv run tests/apple_session_probe.py --host 192.168.1.50 --host 192.168.1.51 \
+  --require-controls --expect-title 'Expected title'
+```
+
+Requires `uv` and Python 3.11+; the script pins `pyatv==0.18.0` inline.
+It scans and transiently connects over AirPlay, reads state, then closes without
+sending playback, seek, volume or grouping commands. Stdout is a JSON array with
+host/name, now-playing app, metadata, state, duration/position, control availability,
+volume and output UIDs. Unsupported optional readings are `null`. `discovery`
+contains only present public AirPlay mDNS properties from this allowlist:
+`flags`, `sf`, `gid`, `pgid`, `igl`, `tsid`, `features`, `model`, `osvers`,
+`srcvers`, `deviceid`. No keys, credentials or raw diagnostics are emitted.
+Discovery/connect/read/close deadlines are 5/8/5/3 seconds per host.
+
+`--require-controls` requires protocol availability of `Play`, `Pause`,
+`PlayPause`, `Volume` and `SetVolume`. `SetPosition` is reported separately,
+not required: live radio can be nonseekable. `--expect-title` checks exact equality.
+Required-control failures, title mismatches and connection/read/close failures
+exit nonzero with sanitized per-host errors.
+
+A successful probe does not prove visibility in iPhone **All Speakers & TVs**.
+HomePods can expose metadata and transport controls to a direct controller while
+remaining absent from that native UI. Compare `discovery` and session fields
+against an Apple-source session, then verify visibility and controls on the
+Apple devices themselves.
+
+Run fake-only probe tests with `uv run --script tests/test_apple_session_probe.py`.
+For full updater/probe discovery, run
+`uv run --python 3.13 --with pyatv==0.18.0 python -m unittest discover -s tests -v`.
+CI runs the same discovery in a uv-managed Python 3.13 environment with
+`pyatv==0.18.0`, and checks only the two probe files with Ruff 0.17.1 and ty 0.0.89.
+None of these checks contact speakers.
+
 ### The start contract
 
 `START_UNIX_MS=<ms>` followed by `ACTION=START` means: **the first sample is
@@ -287,6 +324,13 @@ stdin, the single persistent audio input for the whole process lifetime.
   metadata and the staged artwork as one bundle; the staged path is consumed
   by that push. `ARTWORK=<local file path or http:// imageproxy URL>` pushes
   artwork on its own, outside a track change.
+- Explicit live metadata: `IS_LIVE=0|1` (default `0`) stages intent for the next
+  `ACTION=SENDMETA` bundle. Send it only when that stream reports
+  `[STATUS] capabilities ... live_metadata=1`; missing/unknown means unsupported.
+  Live mode clears finite duration and advertises only Play/Pause/Toggle/Next/
+  Previous, not seek, shuffle or repeat. Send `0` to restore non-live behavior.
+  This prepares radio semantics, not native iPhone session visibility; receiver
+  acceptance still needs hardware confirmation. See `DESIGN.md` §8.
 
 `[STATUS] stopped` acknowledges `ACTION=STOP` once playback has been torn down.
 `STOP` is terminal: the audio loop exits, the connection is torn down and the
@@ -334,6 +378,46 @@ MRP artwork is omitted without withholding it from DMAP and clears stale state.
 `tests/mrp_artwork_matrix.py` generates the controlled Apple TV size/profile
 matrix or records/sends any existing JPEG cache path with its SHA-256, profile,
 dimensions, and full Pillow/libjpeg decode result; see `DESIGN.md` §8.
+
+## Native sender diagnostic
+
+`scripts/native_sender_probe.py` is a standalone stdlib-only diagnostic, not a
+passive observer. **It replaces the selected receiver session.** Get explicit
+authorization and use an idle target, never a receiver playing another session.
+It sends 44.1 kHz signed 16-bit stereo silence at volume zero, forces native AP2
+with `--timing ntp` by default (no shared PTP conflict), and uses a separate fixed
+DACP identity. `CLIAIRPLAY_BUFFERED=0` forces controlled realtime streaming.
+It does not inspect or make claims about receiver UI state.
+
+Authorized idle-target example (run by the operator on the HA host only):
+
+```bash
+python3 scripts/native_sender_probe.py \
+  --binary /data/airplay-native-probe/cliairplay-linux-aarch64 \
+  --host 192.168.1.50 --bind 192.168.1.10 --type130 1 --duration 45
+```
+
+Use only an independently verified binary. `--host` and `--bind` require literal
+IPv4; `--type130` is required (`0` or `1`). `--duration` is 1..120 seconds (default
+45), including the three-second `--check` and connection/setup wait (at most 20
+seconds). `--timing ptp` requires `clock_ready mode=ptp state=ready`; an NTP
+fallback fails the test. Both modes require connected + buffered audio before
+metadata and START. PTP needs exclusive access to ports 319/320: the operator may
+briefly stop stable MA, run both type-130 values under the same PTP flow, and MUST
+restart MA in their cleanup. This helper neither stops nor restarts MA.
+There are no retries or TTL extensions. Teardown may take three extra seconds
+before KILL. `--debug 0` (default) or `1` does not suppress machine status.
+Metadata and START are sent atomically only after setup readiness. JSON stdout emits
+bounded status/event names plus allowlisted route, clock and MRP-path enums/status
+codes, one `ready` on `started`, and a final `result`;
+exit zero requires connected + started with no terminal failure and the child
+still running at the full TTL (even a clean early exit fails). Neither raw
+child output nor metadata fields/pairing material are emitted or persisted;
+credentials are not accepted and inherited auth/token environment is excluded.
+SIGTERM, Ctrl-C and failures reap the child and remove the FIFO.
+
+Keep any Apple-source reference playing on a different receiver. This helper
+does not authorize live playback by itself.
 
 ## Building
 

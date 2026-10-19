@@ -623,6 +623,8 @@ static struct {
     char *artwork_file; /* staged path (ARTWORKFILE key); SENDMETA consumes it */
     int duration;
     int progress;
+    bool is_live;        /* staged explicit intent, default false */
+    bool active_is_live; /* last SENDMETA bundle, not a pending field */
 } g_metadata;
 
 /* Store an owned copy: the value points into the cmdpipe read buffer, which
@@ -664,6 +666,10 @@ static char *metadata_take_artwork_file(void)
 static bool send_track_metadata(const cli_config_t *cfg, const char *title)
 {
     bool delivered = false;
+    g_metadata.active_is_live = g_metadata.is_live;
+    /* Do not let a finite item's staged total leak through a radio bundle or
+     * survive a later switch back to a non-live item with unknown duration. */
+    if (g_metadata.is_live) g_metadata.duration = 0;
     char *artwork_file = metadata_take_artwork_file();
     uint8_t *image = NULL;
     size_t image_size = 0;
@@ -694,9 +700,9 @@ static bool send_track_metadata(const cli_config_t *cfg, const char *title)
         ap2_mrp_artwork_info_t mrp_info;
         ap2_mrp_push_result_t push;
         bool track_changed = false;
-        delivered = ap2cl_set_metadata_ex(
+        delivered = ap2cl_set_metadata_live_ex(
             g_ap2cl, title, metadata_str(g_metadata.artist),
-            metadata_str(g_metadata.album), g_metadata.duration,
+            metadata_str(g_metadata.album), g_metadata.duration, g_metadata.is_live,
             metadata_str(g_metadata.item_id), image ? content_type : NULL,
             image, (int)image_size, &track_changed, &mrp_info, &push);
         if (artwork_failed && track_changed && push.overall_status >= 0) {
@@ -773,14 +779,22 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         /* Stage-only, like TITLE: the next SENDMETA loads the file and pushes
          * it bundled with the metadata. An empty value clears the staging. */
         metadata_set(&g_metadata.artwork_file, value);
+    } else if (strcmp(key, "IS_LIVE") == 0) {
+        /* Accept only the documented wire booleans; malformed input cannot
+         * clear or enable either staged or published live state. */
+        if (strcmp(value, "0") == 0 || strcmp(value, "1") == 0)
+            g_metadata.is_live = value[0] == '1';
+        else
+            LOG_WARN("Ignoring malformed IS_LIVE (expected 0 or 1)");
     } else if (strcmp(key, "DURATION") == 0) {
         g_metadata.duration = atoi(value);
     } else if (strcmp(key, "PROGRESS") == 0) {
         g_metadata.progress = atoi(value);
+        int duration = g_metadata.active_is_live ? 0 : g_metadata.duration;
         if (cfg->protocol == PROTO_RAOP && g_raopcl) {
-            raopcl_set_progress_ms(g_raopcl, g_metadata.progress * 1000, g_metadata.duration * 1000);
+            raopcl_set_progress_ms(g_raopcl, g_metadata.progress * 1000, duration * 1000);
         } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
-            ap2cl_set_progress(g_ap2cl, g_metadata.progress, g_metadata.duration);
+            ap2cl_set_progress(g_ap2cl, g_metadata.progress, duration);
             mrp_status_report(ap2cl_mrp_push_progress(g_ap2cl));
         }
     } else if (strcmp(key, "ARTWORK") == 0) {
@@ -1638,7 +1652,7 @@ static int run_airplay2(cli_config_t *cfg)
         ap2_format_capabilities_t caps;
         ap2cl_format_capabilities(g_ap2cl, &caps);
         printf("[STATUS] capabilities requested=0x%llx realtime_formats=0x%llx "
-               "realtime_known=%d buffered_formats=0x%llx buffered_known=%d\n",
+               "realtime_known=%d buffered_formats=0x%llx buffered_known=%d live_metadata=1\n",
                (unsigned long long)caps.requested,
                (unsigned long long)caps.realtime_formats, caps.realtime_known ? 1 : 0,
                (unsigned long long)caps.buffered_formats, caps.buffered_known ? 1 : 0);

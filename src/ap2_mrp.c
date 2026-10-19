@@ -205,6 +205,7 @@ struct ap2_mrp_ctx {
     char *artist;
     char *album;
     int duration_ms;
+    bool is_live;            /* explicit sender intent, never inferred from duration */
     int elapsed_ms;
     ap2_mrp_playback_state_t playback_state;
     double elapsed_set_at;    /* CFAbsoluteTime when elapsed_ms was captured */
@@ -629,6 +630,8 @@ static bool build_content_item_metadata(struct ap2_mrp_ctx *m, mbuf *meta)
     if (m->artwork_mime && m->artwork_len > 0)
         ok &= pb_put_string_field(meta, 31, m->artwork_mime);         /* artworkMIMEType */
     ok &= pb_put_double_field(meta, 35, elapsed_s);                   /* elapsedTime */
+    if (m->is_live)
+        ok &= pb_put_bool_field(meta, 37, true);                     /* isAlwaysLive */
     ok &= pb_put_float_field(meta, 39,
                              m->playback_state == AP2_MRP_PLAYBACK_PLAYING
                                  ? 1.0f : 0.0f);                      /* playbackRate */
@@ -682,6 +685,8 @@ static bool build_set_state(struct ap2_mrp_ctx *m, bool include_artwork,
     ok &= pb_put_double_field(&npi, 8, now_cf);                       /* timestamp */
     ok &= pb_put_string_field(&npi, 9, m->title ? m->title : "");     /* title */
     ok &= pb_put_bool_field(&npi, 12, true);                          /* isMusicApp */
+    if (m->is_live)
+        ok &= pb_put_bool_field(&npi, 17, true);                      /* isAlwaysLive */
 
     /* PlaybackQueue { location=1, contentItems=2 } with one ContentItem */
     ok = ok && build_content_item_metadata(m, &meta);
@@ -1589,9 +1594,9 @@ void ap2_mrp_stop(struct ap2_mrp_ctx *m)
     m->event_plain_len = 0;
 }
 
-bool ap2_mrp_set_track(struct ap2_mrp_ctx *m, const char *title,
+bool ap2_mrp_set_track_live(struct ap2_mrp_ctx *m, const char *title,
                        const char *artist, const char *album,
-                       int duration_ms, const char *item_id,
+                       int duration_ms, bool is_live, const char *item_id,
                        const char *mime, const uint8_t *art, int art_len,
                        bool *track_changed_out, ap2_mrp_artwork_info_t *info)
 {
@@ -1632,7 +1637,10 @@ bool ap2_mrp_set_track(struct ap2_mrp_ctx *m, const char *title,
      * timeline "update" push never re-supplies Duration, so zeroing it here
      * would strip the total from every later replace push. A new item with
      * unknown duration must not inherit the previous track's length. */
-    if (duration_ms > 0)
+    m->is_live = is_live;
+    if (is_live)
+        m->duration_ms = 0;
+    else if (duration_ms > 0)
         m->duration_ms = duration_ms;
     else if (track_changed)
         m->duration_ms = 0;
@@ -1667,6 +1675,17 @@ bool ap2_mrp_set_track(struct ap2_mrp_ctx *m, const char *title,
     m->state_dirty = true;
     if (track_changed_out) *track_changed_out = track_changed;
     return true;
+}
+
+bool ap2_mrp_set_track(struct ap2_mrp_ctx *m, const char *title,
+                       const char *artist, const char *album,
+                       int duration_ms, const char *item_id,
+                       const char *mime, const uint8_t *art, int art_len,
+                       bool *track_changed_out, ap2_mrp_artwork_info_t *info)
+{
+    return ap2_mrp_set_track_live(m, title, artist, album, duration_ms, false,
+                                  item_id, mime, art, art_len,
+                                  track_changed_out, info);
 }
 
 bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
@@ -1753,7 +1772,7 @@ bool ap2_mrp_set_progress(struct ap2_mrp_ctx *m, int elapsed_ms,
 {
     if (!m) return false;
     m->elapsed_ms = elapsed_ms > 0 ? elapsed_ms : 0;
-    if (duration_ms > 0) m->duration_ms = duration_ms;
+    if (!m->is_live && duration_ms > 0) m->duration_ms = duration_ms;
     m->playback_state = playing ? AP2_MRP_PLAYBACK_PLAYING
                                 : AP2_MRP_PLAYBACK_PAUSED;
     m->elapsed_set_at = mrp_cf_now();
@@ -1891,6 +1910,9 @@ bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
                     ap2_pl_string(m->artist ? m->artist : ""));
     ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoAlbum",
                     ap2_pl_string(m->album ? m->album : ""));
+    if (m->is_live)
+        ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoIsAlwaysLive",
+                        ap2_pl_bool(true));
     if (m->duration_ms > 0)
         ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoDuration",
                         ap2_pl_real((double)m->duration_ms / 1000.0));
@@ -2045,7 +2067,6 @@ static ap2_pl_node *mrp_cmd_info_blob(int cmd, bool enabled, ap2_pl_node *option
 bool ap2_mrp_build_supportedcommands_command(struct ap2_mrp_ctx *m,
                                              uint8_t **out, int *out_len)
 {
-    (void)m;
     if (!out || !out_len) return false;
     /* Command list, options and MRMediaRemoteCommand numbering captured VERBATIM
      * from a real iPhone sender (DESIGN.md §8). Order preserved. Note this
@@ -2053,32 +2074,40 @@ bool ap2_mrp_build_supportedcommands_command(struct ap2_mrp_ctx *m,
      * the pyatv protobuf Command enum used in the type-130 SET_STATE path. */
     ap2_pl_node *arr = ap2_pl_array();
 
-    ap2_pl_node *o26 = ap2_pl_dict();
-    ap2_pl_dict_set(o26, "kMRMediaRemoteCommandInfoShuffleMode", ap2_pl_int(1));
-    ap2_pl_array_append(arr, mrp_cmd_info_blob(26, true, o26));
+    if (m && m->is_live) {
+        /* Only commands accepted by mrp_parse_remote_command: Apple command
+         * numbering Play=0, Pause=1, Toggle=2, Next=4, Previous=5. */
+        static const int live[] = {0, 1, 2, 4, 5};
+        for (size_t i = 0; i < sizeof(live) / sizeof(live[0]); i++)
+            ap2_pl_array_append(arr, mrp_cmd_info_blob(live[i], true, NULL));
+    } else {
+        ap2_pl_node *o26 = ap2_pl_dict();
+        ap2_pl_dict_set(o26, "kMRMediaRemoteCommandInfoShuffleMode", ap2_pl_int(1));
+        ap2_pl_array_append(arr, mrp_cmd_info_blob(26, true, o26));
 
-    ap2_pl_node *o25 = ap2_pl_dict();
-    ap2_pl_dict_set(o25, "kMRMediaRemoteCommandInfoRepeatMode", ap2_pl_int(1));
-    ap2_pl_array_append(arr, mrp_cmd_info_blob(25, true, o25));
+        ap2_pl_node *o25 = ap2_pl_dict();
+        ap2_pl_dict_set(o25, "kMRMediaRemoteCommandInfoRepeatMode", ap2_pl_int(1));
+        ap2_pl_array_append(arr, mrp_cmd_info_blob(25, true, o25));
 
-    ap2_pl_node *o24 = ap2_pl_dict();
-    ap2_pl_dict_set(o24, "kMRMediaRemoteCommandInfoCanBeControlledByScrubbingKey",
-                    ap2_pl_bool(false));
-    ap2_pl_dict_set(o24, "kMRMediaRemoteCommandInfoSupportsReferencePosition",
-                    ap2_pl_bool(false));
-    ap2_pl_array_append(arr, mrp_cmd_info_blob(24, true, o24));
+        ap2_pl_node *o24 = ap2_pl_dict();
+        ap2_pl_dict_set(o24, "kMRMediaRemoteCommandInfoCanBeControlledByScrubbingKey",
+                        ap2_pl_bool(false));
+        ap2_pl_dict_set(o24, "kMRMediaRemoteCommandInfoSupportsReferencePosition",
+                        ap2_pl_bool(false));
+        ap2_pl_array_append(arr, mrp_cmd_info_blob(24, true, o24));
 
-    ap2_pl_node *o18 = ap2_pl_dict();
-    ap2_pl_dict_set(o18, "kMRMediaRemoteCommandInfoPreferredIntervalsKey", ap2_pl_array());
-    ap2_pl_array_append(arr, mrp_cmd_info_blob(18, false, o18));
+        ap2_pl_node *o18 = ap2_pl_dict();
+        ap2_pl_dict_set(o18, "kMRMediaRemoteCommandInfoPreferredIntervalsKey", ap2_pl_array());
+        ap2_pl_array_append(arr, mrp_cmd_info_blob(18, false, o18));
 
-    ap2_pl_node *o17 = ap2_pl_dict();
-    ap2_pl_dict_set(o17, "kMRMediaRemoteCommandInfoPreferredIntervalsKey", ap2_pl_array());
-    ap2_pl_array_append(arr, mrp_cmd_info_blob(17, false, o17));
+        ap2_pl_node *o17 = ap2_pl_dict();
+        ap2_pl_dict_set(o17, "kMRMediaRemoteCommandInfoPreferredIntervalsKey", ap2_pl_array());
+        ap2_pl_array_append(arr, mrp_cmd_info_blob(17, false, o17));
 
-    static const int simple[] = { 10, 11, 8, 9, 5, 4, 3, 2, 1, 0 };
-    for (size_t i = 0; i < sizeof(simple) / sizeof(simple[0]); i++)
-        ap2_pl_array_append(arr, mrp_cmd_info_blob(simple[i], true, NULL));
+        static const int simple[] = { 10, 11, 8, 9, 5, 4, 3, 2, 1, 0 };
+        for (size_t i = 0; i < sizeof(simple) / sizeof(simple[0]); i++)
+            ap2_pl_array_append(arr, mrp_cmd_info_blob(simple[i], true, NULL));
+    }
 
     ap2_pl_node *params = ap2_pl_dict();
     ap2_pl_dict_set(params, "mrSupportedCommandsFromSender", arr);

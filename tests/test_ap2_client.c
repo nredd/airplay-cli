@@ -2770,6 +2770,17 @@ static int canonical_session(bool ptp, uint8_t **out)
     return len;
 }
 
+/* Binary-safe key lookup without GNU-only memmem in the portable test build. */
+static bool test_bytes_contain(const uint8_t *data, size_t len, const char *needle)
+{
+    assert(data && needle);
+    size_t size = strlen(needle);
+    if (size > len) return false;
+    for (size_t i = 0; i <= len - size; i++)
+        if (!memcmp(data + i, needle, size)) return true;
+    return false;
+}
+
 static void test_homepod_remote_admission(void)
 {
     const char *good = "model=AudioAccessory5,1 osvers=27.0 igl=1";
@@ -2820,10 +2831,10 @@ static void test_homepod_remote_admission(void)
     }
     uint8_t *paired = NULL;
     int len = ap2cl_test_session_setup(true, remote_policy(good, 0), &paired);
-    assert(len > 0);
+    assert(len > 0 && paired);
     /* The raw bplist bool markers are checked in the serializer tests too. */
-    assert(memmem(paired, (size_t)len, "senderSupportsRelay", 19));
-    assert(memmem(paired, (size_t)len, "isMultiSelectAirPlay", 20));
+    assert(test_bytes_contain(paired, (size_t)len, "senderSupportsRelay"));
+    assert(test_bytes_contain(paired, (size_t)len, "isMultiSelectAirPlay"));
     free(paired);
     unsetenv("CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE");
 

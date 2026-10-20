@@ -59,6 +59,9 @@ class NativeSenderProbeTest(unittest.TestCase):
                 except BlockingIOError:
                     data['before_connected'] = ''
                 os.close(fd)
+                if mode == 'transport_privacy':
+                    print('[STATUS] SecretStatusToken123 command=pause', flush=True)
+                    print('[EVENT] SecretEventToken456 command=pause', flush=True)
                 print('RAW SECRET pairing token=do-not-emit', flush=True)
                 print('[STATUS] connected secret=do-not-emit', flush=True)
                 if mode != 'old_binary':
@@ -78,7 +81,49 @@ class NativeSenderProbeTest(unittest.TestCase):
                 capture.write_text(json.dumps(data))
                 if mode == 'never_started':
                     time.sleep(10)
+                if mode == 'transport_pre':
+                    print('[EVENT] remote command=pause', flush=True)
+                    time.sleep(0.08)
                 print('[STATUS] started at_unix_ms=123', flush=True)
+                if mode.startswith('transport_'):
+                    fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+                    scenarios = {{
+                        'transport_sequence': ['pause', 'play', 'play_pause'],
+                        'transport_privacy': ['pause', 'play'],
+                        'transport_duplicates': ['play', 'pause', 'pause', 'play', 'play'],
+                        'transport_storm': ['play_pause'] * 1000,
+                        'transport_spaced': ['play_pause', 'play_pause'],
+                        'transport_navigation': ['next', 'previous'],
+                        'transport_pre': [],
+                        'transport_malicious': ['SECRET', 'pauseSECRET', 'pause command=SECRET', 'SECRET command=pause'],
+                        'transport_exit': ['pause'],
+                        'transport_error': ['pause'],
+                    }}
+                    data['actions'] = ''
+                    capture.write_text(json.dumps(data))
+                    for command in scenarios[mode]:
+                        print('[EVENT] remote command=' + command + ' token=SECRET', flush=True)
+                        if mode in ('transport_exit', 'transport_error'):
+                            continue
+                        if mode != 'transport_storm':
+                            time.sleep(0.3 if mode == 'transport_spaced' else 0.06)
+                    if mode == 'transport_exit':
+                        os._exit(0)
+                    if mode == 'transport_error':
+                        print('[STATUS] error detail=SECRET', flush=True)
+                    end = time.monotonic() + 2
+                    while time.monotonic() < end:
+                        try:
+                            actions = os.read(fd, 4096).decode()
+                        except BlockingIOError:
+                            actions = ''
+                        if actions:
+                            data['actions'] += actions
+                            for action in actions.splitlines():
+                                print('[STATUS] paused' if action == 'ACTION=PAUSE' else '[STATUS] playing', flush=True)
+                            capture.write_text(json.dumps(data))
+                        time.sleep(0.01)
+                    os.close(fd)
                 if mode == 'clean_exit_after_start':
                     time.sleep(0.1)
                     sys.exit(0)
@@ -387,6 +432,145 @@ class NativeSenderProbeTest(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             probe.interrupted(15, None)
 
+    def test_transport_actions_and_confirmations(self) -> None:
+        """Only opt-in normalized events drive the same producer's FIFO after START."""
+        for mode, extra, expected in (
+            ("sequence", (), ""),
+            ("sequence", ("--respond-transport", "0"), ""),
+            (
+                "sequence",
+                ("--respond-transport", "1"),
+                "ACTION=PAUSE\nACTION=PLAY\nACTION=PAUSE\n",
+            ),
+            ("duplicates", ("--respond-transport", "1"), "ACTION=PAUSE\nACTION=PLAY\n"),
+            ("storm", ("--respond-transport", "1"), "ACTION=PAUSE\n"),
+            ("spaced", ("--respond-transport", "1"), "ACTION=PAUSE\nACTION=PLAY\n"),
+            ("navigation", ("--respond-transport", "1"), ""),
+            ("pre", ("--respond-transport", "1"), ""),
+            ("malicious", ("--respond-transport", "1"), ""),
+        ):
+            with self.subTest(mode=mode, extra=extra):
+                self.make_binary("transport_" + mode)
+                code, output = self.run_probe(*extra)
+                self.assertEqual(code, 0, output)
+                data = self.assert_cleaned()
+                self.assertEqual(data["actions"], expected)
+                self.assertNotIn("SECRET", output)
+                records = [json.loads(line) for line in output.splitlines()]
+                self.assertLessEqual(len(records), 258)
+                actions = [r for r in records if r["kind"] == "fifo_action"]
+                self.assertEqual(len(actions), len(expected.splitlines()))
+                self.assertTrue(all(set(r) == {"kind", "action"} for r in actions))
+                if expected:
+                    self.assertTrue(any(r.get("name") == "paused" for r in records))
+                if "ACTION=PLAY" in expected:
+                    self.assertTrue(any(r.get("name") == "playing" for r in records))
+
+    def test_transport_exit_and_failure_stop_writes(self) -> None:
+        """A queued request cannot write after exit or a terminal status latch."""
+        original_write = os.write
+        for mode in ("transport_exit", "transport_error"):
+            self.make_binary(mode)
+            with patch.object(probe.os, "write", wraps=original_write) as writes:
+                code, output = self.run_probe("--respond-transport", "1")
+            self.assertEqual(code, 1, output)
+            self.assertEqual(
+                [call.args[1] for call in writes.call_args_list], [probe.COMMANDS]
+            )
+            self.assert_cleaned()
+
+    def test_remote_enums_and_transport_queue_bounds(self) -> None:
+        """Retain five public enums only, never telemetry commands or extra fields."""
+        for command in ("play", "pause", "play_pause", "next", "previous"):
+            self.assertEqual(
+                probe.safe_fields(
+                    f"[EVENT] remote command={command} secret=SECRET".encode(), "remote"
+                ),
+                {"command": command},
+            )
+        stream = io.BytesIO(
+            b"[EVENT] remote command=pause\n"
+            b"[STATUS] started\n"
+            + b"[STATUS] remote command=pause\n" * 200
+            + b"[EVENT] remote command=pause\n" * 1000
+        )
+        reader = probe.Reader(stream, True)
+        reader.thread.join(timeout=1)
+        self.assertEqual(reader.commands.qsize(), 128)
+        self.assertEqual(reader.records.qsize(), 128)
+        reader = probe.Reader(
+            io.BytesIO(b"[STATUS] started\n[EVENT] remote command=pause\n")
+        )
+        reader.thread.join(timeout=1)
+        self.assertTrue(reader.commands.empty())
+
+    def test_reader_drops_unknown_machine_names(self) -> None:
+        """Reject names before retention, with independent per-kind admission."""
+        for respond in (False, True):
+            with self.subTest(respond=respond):
+                reader = probe.Reader(
+                    io.BytesIO(
+                        b"[STATUS] SecretStatusToken123 command=pause\n"
+                        b"[EVENT] SecretEventToken456 command=pause\n"
+                        b"[EVENT] started\n[STATUS] remote command=pause\n"
+                        b"[STATUS] connected\n[STATUS] started\n"
+                        b"[STATUS] homepod_remote_admission enabled=1\n"
+                        b"[STATUS] homepod_remote command=play\n"
+                        b"[EVENT] remote command=pause\n"
+                        b"[STATUS] paused\n[STATUS] playing\n"
+                    ),
+                    respond,
+                )
+                reader.thread.join(timeout=1)
+                records = list(reader.records.queue)
+                serialized = json.dumps(records).lower()
+                self.assertNotIn("secretstatustoken123", serialized)
+                self.assertNotIn("secreteventtoken456", serialized)
+                self.assertEqual(
+                    [(kind, name) for kind, name, _ in records],
+                    [
+                        ("status", name)
+                        for name in (
+                            "connected",
+                            "started",
+                            "homepod_remote_admission",
+                            "homepod_remote",
+                        )
+                    ]
+                    + [
+                        ("event", "remote"),
+                        ("status", "paused"),
+                        ("status", "playing"),
+                    ],
+                )
+                self.assertTrue(reader.connected.is_set())
+                self.assertTrue(reader.started.is_set())
+                self.assertTrue(reader.admission_enabled.is_set())
+                self.assertEqual(
+                    list(reader.commands.queue), ["pause"] if respond else []
+                )
+
+    def test_posix_unknown_names_never_reach_json(self) -> None:
+        """Injected child names stay private in observe and response modes."""
+        for respond in ("0", "1"):
+            with self.subTest(respond=respond):
+                self.make_binary("transport_privacy")
+                code, output = self.run_probe("--respond-transport", respond)
+                self.assertEqual(code, 0, output)
+                self.assertNotIn("secretstatustoken123", output.lower())
+                self.assertNotIn("secreteventtoken456", output.lower())
+                data = self.assert_cleaned()
+                self.assertEqual(
+                    data["actions"],
+                    "ACTION=PAUSE\nACTION=PLAY\n" if respond == "1" else "",
+                )
+                records = [json.loads(line) for line in output.splitlines()]
+                self.assertTrue(any(r.get("name") == "started" for r in records))
+                self.assertTrue(any(r.get("command") == "pause" for r in records))
+                if respond == "1":
+                    self.assertTrue(any(r.get("name") == "paused" for r in records))
+                    self.assertTrue(any(r.get("name") == "playing" for r in records))
+
     def test_validation(self) -> None:
         """Bad addresses, binaries, duration and mode fail before spawning."""
         for flag, value in (
@@ -398,6 +582,7 @@ class NativeSenderProbeTest(unittest.TestCase):
             ("--duration", "1.5"),
             ("--type130", "2"),
             ("--debug", "2"),
+            ("--respond-transport", "2"),
             ("--timing", "auto"),
         ):
             with (

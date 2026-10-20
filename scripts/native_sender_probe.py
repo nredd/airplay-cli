@@ -23,9 +23,41 @@ from typing import IO
 
 VERSION = re.compile(rb"cliairplay v[0-9A-Za-z][0-9A-Za-z.+_-]{0,127} check\r?\n?$")
 MACHINE = re.compile(rb"\[(STATUS|EVENT)\] ([A-Za-z][A-Za-z0-9_]{0,63})(?: |\r?$)")
+# Public machine outputs in cliairplay.c, ap2_session.c, ap2_client.c and ap2_mrp.c.
+MACHINE_NAMES = {
+    b"STATUS": {
+        b"connected",
+        b"playing",
+        b"paused",
+        b"eof",
+        b"clock_ready",
+        b"started",
+        b"content_cut",
+        b"anchor_corrected",
+        b"clock_verified",
+        b"error",
+        b"announce_done",
+        b"announce_started",
+        b"mrp",
+        b"stopped",
+        b"latency",
+        b"capabilities",
+        b"route",
+        b"audio",
+        b"flushed",
+        b"idle_timeout",
+        b"homepod_remote_admission",
+        b"homepod_remote",
+        b"REANCHOR",
+    },
+    b"EVENT": {b"remote"},
+}
 AUDIO = re.compile(rb"buffered_ms=[1-9][0-9]{0,19}$")
 MRP_STATUS = re.compile(rb"(?:-1|0|1|[1-5][0-9]{2})$")
+TRANSPORT = {"play": b"ACTION=PLAY\n", "pause": b"ACTION=PAUSE\n"}
+TOGGLE_GUARD_SECONDS = 0.25
 SAFE_FIELDS: dict[str, dict[bytes, set[bytes]]] = {
+    "remote": {b"command": {b"play", b"pause", b"play_pause", b"next", b"previous"}},
     "mrp": {b"path": {b"channel", b"command"}},
     "homepod_remote_admission": {b"enabled": {b"0", b"1"}},
     "homepod_remote": {
@@ -68,6 +100,12 @@ def safe_fields(chunk: bytes, name: str) -> dict[str, str]:
     """Retain only fixed protocol enums and bounded MRP status codes."""
     result = {}
     allowed = SAFE_FIELDS.get(name, {})
+    if name == "remote":
+        commands = [
+            field for field in chunk.split()[2:] if field.startswith(b"command=")
+        ]
+        if len(commands) != 1:
+            return {}
     for field in chunk.split()[2:]:
         key, _, value = field.partition(b"=")
         numeric = (
@@ -88,8 +126,11 @@ def safe_fields(chunk: bytes, name: str) -> dict[str, str]:
 class Reader:
     """Drain bounded lines; retain only protocol names and latched state."""
 
-    def __init__(self, stream: IO[bytes]) -> None:
+    def __init__(self, stream: IO[bytes], respond_transport: bool = False) -> None:
         self.stream = stream
+        self.respond_transport = respond_transport
+        self.commands: queue.Queue[str] = queue.Queue(maxsize=128)
+        self.last_toggle = float("-inf")
         self.records: queue.Queue[tuple[str, str, dict[str, str]]] = queue.Queue(
             maxsize=128
         )
@@ -119,7 +160,12 @@ class Reader:
             match = MACHINE.match(chunk)
             if not match:
                 continue
-            kind, name = (value.decode("ascii").lower() for value in match.groups())
+            raw_kind, raw_name = match.groups()
+            if raw_name not in MACHINE_NAMES[raw_kind]:
+                continue
+            kind, name = (
+                value.decode("ascii").lower() for value in (raw_kind, raw_name)
+            )
             if kind == "status":
                 fields = set(chunk.split()[2:])
                 if name == "audio" and any(AUDIO.fullmatch(field) for field in fields):
@@ -140,8 +186,29 @@ class Reader:
                     self.started.set()
                 elif name in {"error", "stopped", "eof", "idle_timeout"}:
                     self.failed.set()
+            fields_safe = safe_fields(chunk, name)
+            if (
+                self.respond_transport
+                and kind == "event"
+                and name == "remote"
+                and self.started.is_set()
+                and not self.failed.is_set()
+            ):
+                command = fields_safe.get("command")
+                if command in {"play", "pause", "play_pause"}:
+                    now = time.monotonic()
+                    if (
+                        command != "play_pause"
+                        or now - self.last_toggle >= TOGGLE_GUARD_SECONDS
+                    ):
+                        if command == "play_pause":
+                            self.last_toggle = now
+                        try:
+                            self.commands.put_nowait(command)
+                        except queue.Full:
+                            pass
             try:
-                self.records.put_nowait((kind, name, safe_fields(chunk, name)))
+                self.records.put_nowait((kind, name, fields_safe))
             except queue.Full:
                 pass
 
@@ -248,8 +315,8 @@ def probe(opts: argparse.Namespace) -> bool:
                 ) as child,
             ):
                 assert child.stdout is not None
-                reader = Reader(child.stdout)
-                sent = ready = False
+                reader = Reader(child.stdout, opts.respond_transport == 1)
+                sent = ready = paused = False
                 emitted = 0
                 connect_deadline = min(deadline, time.monotonic() + 20)
                 try:
@@ -289,6 +356,37 @@ def probe(opts: argparse.Namespace) -> bool:
                             ready = True
                         if child.poll() is not None:
                             break
+                        if ready and opts.respond_transport == 1:
+                            for _ in range(128):
+                                if (
+                                    time.monotonic() >= deadline
+                                    or child.poll() is not None
+                                    or reader.failed.is_set()
+                                    or reader.admission_denied.is_set()
+                                    and opts.experimental_homepod_remote == 1
+                                    or opts.timing == "ptp"
+                                    and reader.ntp_seen.is_set()
+                                ):
+                                    break
+                                try:
+                                    command = reader.commands.get_nowait()
+                                except queue.Empty:
+                                    break
+                                pause = (
+                                    not paused
+                                    if command == "play_pause"
+                                    else command == "pause"
+                                )
+                                if pause == paused:
+                                    continue
+                                action = "pause" if pause else "play"
+                                payload = TRANSPORT[action]
+                                if os.write(fd, payload) != len(payload):
+                                    raise OSError("Incomplete atomic FIFO write")
+                                paused = pause
+                                if emitted < 256:
+                                    emit("fifo_action", action=action)
+                                    emitted += 1
                         if not sent and time.monotonic() >= connect_deadline:
                             break
                         time.sleep(min(0.02, max(0, deadline - time.monotonic())))
@@ -336,6 +434,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--experimental-homepod-remote", type=int, choices=(0, 1), default=0
     )
+    result.add_argument("--respond-transport", type=int, choices=(0, 1), default=0)
     result.add_argument("--duration", type=int, choices=range(1, 121), default=45)
     result.add_argument("--debug", type=int, choices=(0, 1), default=0)
     result.add_argument("--timing", choices=("ntp", "ptp"), default="ntp")

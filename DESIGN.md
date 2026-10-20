@@ -758,6 +758,24 @@ disabled/ineligible PTP and NTP writers preserve canonical bytes and ordering.
 No matrix `PROBE_*` flags, clock hot-flips, PTP policy changes or type-130
 activation are introduced.
 
+The diagnostic predecessor `3f521b7` measured this interaction on a HomePod mini
+running OS 27, with PTP/realtime, type-130 off and muted stream gain:
+
+| SETUP declarations | Status flags | `igl` | Parent group |
+| --- | --- | --- | --- |
+| neither | `0x1b8404` | 1 | absent |
+| relay only | `0x1b8404` | 1 | absent |
+| multiselect only | `0x1b8404` | 1 | absent |
+| both | `0x1b8c04` | 0 | `gid == pgid` |
+
+All cases reached readiness/START and completed 45 seconds; both declarations
+also completed 120 seconds. Incoming Sync/Follow_Up continued with `igl=0`.
+Two additional 45-second runs changing only the paired case's clock choice to
+sender-clock also completed. These are transport/advertisement observations,
+not audible playback, new gated-build validation or owner-visible UI acceptance.
+They do not justify changing the clock policy. The native iPhone reference still
+differs by unknown status bit 22; it is not interpreted here.
+
 Before declaring an admitted connection successful, the existing MRP attach path
 must have an encrypted reverse event channel ready. Failure remains a generic
 `connect_failed` with normal teardown/cleanup, not silent audio-only success.
@@ -806,6 +824,17 @@ ordinal is sender-local. Existing raw debug is not enabled/reused and global
 privacy defaults do not change. `native_sender_probe.py` independently allowlists
 these fixed enums and numeric ranges into its bounded JSON and requires enabled
 admission before metadata/START when explicitly requested.
+
+The diagnostic's `--respond-transport 1` is an opt-in test consumer (default `0`
+observes only). It queues only public normalized remote play/pause/toggle events
+received after C `started`, with a 128-command bound and monotonic 250 ms toggle
+guard. The main loop writes only constant PLAY/PAUSE actions to its owned producer
+FIFO, suppressing duplicate local intent and stopping on exit, failure or TTL.
+`fifo_action` means a FIFO write; C `paused`/`playing` confirms the producer state,
+not MA or phone UI execution. Next/previous are observed without simulated queue
+changes. Opaque MRP/volume telemetry cannot request actions; there are no API,
+volume, group or other-process actions. Existing admission/readiness, source-clock,
+mute, output cap and cleanup contracts remain intact. This is not a full relay.
 
 **Artwork evidence, probing, and per-push bytes.** AirPlaySender requests
 600x600 artwork from MediaRemote, and the captured iPhone command used a

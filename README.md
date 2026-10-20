@@ -438,13 +438,28 @@ restart MA in their cleanup. This helper neither stops nor restarts MA.
 There are no retries or TTL extensions. Teardown may take three extra seconds
 before KILL. `--debug 0` (default) or `1` does not suppress machine status.
 Metadata and START are sent atomically only after setup readiness. JSON stdout emits
-bounded status/event names plus allowlisted route, clock and MRP-path enums/status
+bounded, per-kind allowlisted status/event names (unknown names are dropped before
+retention or state handling) plus allowlisted route, clock and MRP-path enums/status
 codes, one `ready` on `started`, and a final `result`;
 exit zero requires connected + started with no terminal failure and the child
 still running at the full TTL (even a clean early exit fails). Neither raw
 child output nor metadata fields/pairing material are emitted or persisted;
 credentials are not accepted and inherited auth/token environment is excluded.
 SIGTERM, Ctrl-C and failures reap the child and remove the FIFO.
+
+`--respond-transport 0` (default) observes remote callbacks without responding.
+Opt in with `--respond-transport 1` to test native-phone Pause/Play against this
+muted producer without deploying custom MA. Only normalized `[EVENT] remote`
+`play`, `pause`, and `play_pause` events received after the C `started` status can
+write constant `ACTION=PLAY`/`ACTION=PAUSE` to this owned child's FIFO. Local intent
+suppresses duplicate play/pause; a monotonic 250 ms guard suppresses toggle storms.
+`next`/`previous` remain observations only: no queue/playlist simulation, volume,
+group, API, or other-process actions. The command queue is capped at 128 and JSON
+output at 256 status/event/action records. `fifo_action` records report only FIFO
+writes; C `paused`/`playing` statuses confirm producer transitions, not MA actions
+or UI execution. Failure, child exit, TTL and cleanup stop responses. Readiness,
+admission, clock policy, mute, strict child environment and cleanup stay unchanged.
+This is a pause/play/toggle test consumer, not a full remote relay.
 
 The helper accepts `--experimental-homepod-remote {0,1}` (default `0`). Only
 explicit `1` sets the child opt-in; it is never inherited from the environment.

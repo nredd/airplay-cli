@@ -97,6 +97,36 @@ CI runs the same discovery in a uv-managed Python 3.13 environment with
 `pyatv==0.18.0`, and checks only the two probe files with Ruff 0.17.1 and ty 0.0.89.
 None of these checks contact speakers.
 
+### Experimental HomePod remote admission
+
+`CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE=1` is a strict literal-`1`, default-off
+source-preparation opt-in, not production deployment or a full relay claim.
+It snapshots eligibility before session SETUP: exact `AudioAccessory5,1`, known
+OS major 27 (`osvers`/`ov`, no firmware or future-OS guess), encrypted native
+MediaRemote, MRP enabled, a registered remote callback, actual PTP and realtime
+(not buffered). Only eligible sessions emit both `senderSupportsRelay=true` and
+`isMultiSelectAirPlay=true`. All other session SETUP bytes remain unchanged.
+An admitted attempt requires an attached encrypted reverse-event/MRP context
+before connect succeeds; failure uses `connect_failed` and connection cleanup.
+The opt-in neither enables type 130 nor changes PTP follow/clock policy.
+
+In this mode `/command` advertises only implemented Play/Pause/Toggle/Next/
+Previous, in live and non-live metadata and across transitions. It does not
+advertise volume, seek, shuffle, repeat or stop. DataStream still only ACKs sync,
+not semantic dispatch. Native MRP/group volume and CLI stream gain are separate
+knobs; telemetry is not routed to group volume. Native owner UI visibility and
+controls remain unconfirmed: the next step is owner UI checks with correlated
+traces, not a production rollout.
+
+Eligible sessions emit at most 128 bounded diagnostic records per MRP context,
+then continue servicing traffic. Records contain fixed classifications,
+recognized command names, bounded protobuf field-1 types, lengths, local
+ordinal/relative monotonic time and `dispatched`. That field means recognized
+and callback invoked, NOT that Music Assistant executed an action. No bodies,
+arbitrary type/value strings, keys, tokens, metadata or IDs are included. This
+trace does not enable existing raw debug logging or change global privacy defaults.
+See `DESIGN.md` §8 for classifier limits.
+
 ### The start contract
 
 `START_UNIX_MS=<ms>` followed by `ACTION=START` means: **the first sample is
@@ -415,6 +445,15 @@ still running at the full TTL (even a clean early exit fails). Neither raw
 child output nor metadata fields/pairing material are emitted or persisted;
 credentials are not accepted and inherited auth/token environment is excluded.
 SIGTERM, Ctrl-C and failures reap the child and remove the FIFO.
+
+The helper accepts `--experimental-homepod-remote {0,1}` (default `0`). Only
+explicit `1` sets the child opt-in; it is never inherited from the environment.
+When requested, `[STATUS] homepod_remote_admission enabled=1` is mandatory before
+START, in addition to normal readiness. Ineligible (`enabled=0`) or older binaries
+fail without sending metadata/START. Use `--timing ptp` for an eligible attempt;
+NTP remains the helper's default. Fixed diagnostic enums/numeric fields are
+retained in bounded JSON, never raw receiver strings. Existing `--type130` remains
+an independent, required option.
 
 Keep any Apple-source reference playing on a different receiver. This helper
 does not authorize live playback by itself.

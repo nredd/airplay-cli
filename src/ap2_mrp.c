@@ -206,6 +206,9 @@ struct ap2_mrp_ctx {
     char *album;
     int duration_ms;
     bool is_live;            /* explicit sender intent, never inferred from duration */
+    bool experimental_homepod_remote; /* set before publication, immutable */
+    unsigned diagnostic_count; /* tick thread only, capped at 128 */
+    uint64_t diagnostic_start_ms;
     int elapsed_ms;
     ap2_mrp_playback_state_t playback_state;
     double elapsed_set_at;    /* CFAbsoluteTime when elapsed_ms was captured */
@@ -1036,10 +1039,80 @@ static void mrp_drain_encrypted(struct ap2_mrp_ctx *m)
         mrp_close_data_channel(m);
 }
 
-/* Consume complete 32-byte-header data frames from rx_msg. Incoming protobufs
- * are counted but not dispatched: acting on them (SendCommand transport
- * controls from the receiver: play/pause/next from the Siri remote) is not
- * implemented (DESIGN.md §8). */
+/* Diagnostics deliberately classify only a single length-prefixed protobuf
+ * envelope's field 1. Extensions and values have no inferred semantics. */
+static bool mrp_diag_varint(const uint8_t **p, const uint8_t *end, uint64_t *v)
+{
+    *v = 0;
+    for (unsigned i = 0; i < 10 && *p < end; i++) {
+        uint8_t b = *(*p)++;
+        if (i == 9 && b > 1) return false;
+        *v |= (uint64_t)(b & 127) << (i * 7);
+        if (!(b & 128)) return true;
+    }
+    return false;
+}
+
+/* Returns a fixed classification and a bounded numeric type, never strings
+ * from the receiver. Unknown/malformed containers are not semantic messages. */
+static const char *mrp_diag_protobuf(const uint8_t *body, size_t len, int *type)
+{
+    *type = -1;
+    if (!body || len > 65536) return "invalid";
+    const uint8_t *p;
+    size_t bytes;
+    if (!ap2_bplist_get_params_data(body, len, &p, &bytes)) return "unknown";
+    const uint8_t *end = p + bytes;
+    uint64_t n;
+    if (!mrp_diag_varint(&p, end, &n) || n != (uint64_t)(end - p))
+        return "invalid";
+    bool found = false;
+    int candidate = -1;
+    while (p < end) {
+        uint64_t tag, value;
+        if (!mrp_diag_varint(&p, end, &tag) || !(tag >> 3) ||
+            (tag >> 3) > 0x1fffffff) return "invalid";
+        if ((tag & 7) == 0) {
+            if (!mrp_diag_varint(&p, end, &value)) return "invalid";
+            if ((tag >> 3) == 1) {
+                if (found) return "invalid";
+                found = true;
+                if (value <= 65535) candidate = (int)value;
+            }
+        } else {
+            if ((tag >> 3) == 1) return "invalid";
+            if ((tag & 7) == 1) n = 8;
+            else if ((tag & 7) == 5) n = 4;
+            else if ((tag & 7) != 2 || !mrp_diag_varint(&p, end, &n))
+                return "invalid";
+            if (n > (uint64_t)(end - p)) return "invalid";
+            p += (size_t)n;
+        }
+    }
+    *type = candidate;
+    return candidate >= 0 ? "protobuf" : "unknown";
+}
+
+static void mrp_diagnostic(struct ap2_mrp_ctx *m, bool event,
+    const char *kind, const uint8_t *body, size_t len, int command, bool handled)
+{
+    if (!m->experimental_homepod_remote || m->diagnostic_count >= 128) return;
+    uint64_t now = ap2_io_monotonic_ms();
+    if (!m->diagnostic_count) m->diagnostic_start_ms = now;
+    int type = -1;
+    const char *classification = command >= 0 ? "command" :
+        mrp_diag_protobuf(body, len, &type);
+    static const char *commands[] = {"play", "pause", "toggle", "next", "previous"};
+    const char *name = command >= 0 && command < 5 ? commands[command] : "unknown";
+    fprintf(stderr, "[STATUS] homepod_remote ordinal=%u elapsed_ms=%llu "
+        "channel=%s frame_kind=%s classification=%s command=%s protobuf_type=%d "
+        "bytes=%zu dispatched=%d\n", ++m->diagnostic_count,
+        (unsigned long long)(now - m->diagnostic_start_ms),
+        event ? "event" : "datastream", kind, classification, name, type, len,
+        handled ? 1 : 0);
+}
+
+/* Sync frames are acknowledged, never semantically dispatched (DESIGN.md §8). */
 static void mrp_process_frames(struct ap2_mrp_ctx *m)
 {
     int off = 0;
@@ -1057,6 +1130,10 @@ static void mrp_process_frames(struct ap2_mrp_ctx *m)
         uint64_t seqno = 0;
         for (int i = 0; i < 8; i++) seqno = (seqno << 8) | h[20 + i];
 
+        bool sync = !memcmp(h + 4, "sync\0\0\0\0\0\0\0\0", 12);
+        bool reply = !memcmp(h + 4, "rply\0\0\0\0\0\0\0\0", 12);
+        mrp_diagnostic(m, false, sync ? "sync" : reply ? "reply" : "unknown",
+            h + MRP_DATA_HDR_LEN, size - MRP_DATA_HDR_LEN, -1, false);
         if (memcmp(h + 4, "sync", 4) == 0) {
             LOG_DEBUG("[MRP] inbound sync frame (%u bytes, seq %llu)",
                       size, (unsigned long long)seqno);
@@ -1311,8 +1388,13 @@ static bool mrp_process_event_requests(struct ap2_mrp_ctx *m)
             response_len > 0 && response_len < (int)sizeof(response) &&
             mrp_event_send_response(
                 m, (const uint8_t *)response, response_len);
+        bool dispatched = have_remote_command && m->remote_command_cb != NULL;
         if (have_remote_command)
             mrp_emit_remote_command(m, remote_command);
+        mrp_diagnostic(m, true, is_command ? "command" : "unknown",
+            m->event_plain + off + header_len, (size_t)content_len,
+            have_remote_command ? (int)remote_command : -1,
+            dispatched);
         if (!response_ok) {
             LOG_ERROR("[MRP] event response send failed");
             return false;
@@ -1453,6 +1535,12 @@ void ap2_mrp_destroy(struct ap2_mrp_ctx *m)
     free(m->artwork_mime);
     free(m->artwork);
     free(m);
+}
+
+void ap2_mrp_set_experimental_homepod_remote(struct ap2_mrp_ctx *m, bool enabled)
+{
+    if (!m) return;
+    m->experimental_homepod_remote = enabled;
 }
 
 bool ap2_mrp_attach_events(struct ap2_mrp_ctx *m, int event_sock)
@@ -2074,7 +2162,7 @@ bool ap2_mrp_build_supportedcommands_command(struct ap2_mrp_ctx *m,
      * the pyatv protobuf Command enum used in the type-130 SET_STATE path. */
     ap2_pl_node *arr = ap2_pl_array();
 
-    if (m && m->is_live) {
+    if (m && (m->is_live || m->experimental_homepod_remote)) {
         /* Only commands accepted by mrp_parse_remote_command: Apple command
          * numbering Play=0, Pause=1, Toggle=2, Next=4, Previous=5. */
         static const int live[] = {0, 1, 2, 4, 5};

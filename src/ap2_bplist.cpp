@@ -115,7 +115,7 @@ static bool bp_read_count(const uint8_t *obj, size_t len, size_t *pos, size_t *c
     if (*pos >= len || (obj[*pos] & 0xF0) != 0x10) return false;
     size_t ibytes = (size_t)1 << (obj[*pos] & 0x0F);
     (*pos)++;
-    if (*pos + ibytes > len) return false;
+    if (ibytes > 8 || ibytes > len - *pos) return false;
     uint64_t v = 0;
     for (size_t i = 0; i < ibytes; i++) v = (v << 8) | obj[(*pos)++];
     *count = (size_t)v;
@@ -235,6 +235,28 @@ static bool bp_find_dict_child_ref(const bp_raw_view *view,
     uint64_t dict_ref;
     return bp_find_value_ref(view, dict_key, &dict_ref) &&
            bp_dict_find_value_ref(view, dict_ref, key, value_ref);
+}
+
+int ap2_bplist_get_params_data(const uint8_t *data, size_t len,
+                                const uint8_t **out, size_t *out_len)
+{
+    bp_raw_view view;
+    uint64_t params_ref, data_ref;
+    if (!out || !out_len || !bp_view_init(data, len, &view) ||
+        view.table_ofs < 8 || !view.num_objects)
+        return 0;
+    uint64_t root_ref = bp_read_be(data + len - 16, 8);
+    if (!bp_dict_find_value_ref(&view, root_ref, "params", &params_ref) ||
+        !bp_dict_find_value_ref(&view, params_ref, "data", &data_ref))
+        return 0;
+    size_t pos = bp_view_obj_ofs(&view, data_ref), count;
+    if (pos < 8 || pos >= view.table_ofs || (data[pos] & 0xf0) != 0x40 ||
+        !bp_read_count(data, view.table_ofs, &pos, &count) ||
+        count > view.table_ofs - pos)
+        return 0;
+    *out = data + pos;
+    *out_len = count;
+    return 1;
 }
 
 int ap2_bplist_get_root_string(const uint8_t *data, size_t len, const char *key,

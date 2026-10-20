@@ -140,6 +140,10 @@ bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed);
  * success. This derives the independent Events-Salt keys and services encrypted
  * reverse HTTP requests with 200 responses from ap2_mrp_tick().
  */
+/* Internal session policy. Set once before publishing the context; callers use
+ * the existing MRP state lock/serializer for subsequent command snapshots. */
+void ap2_mrp_set_experimental_homepod_remote(struct ap2_mrp_ctx *m, bool enabled);
+
 bool ap2_mrp_attach_events(struct ap2_mrp_ctx *m, int event_sock);
 
 /*

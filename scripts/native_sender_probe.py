@@ -27,6 +27,14 @@ AUDIO = re.compile(rb"buffered_ms=[1-9][0-9]{0,19}$")
 MRP_STATUS = re.compile(rb"(?:-1|0|1|[1-5][0-9]{2})$")
 SAFE_FIELDS: dict[str, dict[bytes, set[bytes]]] = {
     "mrp": {b"path": {b"channel", b"command"}},
+    "homepod_remote_admission": {b"enabled": {b"0", b"1"}},
+    "homepod_remote": {
+        b"channel": {b"event", b"datastream"},
+        b"frame_kind": {b"command", b"sync", b"reply", b"unknown"},
+        b"classification": {b"command", b"protobuf", b"invalid", b"unknown"},
+        b"command": {b"play", b"pause", b"toggle", b"next", b"previous", b"unknown"},
+        b"dispatched": {b"0", b"1"},
+    },
     "clock_ready": {
         b"mode": {b"ptp", b"ntp"},
         b"state": {b"cold", b"probing", b"ready", b"stalled"},
@@ -37,6 +45,13 @@ SAFE_FIELDS: dict[str, dict[bytes, set[bytes]]] = {
         b"timing": {b"ptp", b"ntp"},
     },
 }
+SAFE_NUMBERS = {
+    b"ordinal": (1, 128),
+    b"elapsed_ms": (0, 2**63 - 1),
+    b"protobuf_type": (-1, 65535),
+    b"bytes": (0, 65536),
+}
+NUMBER = re.compile(rb"(?:0|[1-9][0-9]{0,18}|-1)$")
 COMMANDS = (
     b"TITLE=AirPlay relay probe\nARTIST=\nALBUM=\nITEMID=native-relay-probe\n"
     b"DURATION=0\nSTART_UNIX_MS=0\nACTION=SENDMETA\nACTION=START\n"
@@ -55,8 +70,16 @@ def safe_fields(chunk: bytes, name: str) -> dict[str, str]:
     allowed = SAFE_FIELDS.get(name, {})
     for field in chunk.split()[2:]:
         key, _, value = field.partition(b"=")
-        if value in allowed.get(key, set()) or (
-            name == "mrp" and key == b"status" and MRP_STATUS.fullmatch(value)
+        numeric = (
+            name == "homepod_remote"
+            and key in SAFE_NUMBERS
+            and NUMBER.fullmatch(value)
+            and SAFE_NUMBERS[key][0] <= int(value) <= SAFE_NUMBERS[key][1]
+        )
+        if (
+            numeric
+            or value in allowed.get(key, set())
+            or (name == "mrp" and key == b"status" and MRP_STATUS.fullmatch(value))
         ):
             result[key.decode("ascii")] = value.decode("ascii")
     return result
@@ -70,6 +93,8 @@ class Reader:
         self.records: queue.Queue[tuple[str, str, dict[str, str]]] = queue.Queue(
             maxsize=128
         )
+        self.admission_enabled = threading.Event()
+        self.admission_denied = threading.Event()
         self.connected = threading.Event()
         self.started = threading.Event()
         self.failed = threading.Event()
@@ -104,6 +129,11 @@ class Reader:
                         self.ntp_seen.set()
                     if {b"mode=ptp", b"state=ready"} <= fields:
                         self.ptp_ready.set()
+                if name == "homepod_remote_admission":
+                    if b"enabled=0" in fields:
+                        self.admission_denied.set()
+                    if b"enabled=1" in fields:
+                        self.admission_enabled.set()
                 if name == "connected":
                     self.connected.set()
                 elif name == "started":
@@ -127,17 +157,25 @@ def stop(child: subprocess.Popen[bytes]) -> None:
     child.wait()
 
 
-def child_env(type130: int) -> dict[str, str]:
+def child_env(type130: int, experimental_homepod_remote: int = 0) -> dict[str, str]:
     """Pass only platform runtime variables, never inherited auth or tokens."""
-    return {
-        key: os.environ[key]
-        for key in ("PATH", "SYSTEMROOT", "TMPDIR")
-        if key in os.environ
-    } | {
-        "CLIAIRPLAY_MRP": "1",
-        "CLIAIRPLAY_MRP_TYPE130": str(type130),
-        "CLIAIRPLAY_BUFFERED": "0",
-    }
+    return (
+        {
+            key: os.environ[key]
+            for key in ("PATH", "SYSTEMROOT", "TMPDIR")
+            if key in os.environ
+        }
+        | {
+            "CLIAIRPLAY_MRP": "1",
+            "CLIAIRPLAY_MRP_TYPE130": str(type130),
+            "CLIAIRPLAY_BUFFERED": "0",
+        }
+        | (
+            {"CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE": "1"}
+            if experimental_homepod_remote == 1
+            else {}
+        )
+    )
 
 
 def check_binary(binary: str, env: dict[str, str], deadline: float) -> None:
@@ -159,7 +197,7 @@ def check_binary(binary: str, env: dict[str, str], deadline: float) -> None:
 def probe(opts: argparse.Namespace) -> bool:
     """Run one sender within one absolute TTL; always clean up the FIFO and child."""
     deadline = time.monotonic() + opts.duration
-    env = child_env(opts.type130)
+    env = child_env(opts.type130, opts.experimental_homepod_remote)
     check_binary(str(opts.binary), env, deadline)
     if time.monotonic() >= deadline:
         return False
@@ -223,6 +261,11 @@ def probe(opts: argparse.Namespace) -> bool:
                                 break
                             emit(kind, name=name, **fields)
                             emitted += 1
+                        if (
+                            opts.experimental_homepod_remote == 1
+                            and reader.admission_denied.is_set()
+                        ):
+                            break
                         if reader.failed.is_set() or (
                             opts.timing == "ptp" and reader.ntp_seen.is_set()
                         ):
@@ -232,6 +275,10 @@ def probe(opts: argparse.Namespace) -> bool:
                             reader.connected.is_set()
                             and reader.audio.is_set()
                             and clock_ready
+                            and (
+                                opts.experimental_homepod_remote == 0
+                                or reader.admission_enabled.is_set()
+                            )
                             and not sent
                         ):
                             if os.write(fd, COMMANDS) != len(COMMANDS):
@@ -253,6 +300,10 @@ def probe(opts: argparse.Namespace) -> bool:
                     ready
                     and not reader.failed.is_set()
                     and exited is None
+                    and not (
+                        opts.experimental_homepod_remote == 1
+                        and reader.admission_denied.is_set()
+                    )
                     and not (opts.timing == "ptp" and reader.ntp_seen.is_set())
                 )
         finally:
@@ -282,6 +333,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--host", type=ipv4, required=True)
     result.add_argument("--bind", type=ipv4, required=True)
     result.add_argument("--type130", type=int, choices=(0, 1), required=True)
+    result.add_argument(
+        "--experimental-homepod-remote", type=int, choices=(0, 1), default=0
+    )
     result.add_argument("--duration", type=int, choices=range(1, 121), default=45)
     result.add_argument("--debug", type=int, choices=(0, 1), default=0)
     result.add_argument("--timing", choices=("ntp", "ptp"), default="ntp")

@@ -61,6 +61,10 @@ class NativeSenderProbeTest(unittest.TestCase):
                 os.close(fd)
                 print('RAW SECRET pairing token=do-not-emit', flush=True)
                 print('[STATUS] connected secret=do-not-emit', flush=True)
+                if mode != 'old_binary':
+                    enabled = '1' if os.environ.get('CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE') == '1' and mode != 'ineligible' else '0'
+                    print('[STATUS] homepod_remote_admission enabled=' + enabled, flush=True)
+                    print('[STATUS] homepod_remote ordinal=1 elapsed_ms=0 channel=event frame_kind=command classification=command command=play protobuf_type=-1 bytes=123 dispatched=1 secret=do-not-emit', flush=True)
                 timing = args[args.index('--timing') + 1]
                 if mode == 'fallback':
                     print('[STATUS] clock_ready mode=ntp state=ready', flush=True)
@@ -152,6 +156,71 @@ class NativeSenderProbeTest(unittest.TestCase):
         self.assertNotIn("private", str(data["env"]))
         self.assertIn("'CLIAIRPLAY_MRP_TYPE130': '1'", str(data["env"]))
         self.assertIn("'CLIAIRPLAY_BUFFERED': '0'", str(data["env"]))
+
+    def test_experimental_admission_is_explicit_and_required(self) -> None:
+        """Never inherit admission; an old or ineligible binary cannot START."""
+        with patch.dict(os.environ, {"CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE": "1"}):
+            self.assertNotIn(
+                "CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE", probe.child_env(1, 0)
+            )
+            env = probe.child_env(0, 1)
+            self.assertEqual(env["CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE"], "1")
+            self.assertEqual(env["CLIAIRPLAY_MRP_TYPE130"], "0")
+        with patch.dict(os.environ, {"CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE": "1"}):
+            code, output = self.run_probe()
+        self.assertEqual(code, 0, output)
+        data = self.assert_cleaned()
+        env = data["env"]
+        assert isinstance(env, dict)
+        self.assertNotIn("CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE", env)
+        for mode, expected in (("success", 0), ("old_binary", 1), ("ineligible", 1)):
+            with self.subTest(mode=mode):
+                self.make_binary(mode)
+                code, output = self.run_probe("--experimental-homepod-remote", "1")
+                self.assertEqual(code, expected, output)
+                data = self.assert_cleaned()
+                self.assertIn(
+                    "'CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE': '1'", str(data["env"])
+                )
+                if expected:
+                    self.assertNotIn("commands", data)
+                else:
+                    records = [json.loads(line) for line in output.splitlines()]
+                    diagnostic = next(
+                        r for r in records if r.get("name") == "homepod_remote"
+                    )
+                    self.assertEqual(diagnostic["dispatched"], "1")
+                    self.assertEqual(diagnostic["bytes"], "123")
+                    self.assertNotIn("do-not-emit", output)
+
+    def test_diagnostic_allowlist_and_numeric_bounds(self) -> None:
+        """Retain fixed classifications only; dispatched does not mean action executed."""
+        safe = probe.safe_fields(
+            b"[STATUS] homepod_remote ordinal=128 elapsed_ms=123 channel=datastream "
+            b"frame_kind=sync classification=protobuf command=unknown protobuf_type=139 "
+            b"bytes=65536 dispatched=0 type=SECRET value=SECRET token=SECRET",
+            "homepod_remote",
+        )
+        self.assertEqual(safe["protobuf_type"], "139")
+        self.assertEqual(safe["ordinal"], "128")
+        self.assertNotIn("SECRET", str(safe))
+        for field in (
+            b"ordinal=129",
+            b"elapsed_ms=-1",
+            b"protobuf_type=65536",
+            b"bytes=65537",
+            b"bytes=01",
+            b"bytes=999999999999999999999999",
+            b"frame_kind=SECRET",
+            b"command=SECRET",
+            b"dispatched=2",
+        ):
+            self.assertEqual(
+                probe.safe_fields(
+                    b"[STATUS] homepod_remote " + field, "homepod_remote"
+                ),
+                {},
+            )
 
     def test_failures_and_cleanup(self) -> None:
         """Reject malformed checks, unreachable targets, missing starts and errors."""
@@ -254,11 +323,13 @@ class NativeSenderProbeTest(unittest.TestCase):
             + b"x" * 5000
             + b"\n"
             + b"[EVENT] remote secret=hidden\n" * 1000
+            + b"[STATUS] homepod_remote_admission enabled=1\n"
             + b"[STATUS] connected\n[STATUS] started\n[STATUS] error detail=hidden\n"
         )
         reader = probe.Reader(stream)
         reader.thread.join(timeout=1)
         self.assertEqual(reader.records.qsize(), 128)
+        self.assertTrue(reader.admission_enabled.is_set())
         self.assertTrue(reader.connected.is_set())
         self.assertTrue(reader.started.is_set())
         self.assertTrue(reader.failed.is_set())

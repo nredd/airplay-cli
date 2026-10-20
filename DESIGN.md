@@ -744,6 +744,69 @@ Hardware confirmation remains required for bridge acceptance of the live key,
 receiver duration clearing and pyatv SetPosition/SetShuffle/SetRepeat becoming
 unavailable, plus live -> non-live restoration and programme/artwork stability.
 
+**Experimental HomePod admission, source preparation only.**
+`CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE=1` accepts only literal `1` and defaults
+off. A per-session policy is snapshotted before the session SETUP using the
+existing TXT model/version and MRP environment helpers: exact `AudioAccessory5,1`
+(`model`, falling back to `am`), known OS major 27 (`osvers`, falling back to `ov`
+only when absent), native encrypted MRP eligibility, registered remote callback,
+MRP enabled, effective PTP and realtime. Firmware-only identification, unknown
+versions, future majors, buffered/NTP/compat sessions and missing callbacks do
+not qualify. It adds the pair `senderSupportsRelay=true` and
+`isMultiSelectAirPlay=true` to the actual PTP session writer only when eligible;
+disabled/ineligible PTP and NTP writers preserve canonical bytes and ordering.
+No matrix `PROBE_*` flags, clock hot-flips, PTP policy changes or type-130
+activation are introduced.
+
+Before declaring an admitted connection successful, the existing MRP attach path
+must have an encrypted reverse event channel ready. Failure remains a generic
+`connect_failed` with normal teardown/cleanup, not silent audio-only success.
+The context command-policy flag is set before publication and command builders
+snapshot it under `mrp_lock`, with publication serialized by `mrp_publish_lock`.
+Blocking I/O remains outside the state lock. In this mode the five implemented
+`/command` controls remain the only advertised commands regardless of live intent
+or live transitions; default nonexperimental/non-live behavior is unchanged.
+Type-130 outbound already has those five controls. Neither channel adds semantic
+handlers. In particular, DataStream sync ACKs are NOT MediaRemote dispatch and
+native MRP/group volume is NOT CLI stream gain. No group-volume routing or
+volume-support claim follows from receiver telemetry.
+
+The next test needs owner UI observation and correlated traces. Admission is not
+proof of native All Speakers & TVs visibility, native controls or a complete
+relay. No production deployment is implied.
+
+**Narrow opt-in diagnostic protocol.** Every native session SETUP attempt reports
+`[STATUS] homepod_remote_admission enabled=0|1` on stdout (fixed boolean only).
+It reports the snapshotted policy, not connection success or UI visibility.
+Only admitted MRP contexts produce the following on stderr, at most 128 records
+per context, while continuing to ACK/service traffic after the cap:
+
+```
+[STATUS] homepod_remote ordinal=1 elapsed_ms=0 channel=event frame_kind=command classification=command command=play protobuf_type=-1 bytes=123 dispatched=1
+```
+
+`channel` is `event|datastream`; `frame_kind` is `command|sync|reply|unknown`.
+`classification` is `command|protobuf|invalid|unknown`; recognized `command` is
+`play|pause|toggle|next|previous`, otherwise `unknown`. `protobuf_type` is -1
+(unknown) or 0..65535; `bytes` is the payload length; `ordinal` is local 1..128;
+`elapsed_ms` is relative monotonic time from the first record. `dispatched=1`
+means a recognized reverse command and callback invoked, NOT an executed MA
+action. DataStream always reports `dispatched=0`, including sync ACKs.
+
+The classifier reads only root `params.data` via bounded bplist traversal, then
+one length-prefixed protobuf envelope (maximum payload 65536 bytes), validating
+varints and skipping bounded wire-0/1/2/5 fields to report integer field 1 only.
+Malformed/truncated data, duplicate or wrong-wire field 1, unsupported wire
+formats and multiple envelopes are invalid; missing/unrecognized containers
+or out-of-range types are unknown. It does not parse extensions, invent message
+semantics, reinterpret unknown messages or dispatch data-channel messages.
+Unknown strings remain unknown. No bodies, arbitrary strings, keys, tokens,
+metadata, addresses, IDs or receiver sequence numbers enter this trace; the
+ordinal is sender-local. Existing raw debug is not enabled/reused and global
+privacy defaults do not change. `native_sender_probe.py` independently allowlists
+these fixed enums and numeric ranges into its bounded JSON and requires enabled
+admission before metadata/START when explicitly requested.
+
 **Artwork evidence, probing, and per-push bytes.** AirPlaySender requests
 600x600 artwork from MediaRemote, and the captured iPhone command used a
 600x600, three-component baseline JPEG of about 43 KB. These establish a known
@@ -1202,6 +1265,8 @@ verbosity, never its stream.
 | `[STATUS] latency` | stdout | once after connect, AirPlay 2 route only |
 | `[STATUS] mrp path=channel` | stdout | once after connect, only when type-130 is enabled (§8) |
 | `[STATUS] mrp path=command` | stdout | on each change of the `/command` HTTP status |
+| `[STATUS] homepod_remote_admission` | stdout | once before native session SETUP; snapshotted enabled=0/1, not success |
+| `[STATUS] homepod_remote` | stderr | opt-in only, maximum 128 fixed diagnostic records per context (§8) |
 | `[EVENT] remote command=` | stdout | device-originated remote-control press |
 | `[STATUS] connected` | stderr | once, when the session is up |
 | `[STATUS] clock_ready` | stderr | after `connected`, then on material change until `state=ready` (§6) |

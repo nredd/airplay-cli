@@ -65,8 +65,9 @@ static void check_commands(struct ap2_mrp_ctx *m, bool live)
     size_t count = test_count(b, &pos);
     static const int baseline[] = {26,25,24,18,17,10,11,8,9,5,4,3,2,1,0};
     static const int radio[] = {0,1,2,4,5};
-    const int *expected = live ? radio : baseline;
-    assert(count == (live ? 5 : 15));
+    bool restricted = live || m->experimental_homepod_remote;
+    const int *expected = restricted ? radio : baseline;
+    assert(count == (restricted ? 5 : 15));
     for (size_t i = 0; i < count; i++) {
         size_t blob = test_object(b, (size_t)len,
             test_be(b + pos + i * b[len - 25], b[len - 25]));
@@ -75,7 +76,7 @@ static void check_commands(struct ap2_mrp_ctx *m, bool live)
         uint64_t cmd = 999;
         assert(ap2_bplist_find_uint(b + blob, bytes, "kCommandInfoCommandKey", &cmd));
         assert(cmd == (uint64_t)expected[i]);
-        if (live) {
+        if (restricted) {
             size_t enabled = test_value(b + blob, bytes, "kCommandInfoEnabledKey");
             assert(enabled && b[blob + enabled] == 0x09);
             assert(!test_value(b + blob, bytes, "kCommandInfoOptionsKey"));
@@ -175,7 +176,7 @@ static void check_state(struct ap2_mrp_ctx *m, bool live, bool duration)
     check_commands(m, live);
 }
 
-static void test_live_bundle(void)
+static void test_live_bundle(bool experimental)
 {
     cli_config_t cfg = {.protocol = PROTO_AIRPLAY2};
     ap2_device_info_t device = {.name = "live test", .address = "127.0.0.1", .port = 7000};
@@ -186,6 +187,7 @@ static void test_live_bundle(void)
     struct ap2_mrp_ctx *m = ap2_mrp_create("127.0.0.1", 7000, NULL,
         "0011223344556677", "Live test", NULL, NULL, NULL, 0);
     assert(m);
+    ap2_mrp_set_experimental_homepod_remote(m, experimental);
     ap2cl_test_set_mrp(g_ap2cl, m);
     handle_command("TITLE", "Finite track", &cfg);
     handle_command("ITEMID", "station-id", &cfg);
@@ -265,9 +267,190 @@ static void test_live_remote_mapping(void)
     }
 }
 
+static uint8_t *diag_payload(const uint8_t *pb, size_t bytes, int *len)
+{
+    ap2_pl_node *root = ap2_pl_dict(), *params = ap2_pl_dict();
+    ap2_pl_dict_set(params, "data", ap2_pl_data(pb, bytes));
+    ap2_pl_dict_set(root, "params", params);
+    uint8_t *out = NULL;
+    *len = ap2_pl_serialize(root, &out);
+    ap2_pl_free(root);
+    return out;
+}
+
+int ap2cl_test_session_setup(bool ptp, bool enabled, uint8_t **out);
+
+static void test_paired_setup_booleans(void)
+{
+    uint8_t *b = NULL;
+    int len = ap2cl_test_session_setup(true, true, &b);
+    size_t relay = test_value(b, (size_t)len, "senderSupportsRelay");
+    size_t multi = test_value(b, (size_t)len, "isMultiSelectAirPlay");
+    assert(relay && multi && b[relay] == 0x09 && b[multi] == 0x09);
+    free(b);
+    for (unsigned ptp = 0; ptp < 2; ptp++) {
+        len = ap2cl_test_session_setup(ptp, false, &b);
+        assert(!test_value(b, (size_t)len, "senderSupportsRelay"));
+        assert(!test_value(b, (size_t)len, "isMultiSelectAirPlay"));
+        free(b);
+    }
+}
+
+static void test_diagnostic_classifier(void)
+{
+    /* One envelope, field 1 only. Opaque extension strings never become types. */
+    static const uint8_t valid[] = {10, 8, 139, 1, 18, 5, 'S','E','C','R','T'};
+    int len, type;
+    uint8_t *b = diag_payload(valid, sizeof(valid), &len);
+    assert(!strcmp(mrp_diag_protobuf(b, (size_t)len, &type), "protobuf") && type == 139);
+    assert(!strcmp(mrp_diag_protobuf(b, 65537, &type), "invalid") && type == -1);
+    for (int n = 0; n < len; n++) {
+        const char *result = mrp_diag_protobuf(b, (size_t)n, &type);
+        assert(!strcmp(result, "unknown") || !strcmp(result, "invalid"));
+    }
+    free(b);
+    static const uint8_t malformed[][12] = {
+        {2, 8}, {2, 8, 128}, {2, 0, 1}, {2, 15, 1},
+        {4, 8, 1, 8, 2}, {2, 10, 0}, {3, 18, 8, 0},
+        {11, 8, 255,255,255,255,255,255,255,255,255,2}
+    };
+    static const size_t sizes[] = {2,3,3,3,5,3,4,12};
+    for (size_t i = 0; i < sizeof(sizes)/sizeof(sizes[0]); i++) {
+        b = diag_payload(malformed[i], sizes[i], &len);
+        assert(!strcmp(mrp_diag_protobuf(b, (size_t)len, &type), "invalid") && type == -1);
+        free(b);
+    }
+    static const uint8_t unknown[] = {4, 8, 128,128,4}; /* type 65536 */
+    b = diag_payload(unknown, sizeof(unknown), &len);
+    assert(!strcmp(mrp_diag_protobuf(b, (size_t)len, &type), "unknown") && type == -1);
+    free(b);
+}
+
+static void diag_callback(ap2_remote_command_t command, void *userdata)
+{
+    assert(command == AP2_REMOTE_COMMAND_PLAY);
+    (*(unsigned *)userdata)++;
+}
+
+/* Encrypt into the actual input sockets, exercising authentication, framing,
+ * classification, acknowledgement and dispatch rather than calling a model. */
+static void diag_send(struct ap2_mrp_ctx *m, int fd, bool event,
+                      uint64_t *counter, const uint8_t *body, int bytes)
+{
+    uint8_t *encrypted = NULL;
+    int n = mrp_channel_encrypt_with(event ? m->event_in_key : m->in_key,
+        counter, body, bytes, &encrypted);
+    assert(n > 0 && write(fd, encrypted, (size_t)n) == n);
+    free(encrypted);
+    ap2_mrp_tick(m);
+    assert(event ? ap2_mrp_event_status(m) == 1 : m->connected);
+    uint8_t ack[2048];
+    /* Only sync DataStream frames receive an ACK; unknown kinds do not. */
+    ssize_t ack_len = recv(fd, ack, sizeof(ack), MSG_DONTWAIT);
+    if (event || !memcmp(body + 4, "sync", 4)) assert(ack_len > 0);
+}
+
+static void test_encrypted_diagnostics_and_cap(void)
+{
+    int events[2], data[2];
+    assert(!socketpair(AF_UNIX, SOCK_STREAM, 0, events));
+    assert(!socketpair(AF_UNIX, SOCK_STREAM, 0, data));
+    uint8_t secret[32] = {1};
+    struct ap2_mrp_ctx *m = ap2_mrp_create("127.0.0.1", 7000, NULL, "1",
+        "SECRET_METADATA", NULL, NULL, secret, sizeof(secret));
+    assert(m && ap2_mrp_attach_events(m, events[0]));
+    m->sock = data[0];
+    m->connected = true;
+    unsigned callbacks = 0;
+    ap2_mrp_set_remote_command_callback(m, diag_callback, &callbacks);
+    uint64_t event_counter = 0, data_counter = 0;
+    int saved = dup(STDERR_FILENO);
+    FILE *capture = tmpfile();
+    assert(saved >= 0 && capture && dup2(fileno(capture), STDERR_FILENO) >= 0);
+
+    ap2_pl_node *root = ap2_pl_dict();
+    ap2_pl_dict_set(root, "type", ap2_pl_string("sendMediaRemoteCommand"));
+    ap2_pl_dict_set(root, "value", ap2_pl_string("play"));
+    ap2_pl_dict_set(root, "secret", ap2_pl_string("SECRET_TOKEN_AND_ID"));
+    uint8_t *b = NULL;
+    int n = ap2_pl_serialize(root, &b);
+    ap2_pl_free(root);
+    uint8_t event[2048];
+    int header = snprintf((char *)event, sizeof(event),
+        "POST /command HTTP/1.1\r\nContent-Length: %d\r\n\r\n", n);
+    memcpy(event + header, b, (size_t)n);
+    free(b);
+    int event_len = header + n;
+    diag_send(m, events[1], true, &event_counter, event, event_len);
+    assert(callbacks == 1 && m->diagnostic_count == 0); /* default off */
+    ap2_mrp_set_experimental_homepod_remote(m, true);
+    diag_send(m, events[1], true, &event_counter, event, header + n);
+
+    root = ap2_pl_dict();
+    ap2_pl_dict_set(root, "type", ap2_pl_string("SECRET_TYPE"));
+    ap2_pl_dict_set(root, "value", ap2_pl_string("SECRET_VALUE"));
+    n = ap2_pl_serialize(root, &b);
+    ap2_pl_free(root);
+    uint8_t unknown_event[2048];
+    int unknown_header = snprintf((char *)unknown_event, sizeof(unknown_event),
+        "POST /command HTTP/1.1\r\nContent-Length: %d\r\n\r\n", n);
+    memcpy(unknown_event + unknown_header, b, (size_t)n);
+    free(b);
+    diag_send(m, events[1], true, &event_counter, unknown_event, unknown_header + n);
+    assert(callbacks == 2);
+
+    static const uint8_t protobuf[] = {3, 8, 139, 1};
+    b = diag_payload(protobuf, sizeof(protobuf), &n);
+    uint8_t frame[2048];
+    mrp_write_data_header(frame, "sync", "comm", 42, n);
+    memcpy(frame + MRP_DATA_HDR_LEN, b, (size_t)n);
+    free(b);
+    diag_send(m, data[1], false, &data_counter, frame, MRP_DATA_HDR_LEN + n);
+    assert(m->diagnostic_count == 3);
+    static const uint8_t invalid_pb[] = {2, 8, 128};
+    b = diag_payload(invalid_pb, sizeof(invalid_pb), &n);
+    mrp_write_data_header(frame, "SECR", "comm", 43, n);
+    memcpy(frame + MRP_DATA_HDR_LEN, b, (size_t)n);
+    free(b);
+    diag_send(m, data[1], false, &data_counter, frame, MRP_DATA_HDR_LEN + n);
+    for (unsigned i = 0; i < 140; i++)
+        diag_send(m, events[1], true, &event_counter, event, event_len);
+    /* Every record after the cap is still acknowledged and dispatched. */
+    assert(m->diagnostic_count == 128 && callbacks == 142);
+    fflush(stderr);
+    assert(dup2(saved, STDERR_FILENO) >= 0);
+    close(saved);
+    rewind(capture);
+    char line[1024];
+    unsigned records = 0;
+    bool saw_data = false;
+    while (fgets(line, sizeof(line), capture)) {
+        assert(strstr(line, "[STATUS] homepod_remote ordinal="));
+        assert(!strstr(line, "SECRET") && !strstr(line, "token=") && !strstr(line, "metadata="));
+        if (strstr(line, "channel=datastream")) {
+            assert((strstr(line, "frame_kind=sync classification=protobuf") && strstr(line, "protobuf_type=139")) ||
+                   (strstr(line, "frame_kind=unknown classification=invalid") && strstr(line, "protobuf_type=-1")));
+            assert(strstr(line, "dispatched=0")); /* sync ACK is not dispatch */
+            saw_data = true;
+        } else if (strstr(line, "classification=unknown"))
+            assert(strstr(line, "command=unknown") && strstr(line, "dispatched=0"));
+        else assert(strstr(line, "command=play") && strstr(line, "dispatched=1"));
+        records++;
+    }
+    assert(records == 128 && saw_data);
+    fclose(capture);
+    ap2_mrp_destroy(m);
+    close(events[1]);
+    close(data[1]);
+}
+
 int main(void)
 {
-    test_live_bundle();
+    test_paired_setup_booleans();
+    test_diagnostic_classifier();
+    test_encrypted_diagnostics_and_cap();
+    test_live_bundle(false);
+    test_live_bundle(true);
     test_live_remote_mapping();
     puts("Live metadata cmdpipe, serializer and remote mapping tests passed");
     return 0;

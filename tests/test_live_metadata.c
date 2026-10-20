@@ -444,8 +444,11 @@ static void test_encrypted_diagnostics_and_cap(void)
     close(data[1]);
 }
 
+#include "mrp_volume_fixture.h"
+
 int main(void)
 {
+    test_observe_only_volume();
     test_paired_setup_booleans();
     test_diagnostic_classifier();
     test_encrypted_diagnostics_and_cap();

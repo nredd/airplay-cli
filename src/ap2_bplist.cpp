@@ -181,7 +181,8 @@ static bool bp_ascii_key_equals(const bp_raw_view *view, uint64_t ref,
 }
 
 static bool bp_dict_find_value_ref(const bp_raw_view *view, uint64_t dict_ref,
-                                   const char *key, uint64_t *value_ref)
+                                   const char *key, uint64_t *value_ref,
+                                   bool unique = false)
 {
     size_t pos = bp_view_obj_ofs(view, dict_ref);
     if (!pos || pos >= view->table_ofs ||
@@ -192,16 +193,19 @@ static bool bp_dict_find_value_ref(const bp_raw_view *view, uint64_t dict_ref,
     if (!bp_read_count(view->data, view->table_ofs, &pos, &count)) return false;
     if (count > (view->table_ofs - pos) / (2 * view->ref_size)) return false;
 
+    bool found = false;
     for (size_t i = 0; i < count; i++) {
         uint64_t key_ref = bp_read_be(view->data + pos + i * view->ref_size,
                                       view->ref_size);
         if (!bp_ascii_key_equals(view, key_ref, key)) continue;
+        if (found) return false;
         *value_ref = bp_read_be(view->data + pos +
                                 (count + i) * view->ref_size,
                                 view->ref_size);
-        return true;
+        if (!unique) return true;
+        found = true;
     }
-    return false;
+    return found;
 }
 
 static bool bp_find_value_ref(const bp_raw_view *view, const char *key,
@@ -246,8 +250,8 @@ int ap2_bplist_get_params_data(const uint8_t *data, size_t len,
         view.table_ofs < 8 || !view.num_objects)
         return 0;
     uint64_t root_ref = bp_read_be(data + len - 16, 8);
-    if (!bp_dict_find_value_ref(&view, root_ref, "params", &params_ref) ||
-        !bp_dict_find_value_ref(&view, params_ref, "data", &data_ref))
+    if (!bp_dict_find_value_ref(&view, root_ref, "params", &params_ref, true) ||
+        !bp_dict_find_value_ref(&view, params_ref, "data", &data_ref, true))
         return 0;
     size_t pos = bp_view_obj_ofs(&view, data_ref), count;
     if (pos < 8 || pos >= view.table_ofs || (data[pos] & 0xf0) != 0x40 ||

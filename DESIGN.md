@@ -814,7 +814,7 @@ Only admitted MRP contexts produce the following on stderr, at most 128 records
 per context, while continuing to ACK/service traffic after the cap:
 
 ```
-[STATUS] homepod_remote ordinal=1 elapsed_ms=0 channel=event frame_kind=command classification=command command=play protobuf_type=-1 bytes=123 dispatched=1
+[STATUS] homepod_remote ordinal=1 elapsed_ms=0 channel=event frame_kind=command classification=command command=play protobuf_type=-1 bytes=123 dispatched=1 message=transport target=missing value_state=missing
 ```
 
 `channel` is `event|datastream`; `frame_kind` is `command|sync|reply|unknown`.
@@ -825,19 +825,74 @@ per context, while continuing to ACK/service traffic after the cap:
 means a recognized reverse command and callback invoked, NOT an executed MA
 action. DataStream always reports `dispatched=0`, including sync ACKs.
 
-The classifier reads only root `params.data` via bounded bplist traversal, then
-one length-prefixed protobuf envelope (maximum payload 65536 bytes), validating
-varints and skipping bounded wire-0/1/2/5 fields to report integer field 1 only.
-Malformed/truncated data, duplicate or wrong-wire field 1, unsupported wire
-formats and multiple envelopes are invalid; missing/unrecognized containers
-or out-of-range types are unknown. It does not parse extensions, invent message
-semantics, reinterpret unknown messages or dispatch data-channel messages.
-Unknown strings remain unknown. No bodies, arbitrary strings, keys, tokens,
-metadata, addresses, IDs or receiver sequence numbers enter this trace; the
-ordinal is sender-local. Existing raw debug is not enabled/reused and global
-privacy defaults do not change. `native_sender_probe.py` independently allowlists
-these fixed enums and numeric ranges into its bounded JSON and requires enabled
-admission before metadata/START when explicitly requested.
+The classifier reads only exact root `params.data` via bounded bplist traversal,
+then one length-prefixed protobuf envelope (maximum payload 65536 bytes), validating
+bounded varints and wire-0/1/2/5 lengths. Missing/unrecognized containers (including
+ambiguous duplicate `params`/`data` keys) and out-of-range types stay unknown.
+Malformed/truncated protobufs, duplicate fields, wrong known-field wire types,
+unsupported wires and multiple envelopes are invalid. Semantic parsing is bounded
+to 256 fields per message, including unknown fields, with no recursive search for
+volume-looking bytes or nested decoys. The narrow classifier requires a single
+extension and rejects extra extension fields, even if a full MRP decoder could
+accept them. This is a diagnostic classifier limit, not a full MRP decoder.
+
+This fork-only seam observes volume; it does NOT implement group volume. `message`
+is `transport|receiver_telemetry|volume_set_candidate|volume_feedback|volume_get|volume_result|volume_capability|unknown|invalid`.
+The existing `classification` still describes envelope/transport shape; `message`
+adds schema validation, so `classification=protobuf message=invalid` is possible.
+A known root `receiverVolumeDidChange` is always `receiver_telemetry`; its arbitrary
+`value` is not interpreted. For data envelopes, semantic classes require the public
+pyatv `ProtocolMessage` type AND matching length-delimited extension:
+
+| Type | Extension | Observation |
+| --- | --- | --- |
+| 49 | 53, GetVolumeMessage | `volume_get`, optional outputDeviceUID field 1 |
+| 50 | 54, GetVolumeResultMessage | `volume_result`, optional float volume field 1 |
+| 51 | 55, SetVolumeMessage | `volume_set_candidate`, float field 1, outputDeviceUID field 2 |
+| 52 | 56, VolumeDidChangeMessage | `volume_feedback`, optional float field 1, endpointUID/outputDeviceUID fields 2/3 |
+| 17 | 22, VolumeControlAvailabilityMessage | `volume_capability`, optional boolean field 1, capabilities field 2 |
+| 64 | 68, VolumeControlCapabilitiesDidChangeMessage | `volume_capability`, nested availability field 1, endpointUID/outputDeviceUID fields 3/4 |
+
+These installed public `.proto` definitions establish schema, NOT actual measured
+HomePod native-slider requests or their scope. `target=missing|unresolved` records
+only absence/presence of a schema UID; no actual binding exists, so `session_group`
+is never claimed. Any invalid parse resets `target=missing`, discarding partial
+target observations. UID bytes are skipped. `value_state=missing|valid|invalid` records
+schema float presence/validation; finite 0..1 values alone emit `value_milli=0..1000`
+(rounded to nearest thousandth). NaN, infinity, out-of-range or wrong-wire values
+are invalid and never emit a number. Type 51 is a `volume_set_candidate` only
+with an actual valid normalized float; missing or invalid volume makes its message
+`invalid`. Although the public field is optional, a candidate needs a concrete level.
+Types 50/52 preserve missing result/feedback observations because their public float
+fields are optional. Missing never implies level zero or a command. The optional
+availability field is not required either. Valid availability/capabilities alone emit
+`available=0|1` and `capabilities=0..3`; absent fields are omitted. Invalid messages
+emit none of these numbers. Unknown fields are structurally skipped, never retained.
+All volume observations have `dispatched=0`; no callbacks, commands, publication,
+volume writes or MA actions result. Flags are not volume command strings.
+DataStream has no semantic dispatch, and all ACK behavior stays unchanged.
+Native receiver MRP volume 50 and CLI stream gain 0 are separate controls.
+
+No bodies, arbitrary strings, keys, tokens, metadata, addresses, IDs or receiver
+sequence numbers enter this trace; the ordinal is sender-local. Reverse-event
+logging at debug level also uses fixed classes/lengths, not type/value/content-type
+strings or body hex. `native_sender_probe.py` independently allowlists these fixed
+enums and numeric ranges into bounded JSON and requires enabled admission before
+metadata/START when explicitly requested. Observations never enter its FIFO action
+queue, which still accepts only public transport play/pause/toggle events.
+`tests/fixtures/homepod_volume_diagnostics.txt` contains sanitized golden lines from
+the encrypted C cases, checked by the C suite (excluding elapsed-time variation)
+and fed directly through Python `safe_fields`/`Reader` to check retention and
+absence of FIFO eligibility without a runtime/device probe.
+
+Next is an operator-authorized bounded muted native-slider experiment on the
+existing admitted profile: record original native volume, move down a small amount,
+then restore that original native volume. No MA group dispatch, helper volume writes,
+clock-policy change or type-130 activation. The existing native iPhone visibility
+and pause/play acceptance remains valid; volume request/scope remains unmeasured.
+This is not a full-relay claim. Inherited OHF policy requires human review before
+any upstream contribution; no upstream submission here, and the owner will open
+an upstream draft after review.
 
 The diagnostic's `--respond-transport 1` is an opt-in test consumer (default `0`
 observes only). It queues only public normalized remote play/pause/toggle events

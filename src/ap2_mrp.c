@@ -21,7 +21,7 @@
 #include <strings.h>
 #include <stdbool.h>
 #include <stdatomic.h>
-#include <ctype.h>
+#include <math.h>
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
@@ -144,8 +144,6 @@ enum mrp_ext_field {
  * arms for the /feedback keepalive worker (seconds, type-130 channel only). */
 #define MRP_STATE_REPUSH_S 15
 #define MRP_WRITE_TIMEOUT_MS 1000
-#define MRP_EVENT_LOG_TEXT_MAX 96
-#define MRP_EVENT_LOG_HEX_MAX  32
 
 struct ap2_mrp_ctx {
     /* Target + identity */
@@ -1039,8 +1037,7 @@ static void mrp_drain_encrypted(struct ap2_mrp_ctx *m)
         mrp_close_data_channel(m);
 }
 
-/* Diagnostics deliberately classify only a single length-prefixed protobuf
- * envelope's field 1. Extensions and values have no inferred semantics. */
+/* Bounded diagnostic parsing only. These observations never dispatch commands. */
 static bool mrp_diag_varint(const uint8_t **p, const uint8_t *end, uint64_t *v)
 {
     *v = 0;
@@ -1093,6 +1090,164 @@ static const char *mrp_diag_protobuf(const uint8_t *body, size_t len, int *type)
     return candidate >= 0 ? "protobuf" : "unknown";
 }
 
+/* Public pyatv proto2 schemas, not a claim about measured HomePod wire traffic.
+ * Reject duplicate fields (including unknown ones) and bound work independently
+ * of the payload byte bound. Unknown bytes are skipped, never retained/logged. */
+struct mrp_diag_reader {
+    const uint8_t *p, *end;
+    uint32_t seen[256];
+    unsigned count;
+};
+
+struct mrp_diag_field {
+    unsigned number, wire;
+    uint64_t integer;
+    const uint8_t *data;
+    size_t len;
+};
+
+static bool mrp_diag_field(struct mrp_diag_reader *r, struct mrp_diag_field *f)
+{
+    uint64_t tag, n = 0;
+    memset(f, 0, sizeof(*f));
+    if (r->count >= 256 || !mrp_diag_varint(&r->p, r->end, &tag) ||
+        !(tag >> 3) || (tag >> 3) > 0x1fffffff) return false;
+    f->number = (unsigned)(tag >> 3);
+    f->wire = tag & 7;
+    for (unsigned i = 0; i < r->count; i++)
+        if (r->seen[i] == f->number) return false;
+    r->seen[r->count++] = f->number;
+    if (f->wire == 0) return mrp_diag_varint(&r->p, r->end, &f->integer);
+    if (f->wire == 1) n = 8;
+    else if (f->wire == 5) n = 4;
+    else if (f->wire != 2 || !mrp_diag_varint(&r->p, r->end, &n)) return false;
+    if (n > (uint64_t)(r->end - r->p)) return false;
+    f->data = r->p;
+    f->len = (size_t)n;
+    r->p += f->len;
+    return true;
+}
+
+struct mrp_diag_volume {
+    const char *message, *target, *value_state;
+    int value_milli, available, capabilities;
+};
+
+/* Availability is also nested in capabilities-did-change field 1. */
+static bool mrp_diag_availability(const uint8_t *p, size_t len,
+                                  struct mrp_diag_volume *v)
+{
+    struct mrp_diag_reader r = {.p = p, .end = p + len};
+    while (r.p < r.end) {
+        struct mrp_diag_field f;
+        if (!mrp_diag_field(&r, &f)) return false;
+        if (f.number == 1 || f.number == 2) {
+            if (f.wire != 0 || f.integer > (f.number == 1 ? 1 : 3)) return false;
+            if (f.number == 1) v->available = (int)f.integer;
+            else v->capabilities = (int)f.integer;
+        }
+    }
+    return true;
+}
+
+static bool mrp_diag_volume_body(int type, const uint8_t *p, size_t len,
+                                 struct mrp_diag_volume *v)
+{
+    if (type == 17) return mrp_diag_availability(p, len, v);
+    struct mrp_diag_reader r = {.p = p, .end = p + len};
+    while (r.p < r.end) {
+        struct mrp_diag_field f;
+        if (!mrp_diag_field(&r, &f)) return false;
+        if (type == 64 && f.number == 1) {
+            if (f.wire != 2 || !mrp_diag_availability(f.data, f.len, v)) return false;
+        } else if (type != 49 && type != 64 && f.number == 1) {
+            if (f.wire != 5) { v->value_state = "invalid"; return false; }
+            uint32_t bits = (uint32_t)f.data[0] | (uint32_t)f.data[1] << 8 |
+                (uint32_t)f.data[2] << 16 | (uint32_t)f.data[3] << 24;
+            float value;
+            memcpy(&value, &bits, sizeof(value));
+            if (!isfinite(value) || value < 0 || value > 1) {
+                v->value_state = "invalid";
+                return false;
+            }
+            v->value_state = "valid";
+            v->value_milli = (int)(value * 1000.0f + 0.5f);
+        } else if ((type == 49 && f.number == 1) ||
+                   (type == 51 && f.number == 2) ||
+                   (type == 52 && (f.number == 2 || f.number == 3)) ||
+                   (type == 64 && (f.number == 3 || f.number == 4))) {
+            if (f.wire != 2) return false;
+            v->target = "unresolved"; /* Presence is NOT a session/group binding. */
+        }
+    }
+    return true;
+}
+
+static struct mrp_diag_volume mrp_diag_volume(const uint8_t *body, size_t len,
+                                             int command, const char *classification)
+{
+    struct mrp_diag_volume v = {command >= 0 ? "transport" : "unknown",
+        "missing", "missing", -1, -1, -1};
+    if (command >= 0) return v;
+    char root_type[64];
+    if (body && len <= 65536 && ap2_bplist_get_root_string(
+            body, len, "type", root_type, sizeof(root_type)) &&
+        !strcmp(root_type, "receiverVolumeDidChange")) {
+        v.message = "receiver_telemetry";
+        return v; /* Arbitrary root value is never interpreted as a command/value. */
+    }
+    if (!strcmp(classification, "invalid")) { v.message = "invalid"; return v; }
+    const uint8_t *p;
+    size_t bytes;
+    if (!body || len > 65536 || !ap2_bplist_get_params_data(body, len, &p, &bytes))
+        return v;
+    const uint8_t *end = p + bytes;
+    uint64_t n;
+    if (!mrp_diag_varint(&p, end, &n) || n != (uint64_t)(end - p)) {
+        v.message = "invalid"; return v;
+    }
+    struct mrp_diag_reader r = {.p = p, .end = end};
+    struct mrp_diag_field extension = {0};
+    int type = -1;
+    while (r.p < r.end) {
+        struct mrp_diag_field f;
+        if (!mrp_diag_field(&r, &f)) goto invalid;
+        if (f.number == 1) {
+            if (f.wire != 0) goto invalid;
+            if (f.integer <= 65535) type = (int)f.integer;
+        } else if (f.number > 5 && f.number != 78 && f.number != 85) {
+            if (extension.number) goto invalid;
+            extension = f;
+        } else {
+            unsigned wire = (f.number == 2 || f.number == 3 ||
+                             f.number == 78 || f.number == 85) ? 2 : 0;
+            if (f.wire != wire) goto invalid;
+        }
+    }
+    unsigned expected;
+    switch (type) {
+        case 17: expected = 22; v.message = "volume_capability"; break;
+        case 49: expected = 53; v.message = "volume_get"; break;
+        case 50: expected = 54; v.message = "volume_result"; break;
+        case 51: expected = 55; v.message = "volume_set_candidate"; break;
+        case 52: expected = 56; v.message = "volume_feedback"; break;
+        case 64: expected = 68; v.message = "volume_capability"; break;
+        default: return v;
+    }
+    if (extension.number != expected || extension.wire != 2 ||
+        !mrp_diag_volume_body(type, extension.data, extension.len, &v)) goto invalid;
+    /* The public field is optional, but a set candidate needs an actual level.
+     * Missing feedback/result levels remain observations, never implicit zero. */
+    if (type == 51 && strcmp(v.value_state, "valid")) goto invalid;
+    return v;
+invalid:
+    v.message = "invalid";
+    v.target = "missing";
+    if (!strcmp(v.value_state, "valid")) v.value_state = "invalid";
+    v.value_milli = v.available = v.capabilities = -1;
+    return v;
+}
+
 static void mrp_diagnostic(struct ap2_mrp_ctx *m, bool event,
     const char *kind, const uint8_t *body, size_t len, int command, bool handled)
 {
@@ -1104,12 +1259,19 @@ static void mrp_diagnostic(struct ap2_mrp_ctx *m, bool event,
         mrp_diag_protobuf(body, len, &type);
     static const char *commands[] = {"play", "pause", "toggle", "next", "previous"};
     const char *name = command >= 0 && command < 5 ? commands[command] : "unknown";
+    struct mrp_diag_volume v = mrp_diag_volume(body, len, command, classification);
+    flockfile(stderr);
     fprintf(stderr, "[STATUS] homepod_remote ordinal=%u elapsed_ms=%llu "
         "channel=%s frame_kind=%s classification=%s command=%s protobuf_type=%d "
-        "bytes=%zu dispatched=%d\n", ++m->diagnostic_count,
+        "bytes=%zu dispatched=%d message=%s target=%s value_state=%s", ++m->diagnostic_count,
         (unsigned long long)(now - m->diagnostic_start_ms),
         event ? "event" : "datastream", kind, classification, name, type, len,
-        handled ? 1 : 0);
+        handled ? 1 : 0, v.message, v.target, v.value_state);
+    if (v.value_milli >= 0) fprintf(stderr, " value_milli=%d", v.value_milli);
+    if (v.available >= 0) fprintf(stderr, " available=%d", v.available);
+    if (v.capabilities >= 0) fprintf(stderr, " capabilities=%d", v.capabilities);
+    fputc('\n', stderr);
+    funlockfile(stderr);
 }
 
 /* Sync frames are acknowledged, never semantically dispatched (DESIGN.md §8). */
@@ -1135,11 +1297,10 @@ static void mrp_process_frames(struct ap2_mrp_ctx *m)
         mrp_diagnostic(m, false, sync ? "sync" : reply ? "reply" : "unknown",
             h + MRP_DATA_HDR_LEN, size - MRP_DATA_HDR_LEN, -1, false);
         if (memcmp(h + 4, "sync", 4) == 0) {
-            LOG_DEBUG("[MRP] inbound sync frame (%u bytes, seq %llu)",
-                      size, (unsigned long long)seqno);
+            LOG_DEBUG("[MRP] inbound frame kind=sync bytes=%u", size);
             mrp_send_reply(m, seqno);
         } else {
-            LOG_DEBUG("[MRP] inbound frame %.4s (%u bytes)", (const char *)(h + 4), size);
+            LOG_DEBUG("[MRP] inbound frame kind=%s bytes=%u", reply ? "reply" : "unknown", size);
         }
         off += (int)size;
     }
@@ -1189,19 +1350,6 @@ static bool mrp_http_header_value(const char *header, const char *name,
     return false;
 }
 
-static void mrp_event_log_text(char out[MRP_EVENT_LOG_TEXT_MAX + 1],
-                               const char *in)
-{
-    size_t i = 0;
-    if (in) {
-        for (; i < MRP_EVENT_LOG_TEXT_MAX && in[i]; i++) {
-            unsigned char c = (unsigned char)in[i];
-            out[i] = isprint(c) ? (char)c : '.';
-        }
-    }
-    out[i] = '\0';
-}
-
 void ap2_mrp_set_remote_command_callback(
     struct ap2_mrp_ctx *m, ap2_remote_command_cb_t callback, void *userdata)
 {
@@ -1246,48 +1394,6 @@ static bool mrp_parse_remote_command(const uint8_t *body, int body_len,
     else
         return false;
     return true;
-}
-
-static void mrp_log_event_command_body(const char *header,
-                                      const uint8_t *body, int body_len)
-{
-    char content_type[256] = "<missing>";
-    char safe_content_type[MRP_EVENT_LOG_TEXT_MAX + 1];
-    if (!mrp_http_header_value(header, "Content-Type",
-                               content_type, sizeof(content_type)))
-        snprintf(content_type, sizeof(content_type), "%s", "<missing>");
-    mrp_event_log_text(safe_content_type, content_type);
-
-    if (body_len >= 8 && memcmp(body, "bplist00", 8) == 0) {
-        char type[256];
-        char value[256];
-        char safe_type[MRP_EVENT_LOG_TEXT_MAX + 1] = "";
-        char safe_value[MRP_EVENT_LOG_TEXT_MAX + 1] = "";
-        if (ap2_bplist_get_root_string(
-                body, (size_t)body_len, "type", type, sizeof(type)))
-            mrp_event_log_text(safe_type, type);
-        if (ap2_bplist_get_root_string(
-                body, (size_t)body_len, "value", value, sizeof(value)))
-            mrp_event_log_text(safe_value, value);
-        if (safe_type[0] && safe_value[0]) {
-            LOG_DEBUG("[MRP] event command content_type=%s content_length=%d "
-                      "type=%s value=%s",
-                      safe_content_type, body_len, safe_type, safe_value);
-            return;
-        }
-    }
-
-    int shown = body_len < MRP_EVENT_LOG_HEX_MAX
-                    ? body_len : MRP_EVENT_LOG_HEX_MAX;
-    char hex[MRP_EVENT_LOG_HEX_MAX * 2 + 1];
-    for (int i = 0; i < shown; i++)
-        snprintf(hex + i * 2, sizeof(hex) - (size_t)i * 2,
-                 "%02x", body[i]);
-    hex[shown * 2] = '\0';
-    LOG_DEBUG("[MRP] event command body parse failed content_type=%s "
-              "content_length=%d hex=%s%s",
-              safe_content_type, body_len, hex,
-              body_len > shown ? "..." : "");
 }
 
 static bool mrp_event_send_response(struct ap2_mrp_ctx *m,
@@ -1337,7 +1443,7 @@ static bool mrp_process_event_requests(struct ap2_mrp_ctx *m)
             long parsed = strtol(value, &end, 10);
             if (!end || end == value || *end != '\0' || parsed < 0 ||
                 parsed > (long)sizeof(m->event_plain)) {
-                LOG_ERROR("[MRP] invalid event Content-Length: %s", value);
+                LOG_ERROR("[MRP] invalid event Content-Length");
                 return false;
             }
             content_len = (int)parsed;
@@ -1360,8 +1466,8 @@ static bool mrp_process_event_requests(struct ap2_mrp_ctx *m)
             const uint8_t *body = m->event_plain + off + header_len;
             have_remote_command =
                 mrp_parse_remote_command(body, content_len, &remote_command);
-            if (*loglevel >= lDEBUG)
-                mrp_log_event_command_body(header, body, content_len);
+            LOG_DEBUG("[MRP] event command classification=%s bytes=%d",
+                      have_remote_command ? "transport" : "unknown", content_len);
         }
 
         char cseq[64] = "";
@@ -1399,9 +1505,8 @@ static bool mrp_process_event_requests(struct ap2_mrp_ctx *m)
             LOG_ERROR("[MRP] event response send failed");
             return false;
         }
-        LOG_DEBUG("[MRP] event %s %s -> 200%s%s",
-                  method, path, have_cseq ? " cseq=" : "",
-                  have_cseq ? cseq : "");
+        LOG_DEBUG("[MRP] event kind=%s bytes=%d -> 200",
+                  is_command ? "command" : "unknown", content_len);
         off += header_len + content_len;
     }
 

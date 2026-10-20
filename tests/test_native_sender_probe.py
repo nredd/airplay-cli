@@ -90,6 +90,7 @@ class NativeSenderProbeTest(unittest.TestCase):
                     scenarios = {{
                         'transport_sequence': ['pause', 'play', 'play_pause'],
                         'transport_privacy': ['pause', 'play'],
+                        'transport_volume': [],
                         'transport_duplicates': ['play', 'pause', 'pause', 'play', 'play'],
                         'transport_storm': ['play_pause'] * 1000,
                         'transport_spaced': ['play_pause', 'play_pause'],
@@ -101,6 +102,12 @@ class NativeSenderProbeTest(unittest.TestCase):
                     }}
                     data['actions'] = ''
                     capture.write_text(json.dumps(data))
+                    if mode == 'transport_volume':
+                        for channel in ('event', 'datastream'):
+                            for message in ('receiver_telemetry', 'volume_set_candidate', 'volume_feedback', 'volume_get', 'volume_result', 'volume_capability', 'unknown', 'invalid'):
+                                print('[STATUS] homepod_remote channel=' + channel + ' message=' + message + ' target=unresolved value_state=valid value_milli=500 available=1 capabilities=3 dispatched=0 command=pause SECRET_FIELD=SECRET_VALUE', flush=True)
+                        print('[EVENT] homepod_remote message=volume_set_candidate command=pause', flush=True)
+                        print('[EVENT] remote command=volume', flush=True)
                     for command in scenarios[mode]:
                         print('[EVENT] remote command=' + command + ' token=SECRET', flush=True)
                         if mode in ('transport_exit', 'transport_error'):
@@ -237,6 +244,136 @@ class NativeSenderProbeTest(unittest.TestCase):
                     self.assertEqual(diagnostic["dispatched"], "1")
                     self.assertEqual(diagnostic["bytes"], "123")
                     self.assertNotIn("do-not-emit", output)
+
+    def test_posix_volume_observations_never_request_actions(self) -> None:
+        """Real fake-producer telemetry cannot reach the owned action FIFO."""
+        for respond in ("0", "1"):
+            with self.subTest(respond=respond):
+                self.make_binary("transport_volume")
+                code, output = self.run_probe("--respond-transport", respond)
+                self.assertEqual(code, 0, output)
+                data = self.assert_cleaned()
+                self.assertEqual(data["actions"], "")
+                self.assertNotIn("SECRET", output)
+                self.assertNotIn("534543524554", output)
+                records = [json.loads(line) for line in output.splitlines()]
+                observations = [r for r in records if r.get("name") == "homepod_remote"]
+                self.assertTrue(
+                    any(
+                        r.get("message") == "volume_set_candidate" for r in observations
+                    )
+                )
+                self.assertFalse(any(r.get("kind") == "fifo_action" for r in records))
+                self.assertFalse(
+                    any(
+                        r.get("kind") == "event" and r.get("name") == "homepod_remote"
+                        for r in records
+                    )
+                )
+
+    def test_c_volume_diagnostic_contract(self) -> None:
+        """Retain actual encrypted C fixture output without FIFO eligibility.
+
+        `mrp_volume_fixture.h` checks these captured lines against real encrypted
+        cases on every native test run, ignoring only local elapsed time.
+        """
+        golden = (
+            Path(__file__).parent / "fixtures" / "homepod_volume_diagnostics.txt"
+        ).read_bytes()
+        lines = golden.splitlines()
+        self.assertEqual(len(lines), 2)
+        common = {
+            "channel": "event",
+            "frame_kind": "command",
+            "classification": "protobuf",
+            "command": "unknown",
+            "dispatched": "0",
+        }
+        expected = [
+            common
+            | {
+                "ordinal": "1",
+                "elapsed_ms": "0",
+                "protobuf_type": "51",
+                "bytes": "85",
+                "message": "volume_set_candidate",
+                "target": "unresolved",
+                "value_state": "valid",
+                "value_milli": "500",
+            },
+            common
+            | {
+                "ordinal": "17",
+                "elapsed_ms": "1",
+                "protobuf_type": "17",
+                "bytes": "74",
+                "message": "volume_capability",
+                "target": "missing",
+                "value_state": "missing",
+                "available": "1",
+                "capabilities": "3",
+            },
+        ]
+        self.assertEqual(
+            [probe.safe_fields(line, "homepod_remote") for line in lines], expected
+        )
+        reader = probe.Reader(io.BytesIO(b"[STATUS] started\n" + golden), True)
+        reader.thread.join(timeout=1)
+        self.assertFalse(reader.thread.is_alive())
+        self.assertTrue(reader.started.is_set())
+        self.assertTrue(reader.commands.empty())
+        self.assertEqual(
+            list(reader.records.queue)[1:],
+            [("status", "homepod_remote", fields) for fields in expected],
+        )
+
+    def test_volume_diagnostic_fields(self) -> None:
+        """Only fixed enums and inclusive numeric bounds survive retention."""
+        expected = {
+            "message": "volume_feedback",
+            "target": "unresolved",
+            "value_state": "valid",
+            "value_milli": "1000",
+            "available": "0",
+            "capabilities": "3",
+        }
+        self.assertEqual(
+            probe.safe_fields(
+                b"[STATUS] homepod_remote message=volume_feedback target=unresolved "
+                b"value_state=valid value_milli=1000 available=0 capabilities=3 "
+                b"SECRET_FIELD=SECRET_VALUE",
+                "homepod_remote",
+            ),
+            expected,
+        )
+        for field in (
+            b"message=SECRET",
+            b"target=session_group",
+            b"target=SECRET",
+            b"value_state=SECRET",
+            b"value_milli=-1",
+            b"value_milli=1001",
+            b"value_milli=NaN",
+            b"value_milli=inf",
+            b"available=2",
+            b"capabilities=4",
+            b"capabilities=-1",
+        ):
+            self.assertEqual(
+                probe.safe_fields(
+                    b"[STATUS] homepod_remote " + field, "homepod_remote"
+                ),
+                {},
+            )
+        for name in ("remote", "mrp", "route", "homepod_remote_admission"):
+            self.assertEqual(
+                probe.safe_fields(
+                    b"[EVENT] remote value_milli=500 "
+                    b"available=1 capabilities=3 message=volume_feedback",
+                    name,
+                ),
+                {},
+            )
 
     def test_diagnostic_allowlist_and_numeric_bounds(self) -> None:
         """Retain fixed classifications only; dispatched does not mean action executed."""

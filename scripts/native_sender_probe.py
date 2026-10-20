@@ -66,6 +66,19 @@ SAFE_FIELDS: dict[str, dict[bytes, set[bytes]]] = {
         b"classification": {b"command", b"protobuf", b"invalid", b"unknown"},
         b"command": {b"play", b"pause", b"toggle", b"next", b"previous", b"unknown"},
         b"dispatched": {b"0", b"1"},
+        b"message": {
+            b"transport",
+            b"receiver_telemetry",
+            b"volume_set_candidate",
+            b"volume_feedback",
+            b"volume_get",
+            b"volume_result",
+            b"volume_capability",
+            b"unknown",
+            b"invalid",
+        },
+        b"target": {b"missing", b"unresolved"},
+        b"value_state": {b"missing", b"valid", b"invalid"},
     },
     "clock_ready": {
         b"mode": {b"ptp", b"ntp"},
@@ -82,6 +95,9 @@ SAFE_NUMBERS = {
     b"elapsed_ms": (0, 2**63 - 1),
     b"protobuf_type": (-1, 65535),
     b"bytes": (0, 65536),
+    b"value_milli": (0, 1000),
+    b"available": (0, 1),
+    b"capabilities": (0, 3),
 }
 NUMBER = re.compile(rb"(?:0|[1-9][0-9]{0,18}|-1)$")
 COMMANDS = (

@@ -95,7 +95,9 @@ For full updater/probe discovery, run
 `uv run --python 3.13 --with pyatv==0.18.0 python -m unittest discover -s tests -v`.
 CI runs the same discovery in a uv-managed Python 3.13 environment with
 `pyatv==0.18.0`, and checks only the two probe files with Ruff 0.17.1 and ty 0.0.89.
-None of these checks contact speakers.
+None of these checks contact speakers. Run `make test STATIC=1` from the
+repository root for native fixtures; the Python half of the captured diagnostic
+contract runs in unittest discovery and CI, not in that Make target.
 
 ### Experimental HomePod remote admission
 
@@ -130,9 +132,34 @@ then continue servicing traffic. Records contain fixed classifications,
 recognized command names, bounded protobuf field-1 types, lengths, local
 ordinal/relative monotonic time and `dispatched`. That field means recognized
 and callback invoked, NOT that Music Assistant executed an action. No bodies,
-arbitrary type/value strings, keys, tokens, metadata or IDs are included. This
-trace does not enable existing raw debug logging or change global privacy defaults.
+arbitrary type/value strings, keys, tokens, metadata or IDs are included.
+Reverse-event logging, including debug, now contains only fixed classifications
+and lengths, never arbitrary type/value/content-type strings or body hex.
 See `DESIGN.md` §8 for classifier limits.
+
+The fork-only volume seam is observe-only preparation, NOT group-volume support.
+Root `receiverVolumeDidChange` is telemetry regardless of its value. Exact root
+`params.data` envelopes can be classified against public pyatv volume schemas,
+with matching protobuf type/extension, bounded structural validation and normalized
+finite values only. Fixed `message`, `target` and `value_state` fields, optional
+`value_milli` (0..1000), `available` (0..1) and `capabilities` (0..3) share the same
+128-record budget. A target UID is only `unresolved`, never a session/group claim;
+UID bytes and unknown fields are not retained; invalid parses clear the target.
+A type-51 set candidate requires a valid normalized float. Missing optional
+feedback/result levels remain missing, never zero or a command; optional
+availability is omitted when absent. Extra extensions are rejected by this narrow
+classifier, which is not a full MRP decoder. All volume observations have
+`dispatched=0`, with no callbacks, actions or publication. DataStream remains
+ACK-only. Receiver MRP volume 50 and muted CLI stream gain 0 are separate knobs.
+
+These are known-schema fixtures, not measured native-slider requests or scope.
+The next operator-authorized experiment is a bounded muted run on the same admitted
+profile: record original native volume, move the native slider a small amount down,
+then restore its original native volume, retaining only sanitized observations.
+No MA group dispatch, volume writes by the helper, type-130 activation or clock
+changes. The existing iPhone visibility/pause-play acceptance above stands.
+No upstream submission is authorized: inherited OHF policy requires human review
+before any upstream contribution; the owner will open an upstream draft after review.
 
 ### The start contract
 

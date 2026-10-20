@@ -367,7 +367,8 @@ $(CLIENT_TEST): build/tests/test_ap2_client_main.o build/tests/ap2_client.o \
 		$(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
 
 # Include CLI/MRP implementations to exercise their private parser/serializers.
-build/tests/test_live_metadata.o: tests/test_live_metadata.c src/cliairplay.c \
+build/tests/test_live_metadata.o: tests/test_live_metadata.c tests/mrp_volume_fixture.h \
+        tests/fixtures/homepod_volume_diagnostics.txt src/cliairplay.c \
 		src/ap2_mrp.c src/ap2_mrp.h src/ap2_client.h Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@

@@ -744,7 +744,7 @@ Hardware confirmation remains required for bridge acceptance of the live key,
 receiver duration clearing and pyatv SetPosition/SetShuffle/SetRepeat becoming
 unavailable, plus live -> non-live restoration and programme/artwork stability.
 
-**Experimental HomePod admission, source preparation only.**
+**Experimental HomePod admission, default off.**
 `CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE=1` accepts only literal `1` and defaults
 off. A per-session policy is snapshotted before the session SETUP using the
 existing TXT model/version and MRP environment helpers: exact `AudioAccessory5,1`
@@ -789,9 +789,23 @@ handlers. In particular, DataStream sync ACKs are NOT MediaRemote dispatch and
 native MRP/group volume is NOT CLI stream gain. No group-volume routing or
 volume-support claim follows from receiver telemetry.
 
-The next test needs owner UI observation and correlated traces. Admission is not
-proof of native All Speakers & TVs visibility, native controls or a complete
-relay. No production deployment is implied.
+A separate gated-build acceptance run on `1c95c1a` used the matching CI ARM
+artifact and helper, PTP/realtime, type 130 off, muted gain and a 120-second TTL.
+The owner saw the existing HomePod in the native iPhone remote-speaker picker
+and toggled pause/play. The encrypted event channel reported recognized Pause
+then Play with `dispatched=1`; the helper wrote the matching actions only to its
+owned FIFO, and the producer reported Paused then Playing. The run completed
+successfully, diagnostic stderr was empty, and the supported MA installation
+was restored with both HA players idle at their previous levels.
+
+The active receiver reported `0x1b8c04`, `igl=0`, `gid=pgid`, the fixed probe
+title and unavailable seeking. Thus unknown bit 22 and type 130 were not
+required for this observed visibility/transport path. One unknown reverse frame
+was acknowledged without dispatch; no meaning is inferred from it.
+
+This is one HomePod mini/OS 27/iPhone acceptance case, not proof of MA radio
+labels/artwork, group routing/volume, physical-touch regression, other Apple
+controllers or complete relay semantics. No production deployment is implied.
 
 **Narrow opt-in diagnostic protocol.** Every native session SETUP attempt reports
 `[STATUS] homepod_remote_admission enabled=0|1` on stdout (fixed boolean only).

@@ -100,7 +100,7 @@ None of these checks contact speakers.
 ### Experimental HomePod remote admission
 
 `CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE=1` is a strict literal-`1`, default-off
-source-preparation opt-in, not production deployment or a full relay claim.
+experimental opt-in, not production deployment or a full relay claim.
 It snapshots eligibility before session SETUP: exact `AudioAccessory5,1`, known
 OS major 27 (`osvers`/`ov`, no firmware or future-OS guess), encrypted native
 MediaRemote, MRP enabled, a registered remote callback, actual PTP and realtime
@@ -114,9 +114,16 @@ In this mode `/command` advertises only implemented Play/Pause/Toggle/Next/
 Previous, in live and non-live metadata and across transitions. It does not
 advertise volume, seek, shuffle, repeat or stop. DataStream still only ACKs sync,
 not semantic dispatch. Native MRP/group volume and CLI stream gain are separate
-knobs; telemetry is not routed to group volume. Native owner UI visibility and
-controls remain unconfirmed: the next step is owner UI checks with correlated
-traces, not a production rollout.
+knobs; telemetry is not routed to group volume.
+
+On `1c95c1a`, an owner found the existing HomePod mini in the native iPhone
+remote-speaker picker and paused/resumed the muted probe. Encrypted reverse-event
+traces recorded Pause then Play, matching the owned FIFO actions and producer
+Paused/Playing confirmations. The 120-second run completed and the supported MA
+installation was restored. Type 130 was off; no clock-policy change was needed.
+This validates one OS 27 HomePod/iPhone transport path, not MA radio metadata,
+group routing/volume, physical touch, other Apple controllers or a production
+rollout. Those remain separate acceptance checks.
 
 Eligible sessions emit at most 128 bounded diagnostic records per MRP context,
 then continue servicing traffic. Records contain fixed classifications,

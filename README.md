@@ -348,6 +348,11 @@ make HOST=linux PLATFORM=aarch64 CC=aarch64-linux-gnu-gcc STATIC=1
 make test STATIC=1
 ```
 
+The open-writer teardown test retains its one-second deadline but measures awake
+elapsed time on macOS, so system sleep cannot count as a blocked shutdown. It
+also verifies that the reader reached a real nonblocking empty-input poll while
+the writer remains open. Production clock and shutdown policies are unchanged.
+
 Requires the libraop submodule with pre-built static libraries (OpenSSL,
 libcodecs, libmdns).
 

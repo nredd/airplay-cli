@@ -74,7 +74,7 @@ static bool same_file_stat(const struct stat *before, const struct stat *after)
 #endif
 }
 
-static bool hash_stable_file(int fd, unsigned char digest[EVP_MAX_MD_SIZE])
+static bool hash_stable_file(int fd, unsigned char digest[32])
 {
     struct stat before, after;
     if (!stable_regular_file(fd, &before)) return false;

@@ -27,6 +27,7 @@
 #include <poll.h>
 #include <errno.h>
 #include <stdatomic.h>
+#include <limits.h>
 
 #include "../libraop/crosstools/src/platform.h"
 #include "../libraop/crosstools/src/cross_thread.h"
@@ -44,6 +45,7 @@
 #include "artwork.h"
 #include "announce.h"
 #include "host_clock.h"
+#include "attestation.h"
 
 #define VERSION "0.5.2"
 /* Overridden at build time from the git tag for tagged releases (see Makefile). */
@@ -2235,6 +2237,20 @@ static void print_usage(const char *name)
 
 /* ---- Main ---- */
 
+static bool parse_attestation_fd(const char *value, int *fd)
+{
+    if (!value || !*value) return false;
+    unsigned long parsed = 0;
+    for (const char *p = value; *p; p++) {
+        if (*p < '0' || *p > '9' || parsed > (ULONG_MAX - (unsigned)(*p - '0')) / 10)
+            return false;
+        parsed = parsed * 10 + (unsigned)(*p - '0');
+    }
+    if (parsed < 3 || parsed > INT_MAX) return false;
+    *fd = (int)parsed;
+    return true;
+}
+
 int main(int argc, char *argv[])
 {
     cli_config_t cfg = {
@@ -2259,6 +2275,18 @@ int main(int argc, char *argv[])
     bool pairing_mode = false;
     bool ptp_daemon_mode = false;
     bool pair_setup_mode = false;
+    bool check_mode = false;
+    bool attest_fd_seen = false;
+    bool attest_nonce_seen = false;
+    bool attest_only = false;
+    int attest_fd = -1;
+    const char *attest_nonce = NULL;
+    /* Preserve the ordinary --check short circuit, including ignored later options. */
+    bool attestation_requested = false;
+    for (int i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "--attest-", 9) == 0)
+            attestation_requested = true;
+    }
 
     static struct option long_options[] = {
         {"protocol",     required_argument, 0, 'P'},
@@ -2299,6 +2327,9 @@ int main(int argc, char *argv[])
         {"pair",         no_argument,       0, 1003},
         {"pair-setup",   no_argument,       0, 1013},
         {"clock-offset-ns", required_argument, 0, 1015},
+        {"attest-fd",    required_argument, 0, 1016},
+        {"attest-nonce", required_argument, 0, 1017},
+        {"attest-only",  no_argument,       0, 1018},
         {"help",         no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -2367,9 +2398,35 @@ int main(int argc, char *argv[])
             host_clock_set_offset_ns(offset);
             break;
         }
+        case 1016:
+            if (attest_fd_seen || !parse_attestation_fd(optarg, &attest_fd)) {
+                fprintf(stderr, "Invalid or duplicate --attest-fd\n");
+                return 1;
+            }
+            attest_fd_seen = true;
+            break;
+        case 1017:
+            if (attest_nonce_seen || !attestation_nonce_valid(optarg)) {
+                fprintf(stderr, "Invalid or duplicate --attest-nonce\n");
+                return 1;
+            }
+            attest_nonce_seen = true;
+            attest_nonce = optarg;
+            break;
+        case 1018:
+            if (attest_only) {
+                fprintf(stderr, "Duplicate --attest-only\n");
+                return 1;
+            }
+            attest_only = true;
+            break;
         case 1002:
-            printf("cliairplay v%s check\n", CLIAIRPLAY_VERSION);
-            return 0;
+            if (!attestation_requested) {
+                printf("cliairplay v%s check\n", CLIAIRPLAY_VERSION);
+                return 0;
+            }
+            check_mode = true;
+            break;
         case 1003:
             pairing_mode = true;
             break;
@@ -2378,6 +2435,20 @@ int main(int argc, char *argv[])
             print_usage(argv[0]);
             return opt == 'h' ? 0 : 1;
         }
+    }
+
+    if (attest_fd_seen != attest_nonce_seen || (attest_only && !attest_fd_seen)) {
+        fprintf(stderr, "--attest-fd and --attest-nonce are required together\n");
+        return 1;
+    }
+    if (attest_fd_seen && !attestation_ack(attest_fd, attest_nonce)) {
+        fprintf(stderr, "Current-image attestation failed\n");
+        return 1;
+    }
+    if (attest_only) return 0;
+    if (check_mode) {
+        printf("cliairplay v%s check\n", CLIAIRPLAY_VERSION);
+        return 0;
     }
 
     /* The only streaming positional argument is the target host. */

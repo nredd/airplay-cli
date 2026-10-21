@@ -60,6 +60,27 @@ process lifetime. The format is selected with
 `--bitdepth 24` the input must be **s32le**; the binary truncates it to the
 24-bit samples the ALAC encoder consumes.
 
+### Private current-image attestation contract
+
+This private branch accepts `--attest-fd <inherited-readonly-asset-fd>` and
+`--attest-nonce <32-lowercase-hex>` only as a pair. The FD must be at least 3,
+read-only, regular, non-empty, stable across hashing, and no larger than 64 MiB. Hashing
+uses positional reads, so the parent's prior hash may leave its inherited FD at
+EOF. On Linux, before receiver, PTP, pairing, or audio readiness I/O, the CLI
+also reads `/proc/self/exe`, requires both SHA-256 values to match, and emits
+exactly one first stdout line:
+
+```text
+[ATTEST] {"version":1,"kind":"current-image-match-at-ack","nonce":"...","exec_fd_sha256":"...","self_sha256":"..."}
+```
+
+It fails closed when self-image reading is unsupported or denied. `--attest-only`
+requires that pair and exits successfully immediately after this acknowledgement;
+it performs no receiver, PTP, pairing, or PCM setup. Without these flags, CLI
+behavior is unchanged. This is a point-in-time image proof only: the launcher
+must compare the nonce and both hashes to its pinned asset before connecting
+stderr or treating the child as ready.
+
 ### Read-only Apple session probe
 
 ```bash

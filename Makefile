@@ -128,7 +128,7 @@ AP2_SOURCES = ap2_client.c ap2_hap.c ap2_io.c ap2_ptp.c ap2_ptp_shm.c ap2_plist.
 
 # Common/CLI sources
 CLI_SOURCES = cross_log.c cross_ssl.c cross_util.c cross_net.c platform.c host_clock.c \
-	cliairplay.c raop_session.c artwork.c announce.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
+	attestation.c cliairplay.c raop_session.c artwork.c announce.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
 
 # Pre-built static libraries
 # We use a patched copy of libcodecs.a with the buggy alac_create_encoder removed,
@@ -183,6 +183,7 @@ RAOP_LIFECYCLE_TEST_DEFINES = \
 RAOP_SESSION_TEST = build/tests/test_raop_session
 ANNOUNCE_TEST = build/tests/test_announce
 LIVE_METADATA_TEST = build/tests/test_live_metadata
+ATTESTATION_TEST = build/tests/test_attestation
 
 all: directory $(EXECUTABLE)
 
@@ -239,7 +240,7 @@ no_sanitizer_report = case "$(1)" in *Sanitizer*|*"runtime error:"*) \
 
 test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT_TEST) \
 		$(SESSION_TEST) $(PTP_TEST) $(TEST_EXECUTABLE) $(RAOP_LIFECYCLE_TEST_EXECUTABLE) \
-		$(RAOP_SESSION_TEST) $(ANNOUNCE_TEST) $(LIVE_METADATA_TEST)
+		$(RAOP_SESSION_TEST) $(ANNOUNCE_TEST) $(LIVE_METADATA_TEST) $(ATTESTATION_TEST)
 	$(TIMELINE_TEST)
 	$(EVENT_TEST)
 	$(IO_TEST)
@@ -251,6 +252,8 @@ test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT
 	$(RAOP_SESSION_TEST)
 	$(ANNOUNCE_TEST)
 	$(LIVE_METADATA_TEST)
+	$(ATTESTATION_TEST)
+	python3 tests/attestation_cli.py $(EXECUTABLE)
 	python3 tests/session_volume_ipc.py
 	python3 tests/mrp_artwork_matrix.py --help >/dev/null
 	@missing_pipe="$$($(EXECUTABLE) --protocol raop \
@@ -294,6 +297,11 @@ ifeq ($(SANITIZE),)
 		rm -rf "$$pipe_dir"; \
 		printf '%s\n' "$$appletv_pk" | grep -q 'detail="RAOP connect failed"'
 endif
+
+$(ATTESTATION_TEST): tests/test_attestation.c src/attestation.c src/attestation.h Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_attestation.c \
+		$(OPENSSL)/libopenssl.a $(EXTRA_LDFLAGS) -o $@
 
 $(RAOP_SESSION_TEST): tests/test_raop_session.c src/raop_session.c \
 		src/raop_session.h Makefile

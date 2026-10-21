@@ -87,10 +87,10 @@ jobs:
         run: uv run --active --no-project python -m unittest discover -s tests -v
       - name: Check probe formatting and lint
         run: |
-          uv run --active --no-project ruff format --check tests/apple_session_probe.py tests/test_apple_session_probe.py scripts/native_sender_probe.py tests/test_native_sender_probe.py
-          uv run --active --no-project ruff check tests/apple_session_probe.py tests/test_apple_session_probe.py scripts/native_sender_probe.py tests/test_native_sender_probe.py
+          uv run --active --no-project ruff format --check tests/apple_session_probe.py tests/test_apple_session_probe.py scripts/native_sender_probe.py tests/test_native_sender_probe.py tests/attestation_cli.py
+          uv run --active --no-project ruff check tests/apple_session_probe.py tests/test_apple_session_probe.py scripts/native_sender_probe.py tests/test_native_sender_probe.py tests/attestation_cli.py
       - name: Type check probes
-        run: uv run --active --no-project ty check --python "$VIRTUAL_ENV/bin/python" --extra-search-path tests tests/apple_session_probe.py tests/test_apple_session_probe.py scripts/native_sender_probe.py tests/test_native_sender_probe.py
+        run: uv run --active --no-project ty check --python "$VIRTUAL_ENV/bin/python" --extra-search-path tests tests/apple_session_probe.py tests/test_apple_session_probe.py scripts/native_sender_probe.py tests/test_native_sender_probe.py tests/attestation_cli.py
 
   build-linux:
     # Keep release binaries on a stable libc baseline that runs on Debian 12+.

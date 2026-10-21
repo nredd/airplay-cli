@@ -306,10 +306,10 @@ $(ANNOUNCE_TEST): tests/test_announce.c src/announce.c src/announce.h Makefile
 	$(CC) $(TEST_CFLAGS) -Isrc tests/test_announce.c src/announce.c \
 		$(EXTRA_LDFLAGS) -lm -o $@
 
-$(SESSION_TEST): tests/test_ap2_session.c src/ap2_session.c src/ap2_session.h \
-		src/ap2_io.c src/ap2_io.h Makefile
+$(SESSION_TEST): tests/test_ap2_session.c tests/ap2_session_poll_fixture.h \
+		src/ap2_session.c src/ap2_session.h src/ap2_io.c src/ap2_io.h Makefile
 	@mkdir -p $(dir $@)
-	$(CC) $(TEST_CFLAGS) $(INCLUDE) -Dpoll=ap2_session_test_poll \
+	$(CC) $(TEST_CFLAGS) $(INCLUDE) -include tests/ap2_session_poll_fixture.h \
 		-c src/ap2_session.c -o build/tests/ap2_session_fifo_test.o
 	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_ap2_session.c \
 		build/tests/ap2_session_fifo_test.o src/ap2_io.c $(TOOLS)/cross_log.c \

@@ -24,6 +24,34 @@ from scripts import native_sender_probe as probe
 class NativeSenderProbeTest(unittest.TestCase):
     """Exercise real local child/FIFO handling without touching receivers."""
 
+    def test_session_volume_is_observation_only(self) -> None:
+        """Allow fixed contract enums without retaining private IPC values."""
+        cases = [
+            ("session_volume", b"version=1", {"version": "1"}),
+            (
+                "session_volume_transport",
+                b"ready=1 publication=0",
+                {"ready": "1", "publication": "0"},
+            ),
+            ("session_volume_set", b"generation=7 ordinal=12 milli=630", {}),
+            (
+                "stream_volume_result",
+                b"status=committed level=50",
+                {"status": "committed"},
+            ),
+        ]
+        for name, fields, expected in cases:
+            chunk = (
+                b"[EVENT] "
+                + name.encode()
+                + b" "
+                + fields
+                + b" uid=PRIVATE token=PRIVATE"
+            )
+            self.assertEqual(probe.safe_fields(chunk, name), expected)
+            self.assertNotEqual(name, "remote")
+        self.assertEqual(set(probe.TRANSPORT), {"play", "pause"})
+
     def setUp(self) -> None:
         """Create an isolated executable whose behavior is controlled by the test."""
         self.tmp = tempfile.TemporaryDirectory()

@@ -420,6 +420,11 @@ bool ap2cl_feedback(struct ap2cl_s *p);
 
 /* Set volume (0-100). */
 bool ap2cl_set_volume(struct ap2cl_s *p, int volume);
+struct ap2_volume_transaction;
+/* Checked actuator: 1 accepted, 0 rejected, -1 uncertain/unsupported. */
+int ap2cl_apply_volume(struct ap2cl_s *p, unsigned volume);
+bool ap2cl_session_volume_action(struct ap2cl_s *p, const char *action,
+    const struct ap2_volume_transaction *t);
 
 /*
  * Set the track metadata and artwork as one bundle: DMAP metadata (and, when

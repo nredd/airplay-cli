@@ -114,8 +114,8 @@ The opt-in neither enables type 130 nor changes PTP follow/clock policy.
 
 In this mode `/command` advertises only implemented Play/Pause/Toggle/Next/
 Previous, in live and non-live metadata and across transitions. It does not
-advertise volume, seek, shuffle, repeat or stop. DataStream still only ACKs sync,
-not semantic dispatch. Native MRP/group volume and CLI stream gain are separate
+advertise volume, seek, shuffle, repeat or stop. Admission alone leaves DataStream
+ACK-only; the separately enabled logical-volume backend is described below. Native MRP/group volume and CLI stream gain are separate
 knobs; telemetry is not routed to group volume.
 
 On `1c95c1a`, an owner found the existing HomePod mini in the native iPhone
@@ -137,7 +137,7 @@ Reverse-event logging, including debug, now contains only fixed classifications
 and lengths, never arbitrary type/value/content-type strings or body hex.
 See `DESIGN.md` §8 for classifier limits.
 
-The fork-only volume seam is observe-only preparation, NOT group-volume support.
+The default fork-only volume classifier is observe-only, NOT group-volume support.
 Root `receiverVolumeDidChange` is telemetry regardless of its value. Exact root
 `params.data` envelopes can be classified against public pyatv volume schemas,
 with matching protobuf type/extension, bounded structural validation and normalized
@@ -149,17 +149,86 @@ A type-51 set candidate requires a valid normalized float. Missing optional
 feedback/result levels remain missing, never zero or a command; optional
 availability is omitted when absent. Extra extensions are rejected by this narrow
 classifier, which is not a full MRP decoder. All volume observations have
-`dispatched=0`, with no callbacks, actions or publication. DataStream remains
-ACK-only. Receiver MRP volume 50 and muted CLI stream gain 0 are separate knobs.
+`dispatched=0`, with no callbacks, actions or publication from the classifier. DataStream remains
+ACK-only unless the separate logical-volume backend below is explicitly enabled. Receiver MRP volume 50 and muted CLI stream gain 0 are separate knobs.
 
 These are known-schema fixtures, not measured native-slider requests or scope.
-The next operator-authorized experiment is a bounded muted run on the same admitted
-profile: record original native volume, move the native slider a small amount down,
-then restore its original native volume, retaining only sanitized observations.
-No MA group dispatch, volume writes by the helper, type-130 activation or clock
-changes. The existing iPhone visibility/pause-play acceptance above stands.
+The owner corrected the volume evidence: the native volume slider was greyed out;
+no valid slider gesture occurred. No request or UI identity binding was measured.
+The offline operational backend below does NOT solve that native UI limitation. The existing iPhone visibility/pause-play acceptance above stands.
 No upstream submission is authorized: inherited OHF policy requires human review
 before any upstream contribution; the owner will open an upstream draft after review.
+
+### Experimental logical session volume (default off)
+
+`CLIAIRPLAY_SESSION_VOLUME=mrp130` requests a public-MRP DataStream backend
+*only* on an already eligible experimental HomePod remote session. Explicit
+`CLIAIRPLAY_MRP_TYPE130=0|false|off` still kills DataStream; explicit force keeps
+its existing diagnostic semantics and never broadens volume eligibility.
+Optional attachment failure retains reverse-event pause/play. Existing metadata
+stays on `POST /command`, with no DataStream now-playing pushes in volume mode.
+
+Every command reader emits `[STATUS] session_volume version=1`, an additive
+compiled IPC handshake, NOT transport readiness. A requested eligible attempt
+separately reports `[STATUS] session_volume_transport ready=0|1 publication=0`;
+attached channel loss reports `ready=0` and invalidates the backend binding.
+Older consumers can ignore both. The diagnostic helper observes these names but
+never enables volume or responds to session/group requests.
+
+The version-1 IPC names and shapes are frozen:
+- Bind with `SESSION_VOLUME_GENERATION`, `SESSION_VOLUME_OUTPUT_UID_HEX`,
+  explicitly present `SESSION_VOLUME_ENDPOINT_UID_HEX` (may be empty), then
+  `ACTION=SESSION_VOLUME_BIND`. UIDs are private exact byte strings, 1..128
+  output bytes and 0..128 endpoint bytes; generations are positive uint64.
+- Reconcile with `SESSION_VOLUME_GENERATION`, `SESSION_VOLUME_REVISION`,
+  `SESSION_VOLUME_KNOWN=0|1`, and `SESSION_VOLUME_MILLI=0..1000` *only* when
+  known, then `ACTION=SESSION_VOLUME_STATE`. Unknown is NOT zero. Revisions
+  strictly increase inside a generation.
+- Requests emit `[EVENT] session_volume_set generation=7 ordinal=12 milli=630`.
+  This is intent, never committed state. Complete with generation, ordinal,
+  `SESSION_VOLUME_RESULT=committed|rejected|failed|unknown`, revision, known and
+  optional milli as above, then `ACTION=SESSION_VOLUME_COMPLETE`. Committed
+  requires known actual state; noncommitted results require unknown. A request for
+  630 may commit an authoritative actual 610. Failed/uncertain operations never
+  manufacture success. `ACTION=SESSION_VOLUME_UNBIND` takes only generation.
+- Checked device gain uses a SEPARATE ordinal namespace:
+  `STREAM_VOLUME_GENERATION`, `STREAM_VOLUME_ORDINAL`, `STREAM_VOLUME_LEVEL=0..100`,
+  then `ACTION=STREAM_VOLUME_APPLY`. Output is
+  `[EVENT] stream_volume_result generation=7 ordinal=3 status=committed level=50`,
+  or `status=failed|unknown` without level. Native RTSP must accept a 2xx before
+  commit; legacy RAOP requires an active transport and its checked 200 receipt.
+  An uncertain RAOP failure is `unknown`, not a guessed rejection. These are raw
+  device percentages, NOT normalized group volume. Legacy `VOLUME=` is unchanged.
+
+Write every complete transaction in one atomic pipe write (within `PIPE_BUF`).
+Fields are unique, bounded, strict decimal/hex, never logged, and cleared after
+EVERY attempted ACTION, including malformed attempts. No leftovers or mixed
+namespaces are accepted. The driver holds one executing Set plus one coalesced
+trailing Set, a 3-second backend deadline and a 16-identifier replay window.
+Timeout clears known state and blocks more work until newer reconciliation;
+it is not cancellation, and late completions cannot become success.
+
+Public Get49/ext53 serves only the authoritative cache, with exact field-2
+correlation and eight bounded replies per drain. There are no outgoing Gets or
+outstanding-Get registry. Unsolicited type50 results, type52 feedback and `dvlc`
+never dispatch. There is no invented SetVolumeResult or private UI protocol.
+
+Native availability and ALL current-state publication remain OFF in production,
+including Get results and committed-change messages, even with a bound, known
+backend. The native output/UI identity binding is unverified. Test-only synthetic
+identity permits encrypted GetResult50/ext54 and committed Change52/ext56 tests;
+it is absent from the runtime binary. Offline operational success is NOT native
+slider acceptance. See `DESIGN.md` for the offline FIFO integration harness.
+
+For developer-only cross-process acceptance, from the MA source root run
+`.venv/bin/python -m scripts.check_native_airplay_volume --harness /absolute/path/to/airplay-cli/build/tests/test_live_metadata`.
+Supply an already-built executable; the command never builds or installs anything.
+It requires MA's source fixtures/venv, runs real encrypted C requests through the real
+MA controller with two fake confirmed actuators and real FIFO feedback, then requires
+the decrypted committed 610 witness for a requested 630. It emits bounded public JSON
+and exits nonzero on failure or timeout. It uses no network or hardware and is not
+part of ordinary MA tests. Synthetic verified identity is offline proof only, NOT
+native UI binding or native volume availability.
 
 ### The start contract
 

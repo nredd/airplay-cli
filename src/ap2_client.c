@@ -475,6 +475,13 @@ static bool ap2_mrp_type130_enabled(void)
 {
     return ap2_env_enabled("CLIAIRPLAY_MRP_TYPE130", false);
 }
+/* Explicit diagnostic kill wins. This never broadens admission eligibility. */
+static bool ap2_session_volume_enabled(struct ap2cl_s *p)
+{
+    const char *mode = getenv("CLIAIRPLAY_SESSION_VOLUME");
+    return mode && !strcmp(mode, "mrp130") && p->experimental_homepod_remote &&
+        (!getenv("CLIAIRPLAY_MRP_TYPE130") || ap2_mrp_type130_enabled());
+}
 
 /* ---- Native AP2 failure reporting ---- */
 
@@ -1676,8 +1683,7 @@ static void ap2_native_setup_mrp(struct ap2cl_s *p)
         LOG_WARN("[MRP] type-130 SETUP returned no dataPort; no now-playing channel");
         return;
     }
-    LOG_INFO("[MRP] type-130 data-channel SETUP OK (dataPort=%d, seed=%llu)",
-             data_port, (unsigned long long)seed);
+    LOG_INFO("[MRP] type-130 data-channel SETUP accepted");
 
     /* Bind the sender to THIS session's pairing secret and open the channel
      * (TCP connect + DEVICE_INFO-first handshake). */
@@ -1693,7 +1699,7 @@ static void ap2_native_setup_mrp(struct ap2cl_s *p)
     if (!p->mrp) return;
     ap2_mrp_set_remote_command_callback(
         p->mrp, ap2_remote_command_received, p);
-    if (!ap2_mrp_attach_events(p->mrp, p->events_sock)) {
+    if (p->events_sock >= 0 && !ap2_mrp_attach_events(p->mrp, p->events_sock)) {
         LOG_WARN("[MRP] event-channel attach failed; degrading to no-MRP");
         ap2_mrp_destroy(p->mrp);
         p->mrp = NULL;
@@ -1701,10 +1707,10 @@ static void ap2_native_setup_mrp(struct ap2cl_s *p)
     }
     p->events_sock = -1;
 
+    bool volume_mode = ap2_session_volume_enabled(p);
+    ap2_mrp_set_volume_mode(p->mrp, volume_mode);
     if (!ap2_mrp_attach(p->mrp, data_port, seed)) {
-        LOG_WARN("[MRP] data-channel attach failed; degrading to no-MRP");
-        ap2_mrp_destroy(p->mrp);
-        p->mrp = NULL;
+        LOG_WARN("[MRP] data-channel attach failed; reverse event channel retained");
         return;
     }
     LOG_INFO("[MRP] remote-control data channel established (now-playing active)");
@@ -2468,8 +2474,15 @@ static bool ap2_native_connect(struct ap2cl_s *p)
      * default; now-playing rides /command (ap2cl_mrp_register + ap2cl_mrp_push).
      * Set CLIAIRPLAY_MRP_TYPE130=1 to re-enable the channel (future remote-
      * control RX). Best-effort; audio is up regardless. */
-    if (ap2_mrp_type130_enabled())
+    bool volume_mode = ap2_session_volume_enabled(p);
+    if (volume_mode && !ap2_homepod_remote_ready(p)) return false;
+    if (ap2_mrp_type130_enabled() || volume_mode)
         ap2_native_setup_mrp(p);
+    if (volume_mode) {
+        printf("[STATUS] session_volume_transport ready=%d publication=0\n",
+            p->mrp && ap2_mrp_is_connected(p->mrp) ? 1 : 0);
+        fflush(stdout);
+    }
 
     if (!ap2_homepod_remote_ready(p)) return false;
 
@@ -4925,24 +4938,48 @@ bool ap2cl_control_healthy(struct ap2cl_s *p)
     return atomic_load(&p->mrp_event_health) != 0;
 }
 
+bool ap2cl_session_volume_action(struct ap2cl_s *p, const char *action,
+    const struct ap2_volume_transaction *t)
+{
+    if (!p) return false;
+    /* Context lifetime is stable until the command thread is joined. The
+     * volume driver has its own lock; callbacks run outside mrp_lock. */
+    return ap2_mrp_volume_action(p->mrp, action, t);
+}
+/* Shared existing curve/send path; checked and legacy callers differ only in
+ * receipt interpretation and when their local volume becomes committed. */
+static int ap2_native_volume_send(struct ap2cl_s *p, int volume, bool legacy_log)
+{
+    float db = volume <= 0 ? -144.0f : raopcl_float_volume(volume > 100 ? 100 : volume);
+    char body[32];
+    int len = snprintf(body, sizeof(body), "volume: %.6f\r\n", db);
+    uint8_t *resp = NULL; int resp_len = 0;
+    int status = ap2_rtsp_send(p, "SET_PARAMETER", p->session_url,
+        (uint8_t *)body, len, "text/parameters", &resp, &resp_len);
+    free(resp);
+    if (legacy_log) LOG_INFO("[AP2] native volume -> %.2f dB (SET_PARAMETER status %d)", db, status);
+    return status;
+}
+int ap2cl_apply_volume(struct ap2cl_s *p, unsigned volume)
+{
+    if (!p || volume > 100) return -1;
+    if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0) {
+        int status = ap2_native_volume_send(p, (int)volume, false);
+        if (status >= 200 && status < 300) { p->volume = (int)volume; return 1; }
+        return status > 0 ? 0 : -1;
+    }
+    if (p->raopcl && raopcl_state(p->raopcl) >= RAOP_FLUSHED) {
+        if (!raopcl_set_volume(p->raopcl, raopcl_float_volume((int)volume))) return -1;
+        p->volume = (int)volume; return 1;
+    }
+    return -1;
+}
 bool ap2cl_set_volume(struct ap2cl_s *p, int volume)
 {
     if (!p) return false;
     p->volume = volume;
     if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0) {
-        /* Same percent->dB mapping as the RAOP path (libraop): linear in dB
-         * over -30..0, mute at 0. This is the AirPlay convention (iOS,
-         * shairport-sync use the same range), so a given slider position is
-         * equally loud on every protocol path and matches other senders. */
-        float vol_db = volume <= 0 ? -144.0f
-                       : raopcl_float_volume(volume > 100 ? 100 : volume);
-        char body[32];
-        int blen = snprintf(body, sizeof(body), "volume: %.6f\r\n", vol_db);
-        uint8_t *resp = NULL; int resp_len = 0;
-        int status = ap2_rtsp_send(p, "SET_PARAMETER", p->session_url,
-                       (uint8_t *)body, blen, "text/parameters", &resp, &resp_len);
-        LOG_INFO("[AP2] native volume -> %.2f dB (SET_PARAMETER status %d)", vol_db, status);
-        free(resp);
+        ap2_native_volume_send(p, volume, true);
         return true;
     }
     if (p->raopcl) return raopcl_set_volume(p->raopcl, raopcl_float_volume(volume));
@@ -5943,6 +5980,14 @@ bool ap2cl_test_apple_model_default(const char *txt, const char *am)
 bool ap2cl_test_env_enabled(const char *name, bool unset_default)
 {
     return ap2_env_enabled(name, unset_default);
+}
+
+int ap2cl_test_volume(struct ap2cl_s *p) { return p->volume; }
+
+bool ap2cl_test_session_volume_enabled(bool admitted)
+{
+    struct ap2cl_s p = {.experimental_homepod_remote = admitted};
+    return ap2_session_volume_enabled(&p);
 }
 
 bool ap2cl_test_mrp_type130_enabled(void)

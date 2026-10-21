@@ -48,9 +48,11 @@ MACHINE_NAMES = {
         b"idle_timeout",
         b"homepod_remote_admission",
         b"homepod_remote",
+        b"session_volume",
+        b"session_volume_transport",
         b"REANCHOR",
     },
-    b"EVENT": {b"remote"},
+    b"EVENT": {b"remote", b"session_volume_set", b"stream_volume_result"},
 }
 AUDIO = re.compile(rb"buffered_ms=[1-9][0-9]{0,19}$")
 MRP_STATUS = re.compile(rb"(?:-1|0|1|[1-5][0-9]{2})$")
@@ -60,6 +62,9 @@ SAFE_FIELDS: dict[str, dict[bytes, set[bytes]]] = {
     "remote": {b"command": {b"play", b"pause", b"play_pause", b"next", b"previous"}},
     "mrp": {b"path": {b"channel", b"command"}},
     "homepod_remote_admission": {b"enabled": {b"0", b"1"}},
+    "session_volume": {b"version": {b"1"}},
+    "session_volume_transport": {b"ready": {b"0", b"1"}, b"publication": {b"0"}},
+    "stream_volume_result": {b"status": {b"committed", b"failed", b"unknown"}},
     "homepod_remote": {
         b"channel": {b"event", b"datastream"},
         b"frame_kind": {b"command", b"sync", b"reply", b"unknown"},

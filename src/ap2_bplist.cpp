@@ -182,7 +182,7 @@ static bool bp_ascii_key_equals(const bp_raw_view *view, uint64_t ref,
 
 static bool bp_dict_find_value_ref(const bp_raw_view *view, uint64_t dict_ref,
                                    const char *key, uint64_t *value_ref,
-                                   bool unique = false)
+                                   bool unique = false, bool single = false)
 {
     size_t pos = bp_view_obj_ofs(view, dict_ref);
     if (!pos || pos >= view->table_ofs ||
@@ -191,7 +191,7 @@ static bool bp_dict_find_value_ref(const bp_raw_view *view, uint64_t dict_ref,
 
     size_t count;
     if (!bp_read_count(view->data, view->table_ofs, &pos, &count)) return false;
-    if (count > (view->table_ofs - pos) / (2 * view->ref_size)) return false;
+    if (count > (view->table_ofs - pos) / (2 * view->ref_size) || (single && count != 1)) return false;
 
     bool found = false;
     for (size_t i = 0; i < count; i++) {
@@ -241,8 +241,8 @@ static bool bp_find_dict_child_ref(const bp_raw_view *view,
            bp_dict_find_value_ref(view, dict_ref, key, value_ref);
 }
 
-int ap2_bplist_get_params_data(const uint8_t *data, size_t len,
-                                const uint8_t **out, size_t *out_len)
+static int bp_get_params_data(const uint8_t *data, size_t len,
+                                const uint8_t **out, size_t *out_len, bool strict)
 {
     bp_raw_view view;
     uint64_t params_ref, data_ref;
@@ -250,8 +250,8 @@ int ap2_bplist_get_params_data(const uint8_t *data, size_t len,
         view.table_ofs < 8 || !view.num_objects)
         return 0;
     uint64_t root_ref = bp_read_be(data + len - 16, 8);
-    if (!bp_dict_find_value_ref(&view, root_ref, "params", &params_ref, true) ||
-        !bp_dict_find_value_ref(&view, params_ref, "data", &data_ref, true))
+    if (!bp_dict_find_value_ref(&view, root_ref, "params", &params_ref, true, strict) ||
+        !bp_dict_find_value_ref(&view, params_ref, "data", &data_ref, true, strict))
         return 0;
     size_t pos = bp_view_obj_ofs(&view, data_ref), count;
     if (pos < 8 || pos >= view.table_ofs || (data[pos] & 0xf0) != 0x40 ||
@@ -261,6 +261,20 @@ int ap2_bplist_get_params_data(const uint8_t *data, size_t len,
     *out = data + pos;
     *out_len = count;
     return 1;
+}
+
+int ap2_bplist_get_params_data(const uint8_t *data, size_t len,
+                                const uint8_t **out, size_t *out_len)
+{
+    return bp_get_params_data(data, len, out, out_len, false);
+}
+
+int ap2_bplist_get_volume_data(const uint8_t *data, size_t len,
+                                const uint8_t **out, size_t *out_len)
+{
+    /* Operational dispatch only accepts the public DataStream envelope, not
+     * RootJSON telemetry containing a volume-shaped data decoy. */
+    return bp_get_params_data(data, len, out, out_len, true);
 }
 
 int ap2_bplist_get_root_string(const uint8_t *data, size_t len, const char *key,

@@ -5,6 +5,7 @@
 #define main cliairplay_program_main
 #include "../src/cliairplay.c"
 #undef main
+#define AP2_VOLUME_TESTING
 #include "../src/ap2_mrp.c"
 #include "mrp_jpeg_fixture.h"
 
@@ -445,9 +446,15 @@ static void test_encrypted_diagnostics_and_cap(void)
 }
 
 #include "mrp_volume_fixture.h"
+#include "session_volume_fixture.h"
+#include "session_volume_harness.h"
 
-int main(void)
+int main(int argc, char **argv)
 {
+    if (argc == 3 && !strcmp(argv[1], "--session-volume-harness"))
+        return session_volume_harness(argv[2]);
+    assert(argc == 1);
+    test_session_volume_contract();
     test_observe_only_volume();
     test_paired_setup_booleans();
     test_diagnostic_classifier();

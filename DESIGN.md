@@ -784,8 +784,9 @@ snapshot it under `mrp_lock`, with publication serialized by `mrp_publish_lock`.
 Blocking I/O remains outside the state lock. In this mode the five implemented
 `/command` controls remain the only advertised commands regardless of live intent
 or live transitions; default nonexperimental/non-live behavior is unchanged.
-Type-130 outbound already has those five controls. Neither channel adds semantic
-handlers. In particular, DataStream sync ACKs are NOT MediaRemote dispatch and
+Type-130 outbound already has those five controls. Admission alone adds no semantic
+handlers; only the separately enabled logical-volume backend below accepts exact
+bound public requests. DataStream sync ACKs are NOT MediaRemote dispatch and
 native MRP/group volume is NOT CLI stream gain. No group-volume routing or
 volume-support claim follows from receiver telemetry.
 
@@ -870,7 +871,8 @@ availability field is not required either. Valid availability/capabilities alone
 emit none of these numbers. Unknown fields are structurally skipped, never retained.
 All volume observations have `dispatched=0`; no callbacks, commands, publication,
 volume writes or MA actions result. Flags are not volume command strings.
-DataStream has no semantic dispatch, and all ACK behavior stays unchanged.
+Default DataStream has no semantic dispatch, and all ACK behavior stays unchanged.
+The explicitly enabled operational backend below is separate from this classifier.
 Native receiver MRP volume 50 and CLI stream gain 0 are separate controls.
 
 No bodies, arbitrary strings, keys, tokens, metadata, addresses, IDs or receiver
@@ -885,11 +887,10 @@ the encrypted C cases, checked by the C suite (excluding elapsed-time variation)
 and fed directly through Python `safe_fields`/`Reader` to check retention and
 absence of FIFO eligibility without a runtime/device probe.
 
-Next is an operator-authorized bounded muted native-slider experiment on the
-existing admitted profile: record original native volume, move down a small amount,
-then restore that original native volume. No MA group dispatch, helper volume writes,
-clock-policy change or type-130 activation. The existing native iPhone visibility
-and pause/play acceptance remains valid; volume request/scope remains unmeasured.
+The owner corrected the subsequent volume evidence: the native slider was greyed
+out, and no valid slider gesture occurred. Volume request/scope and native output/UI
+identity remain unmeasured. The existing native iPhone visibility and pause/play
+acceptance remains valid; the operational backend below is not a grey-slider fix.
 This is not a full-relay claim. Inherited OHF policy requires human review before
 any upstream contribution; no upstream submission here, and the owner will open
 an upstream draft after review.
@@ -1061,6 +1062,97 @@ periodic state refresh. `src/ap2_mrp.c` hand-rolls the
 proto2 emitters, the `/command` builders, the bplist `params.data` wrapper, the
 DataStream key derivation and channel framing, and answers inbound `sync`
 frames with `rply`.
+
+### Logical session-volume backend v1
+
+`src/ap2_volume.c` owns one binding per MRP context, with its own short lock:
+exact binary output/endpoint UID storage, positive increasing generation,
+strictly increasing authoritative revision, explicit known/unknown cache, one
+executing local ordinal and one replaceable trailing level. Set intent never
+changes cached volume. Backend callbacks run after releasing the driver lock,
+without MRP state/send locks. `ap2_mrp_set_volume_callback` optionally replaces the
+CLI stdout adapter before attachment (mode first, callback second); NULL disables
+dispatch. Callbacks must be nonblocking and receive only local generation/ordinal/
+milli, never wire IDs. Three seconds without completion makes the operation
+uncertain, drops its trailing request and invalidates known state. Newer
+reconciliation can restore known state, but a late completion cannot revive the
+expired operation. Rebind invalidates pending work; ordinals remain monotonic.
+No global target registry or group interpolation lives in the C process.
+
+`SESSION_VOLUME_*` staging and `STREAM_VOLUME_*` checked gain use separate
+namespaces and one-shot transactions. `ap2_volume_stage_key/action` are the real
+CLI staging/parser seam. Every ACTION attempt clears all staged fields before
+validation; duplicates, extra/missing keys, overflow, malformed hex/decimal and
+cross-namespace input reject the entire attempt. FIFO readers reassemble partial
+lines and invalidate volume staging on overlong input. Callers write complete
+transactions atomically within `PIPE_BUF`. The complete frozen key/event contract
+is in README's logical-volume section and `build/session-volume-contract.md`.
+No UID, IPC input value, protobuf identifier or token is logged.
+
+`CLIAIRPLAY_SESSION_VOLUME=mrp130` is a strict mode string, default off. It can
+request DataStream only when existing experimental admission is already true.
+An explicitly disabled `CLIAIRPLAY_MRP_TYPE130` wins; its existing explicit force
+behavior remains diagnostic and does not broaden eligibility. A requested eligible
+attempt reports `session_volume_transport ready=0|1 publication=0`, and an attached
+channel closing reports ready=0, separately from
+the command reader's compiled `session_volume version=1` IPC handshake. Optional
+DataStream failure retains the working reverse-event control channel. Volume-only
+DataStream opening omits now-playing registration/state and all periodic metadata
+pushes; POST metadata and existing event callbacks stay on their original paths.
+Clock, non-Apple, legacy gain, route and default policies are unchanged.
+
+DataStream ACKs precede semantic work. Operational dispatch requires the exact
+public `{params:{data:...}}` envelope, one key in each dictionary; root telemetry
+with a valid volume-shaped data decoy is rejected. The existing observer and
+RootJSON envelope reader remain unchanged. Only exact sync/comm frames with bounded,
+unique public protobuf type/extension pairs can request work: Get49/ext53 UID1;
+Set51/ext55 finite normalized float1 and UID2. Requests require the exact configured
+output UID, not an inferred device/cluster/group/RTSP/MA equivalence. Field2 is
+bounded to 128 bytes and echoed byte-for-byte on GetResult50/ext54 float1; field85
+is not correlation. A 16-identifier replay window bounds retained private IDs.
+Get replies are bounded to eight per drain and served from authoritative cache,
+never from requested values. There are NO outgoing Gets or outstanding Gets.
+Unsolicited type50, Change52/ext56, availability17/ext22, scoped capabilities64/ext68,
+root receiver telemetry and `dvlc` cannot dispatch Set. No SetVolumeResult exists
+in the installed public schemas, and none is invented. On committed backend
+feedback the test path builds Change52/ext56 with actual float1, endpointUID2 and
+outputUID3, not the requested level.
+
+PUBLICATION IS CLOSED in the runtime binary, including availability, scoped
+capabilities, Get results and committed current-state messages. Backend registration,
+known state, generation/ownership and an attached channel do not establish native
+UI identity. Only the test translation unit has a synthetic identity flag; there
+is no runtime environment switch or IPC key bypass. This validates an operational
+backend offline, not native UI availability or a working phone slider. No relative
+capability or private UI protocol is claimed.
+
+`ap2cl_apply_volume` shares the original percent-to-dB and RTSP send path with
+legacy `ap2cl_set_volume`, but commits local state only after 2xx. A received
+non-2xx is failed; transport uncertainty is unknown. Active RAOP uses its existing
+checked-200 send API; its boolean failure cannot distinguish rejection from lost
+response, so reports unknown conservatively. Inactive RAOP is never a receipt.
+Legacy API semantics remain deliberately unchanged, including native optimistic
+success on non-2xx. Duplicate/stale actuator ordinals are unknown and never resent.
+Session feedback/completion IPC never invokes either gain actuator.
+
+`make test STATIC=1` includes real encrypted fragmented/coalesced socket tests and
+`tests/session_volume_ipc.py`, which drives the real C command reader through a
+FIFO and verifies a clamped completion via decrypted Change52. For later C stdout
+-> MA controller -> FIFO integration, create a private FIFO and run:
+
+```
+build/tests/test_live_metadata --session-volume-harness /absolute/private/fifo
+```
+
+Bind generation7/output UID hex `500052`/empty endpoint and initialize revision1,
+known zero through that FIFO. The test-only harness emits the frozen request
+`generation=7 ordinal=1 milli=630` after a real encrypted Set; a revision2 committed
+actual result (e.g. 610) produces a decrypted-feedback assertion and
+`[STATUS] session_volume_harness committed=1 milli=610`, then exits0. Deadline is
+eight seconds. The harness uses socketpairs, no live receiver; runtime has no
+synthetic identity flag or harness helpers. It proves C stdout/FIFO/framing, NOT
+the MA group controller or confirmed real actuators; that cross-project test is
+still owned by the adapter integration work.
 
 ## 9. Buffered audio (type 103)
 
@@ -1366,6 +1458,10 @@ verbosity, never its stream.
 | `[STATUS] homepod_remote_admission` | stdout | once before native session SETUP; snapshotted enabled=0/1, not success |
 | `[STATUS] homepod_remote` | stderr | opt-in only, maximum 128 fixed diagnostic records per context (§8) |
 | `[EVENT] remote command=` | stdout | device-originated remote-control press |
+| `[STATUS] session_volume version=1` | stdout | compiled IPC handshake when command reader starts |
+| `[STATUS] session_volume_transport ready=0\|1 publication=0` | stdout | eligible volume-mode attempt readiness and attached channel loss, not UI availability |
+| `[EVENT] session_volume_set` | stdout | bound public-MRP Set intent, generation/ordinal/milli only |
+| `[EVENT] stream_volume_result` | stdout | checked actuator receipt, separate generation/ordinal namespace |
 | `[STATUS] connected` | stderr | once, when the session is up |
 | `[STATUS] clock_ready` | stderr | after `connected`, then on material change until `state=ready` (§6) |
 | `[STATUS] audio buffered_ms=` | stderr | once per start cycle, re-armed by FLUSH (§10) |

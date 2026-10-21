@@ -146,6 +146,18 @@ enum mrp_ext_field {
 #define MRP_WRITE_TIMEOUT_MS 1000
 
 struct ap2_mrp_ctx {
+    struct ap2_volume volume;
+    bool volume_mode;
+#ifdef AP2_VOLUME_TESTING
+    bool verified_volume_identity; /* synthetic offline target only */
+#endif
+    uint8_t volume_replay[16][128];
+    size_t volume_replay_len[16];
+    unsigned volume_replay_next;
+    uint64_t volume_replay_generation;
+    struct { uint8_t id[128]; size_t len; uint64_t generation; } volume_gets[8];
+    unsigned volume_get_count;
+    uint64_t volume_published_revision;
     /* Target + identity */
     char *host;
     int port;
@@ -858,7 +870,18 @@ static bool mrp_write_all(int fd, const uint8_t *data, int len)
 
 static void mrp_close_data_channel(struct ap2_mrp_ctx *m)
 {
+    bool was_connected = m->connected;
     m->connected = false;
+    if (m->volume_mode) {
+        pthread_mutex_lock(&m->volume.lock);
+        uint64_t generation = m->volume.generation;
+        pthread_mutex_unlock(&m->volume.lock);
+        ap2_volume_unbind(&m->volume, generation);
+        if (was_connected) {
+            printf("[STATUS] session_volume_transport ready=0 publication=0\n");
+            fflush(stdout);
+        }
+    }
     if (m->sock >= 0) {
         shutdown(m->sock, SHUT_RDWR);
         close(m->sock);
@@ -1274,7 +1297,151 @@ static void mrp_diagnostic(struct ap2_mrp_ctx *m, bool event,
     funlockfile(stderr);
 }
 
-/* Sync frames are acknowledged, never semantically dispatched (DESIGN.md §8). */
+/* PUBLICATION CLOSED in production. Test inclusion can verify encrypted wire
+ * behavior against an explicitly synthetic identity; no runtime bypass exists. */
+static bool mrp_volume_publication_allowed(struct ap2_mrp_ctx *m)
+{
+#ifdef AP2_VOLUME_TESTING
+    return m->verified_volume_identity;
+#else
+    (void)m;
+    return false;
+#endif
+}
+static bool mrp_volume_reply(struct ap2_mrp_ctx *m, unsigned milli,
+    const uint8_t *identifier, size_t identifier_len, bool change)
+{
+    if (!mrp_volume_publication_allowed(m)) return false;
+    mbuf msg = {0}, inner = {0};
+    bool ok = pb_put_float_field(&inner, 1, milli / 1000.0f);
+    if (change) {
+        pthread_mutex_lock(&m->volume.lock);
+        ok &= pb_put_bytes_field(&inner, 2, m->volume.endpoint, m->volume.endpoint_len);
+        ok &= pb_put_bytes_field(&inner, 3, m->volume.output, m->volume.output_len);
+        pthread_mutex_unlock(&m->volume.lock);
+    }
+    ok &= pb_put_varint_field(&msg, 1, change ? 52 : 50);
+    if (!change) ok &= pb_put_bytes_field(&msg, 2, identifier, identifier_len);
+    ok &= pb_put_msg_field(&msg, change ? 56 : 54, &inner);
+    if (ok) ok = mrp_send_protobuf(m, &msg);
+    mbuf_free(&msg); mbuf_free(&inner);
+    return ok;
+}
+static void mrp_volume_request(void *userdata, uint64_t generation,
+    uint64_t ordinal, unsigned milli)
+{
+    (void)userdata;
+    printf("[EVENT] session_volume_set generation=%llu ordinal=%llu milli=%u\n",
+        (unsigned long long)generation, (unsigned long long)ordinal, milli);
+    fflush(stdout);
+}
+void ap2_mrp_set_volume_mode(struct ap2_mrp_ctx *m, bool enabled)
+{
+    if (!m) return;
+    m->volume_mode = enabled;
+    m->volume.callback = enabled ? mrp_volume_request : NULL;
+}
+void ap2_mrp_set_volume_callback(struct ap2_mrp_ctx *m,
+    ap2_volume_request_cb callback, void *userdata)
+{
+    if (!m) return;
+    m->volume.callback = callback; m->volume.userdata = userdata;
+}
+bool ap2_mrp_volume_action(struct ap2_mrp_ctx *m, const char *action,
+    const struct ap2_volume_transaction *t)
+{
+    if (!m || !m->volume_mode) return false;
+    if (!strcmp(action, "SESSION_VOLUME_BIND"))
+        return ap2_volume_bind(&m->volume, t->generation, t->output, t->output_len,
+            t->endpoint, t->endpoint_len);
+    if (!strcmp(action, "SESSION_VOLUME_UNBIND")) {
+        ap2_volume_unbind(&m->volume, t->generation); return true;
+    }
+    if (!strcmp(action, "SESSION_VOLUME_STATE"))
+        return ap2_volume_state(&m->volume, t->generation, t->revision, t->known, t->milli);
+    if (!strcmp(action, "SESSION_VOLUME_COMPLETE"))
+        return ap2_volume_complete(&m->volume, t->generation, t->ordinal, t->result,
+            t->revision, t->known, t->milli, ap2_io_monotonic_ms());
+    return false;
+}
+static void mrp_volume_receive(struct ap2_mrp_ctx *m, const uint8_t *body, size_t len)
+{
+    if (!m->volume_mode) return;
+    pthread_mutex_lock(&m->volume.lock);
+    uint64_t generation = m->volume.generation;
+    pthread_mutex_unlock(&m->volume.lock);
+    if (generation != m->volume_replay_generation) {
+        memset(m->volume_replay_len, 0, sizeof(m->volume_replay_len));
+        m->volume_replay_next = 0;
+        m->volume_replay_generation = generation;
+        m->volume_published_revision = 0;
+    }
+    const uint8_t *p; size_t bytes;
+    if (!ap2_bplist_get_volume_data(body, len, &p, &bytes)) return;
+    const uint8_t *end = p + bytes; uint64_t n;
+    if (!mrp_diag_varint(&p, end, &n) || n != (uint64_t)(end - p)) return;
+    struct mrp_diag_reader r = {.p = p, .end = end};
+    struct mrp_diag_field ext = {0}, id = {0};
+    unsigned type = 0;
+    while (r.p < r.end) {
+        struct mrp_diag_field f;
+        if (!mrp_diag_field(&r, &f)) return;
+        if (f.number == 1) { if (f.wire != 0 || f.integer > 65535) return; type = f.integer; }
+        else if (f.number == 2) { if (f.wire != 2 || !f.len || f.len > 128) return; id = f; }
+        else if (f.number > 5 && f.number != 78 && f.number != 85) {
+            if (ext.number || f.wire != 2) return;
+            ext = f;
+        } else if (f.wire != ((f.number == 3 || f.number == 78 || f.number == 85) ? 2u : 0u)) return;
+    }
+    /* Results/feedback/capabilities are observations, NEVER requests. No
+     * outgoing Gets exist, so there is no pending response registry. */
+    if ((type != 49 && type != 51) || ext.number != (type == 49 ? 53u : 55u)) return;
+    struct mrp_diag_volume v = {0}; v.value_milli = -1;
+    if (!mrp_diag_volume_body(type, ext.data, ext.len, &v)) return;
+    struct mrp_diag_reader inner = {.p = ext.data, .end = ext.data + ext.len};
+    const uint8_t *uid = NULL; size_t uid_len = 0;
+    while (inner.p < inner.end) {
+        struct mrp_diag_field f;
+        if (!mrp_diag_field(&inner, &f)) return;
+        if (f.number == (type == 49 ? 1u : 2u)) { uid = f.data; uid_len = f.len; }
+    }
+    if (!uid_len || uid_len > 128) return;
+    unsigned milli;
+    if (type == 49) {
+        if (id.len && m->volume_get_count < 8 &&
+            ap2_volume_get(&m->volume, uid, uid_len, &milli) && mrp_volume_publication_allowed(m)) {
+            unsigned slot = m->volume_get_count++;
+            memcpy(m->volume_gets[slot].id, id.data, id.len);
+            m->volume_gets[slot].len = id.len;
+            m->volume_gets[slot].generation = generation;
+        }
+    } else if (v.value_milli >= 0) {
+        if (id.len) for (unsigned i = 0; i < 16; ++i)
+            if (m->volume_replay_len[i] == id.len && !memcmp(m->volume_replay[i], id.data, id.len)) return;
+        if (ap2_volume_set(&m->volume, uid, uid_len, v.value_milli, ap2_io_monotonic_ms()) && id.len) {
+            unsigned slot = m->volume_replay_next++ % 16;
+            memcpy(m->volume_replay[slot], id.data, id.len); m->volume_replay_len[slot] = id.len;
+        }
+    }
+}
+static void mrp_volume_flush(struct ap2_mrp_ctx *m)
+{
+    if (!m->volume_mode) return;
+    pthread_mutex_lock(&m->volume.lock);
+    bool known = m->volume.known && !m->volume.uncertain && m->volume.output_len;
+    unsigned milli = m->volume.milli;
+    uint64_t revision = m->volume.revision, generation = m->volume.generation;
+    pthread_mutex_unlock(&m->volume.lock);
+    if (known && mrp_volume_publication_allowed(m)) {
+        for (unsigned i = 0; i < m->volume_get_count; ++i)
+            if (m->volume_gets[i].generation == generation)
+                mrp_volume_reply(m, milli, m->volume_gets[i].id, m->volume_gets[i].len, false);
+        if (revision > m->volume_published_revision && mrp_volume_reply(m, milli, NULL, 0, true))
+            m->volume_published_revision = revision;
+    }
+    m->volume_get_count = 0;
+}
+/* ACK before semantic processing; backend calls never hold send/state locks. */
 static void mrp_process_frames(struct ap2_mrp_ctx *m)
 {
     int off = 0;
@@ -1299,6 +1466,8 @@ static void mrp_process_frames(struct ap2_mrp_ctx *m)
         if (memcmp(h + 4, "sync", 4) == 0) {
             LOG_DEBUG("[MRP] inbound frame kind=sync bytes=%u", size);
             mrp_send_reply(m, seqno);
+            if (sync && !memcmp(h + 16, "comm", 4))
+                mrp_volume_receive(m, h + MRP_DATA_HDR_LEN, size - MRP_DATA_HDR_LEN);
         } else {
             LOG_DEBUG("[MRP] inbound frame kind=%s bytes=%u", reply ? "reply" : "unknown", size);
         }
@@ -1584,6 +1753,7 @@ struct ap2_mrp_ctx *ap2_mrp_create(const char *host, int port,
         return NULL;
     struct ap2_mrp_ctx *m = calloc(1, sizeof(*m));
     if (!m) return NULL;
+    if (!ap2_volume_init(&m->volume)) { free(m); return NULL; }
 
     m->host = mrp_strdup(host);
     m->port = port;
@@ -1622,6 +1792,7 @@ void ap2_mrp_destroy(struct ap2_mrp_ctx *m)
     if (!m) return;
     ap2_mrp_stop(m);
     pthread_mutex_destroy(&m->send_lock);
+    ap2_volume_destroy(&m->volume);
     OPENSSL_cleanse(m->shared_secret, sizeof(m->shared_secret));
     OPENSSL_cleanse(m->out_key, sizeof(m->out_key));
     OPENSSL_cleanse(m->in_key, sizeof(m->in_key));
@@ -1678,6 +1849,29 @@ bool ap2_mrp_attach_events(struct ap2_mrp_ctx *m, int event_sock)
     return true;
 }
 
+/* Separated only to exercise actual opening/failure behavior with socketpairs. */
+static bool mrp_data_handshake(struct ap2_mrp_ctx *m)
+{
+    mbuf msg = {0};
+    bool ok = build_device_info(m, &msg) && mrp_send_protobuf(m, &msg);
+    mbuf_free(&msg);
+    ok = ok && build_set_connection_state(&msg, MRP_CONNECTION_STATE_CONNECTED) && mrp_send_protobuf(m, &msg);
+    mbuf_free(&msg);
+    ok = ok && build_client_updates_config(&msg) && mrp_send_protobuf(m, &msg);
+    mbuf_free(&msg);
+    if (!m->volume_mode) {
+        ok = ok && build_set_now_playing_client(m, &msg) && mrp_send_protobuf(m, &msg);
+        mbuf_free(&msg);
+        ok = ok && mrp_push_state(m, m->artwork_len > 0);
+        if (ok) { m->state_dirty = false; m->state_include_artwork = false; }
+    }
+    if (!ok) {
+        LOG_ERROR("[MRP] handshake push failed");
+        mrp_close_data_channel(m); /* NEVER close the independent event channel. */
+    }
+    return ok;
+}
+
 bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed)
 {
     if (!m || data_port <= 0) return false;
@@ -1725,34 +1919,9 @@ bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed)
     m->connected = true;
     LOG_INFO("[MRP] data channel connected to %s:%d", m->host, data_port);
 
-    /* Opening sequence: DEVICE_INFO must be first (receiver stays silent
-     * otherwise), then connection state, updates config, now-playing client
-     * registration, and the initial full state. */
-    bool ok = true;
-    mbuf msg = {0};
-    ok = ok && build_device_info(m, &msg) && mrp_send_protobuf(m, &msg);
-    mbuf_free(&msg);
-    ok = ok && build_set_connection_state(&msg, MRP_CONNECTION_STATE_CONNECTED) &&
-         mrp_send_protobuf(m, &msg);
-    mbuf_free(&msg);
-    ok = ok && build_client_updates_config(&msg) && mrp_send_protobuf(m, &msg);
-    mbuf_free(&msg);
-    ok = ok && build_set_now_playing_client(m, &msg) && mrp_send_protobuf(m, &msg);
-    mbuf_free(&msg);
-    ok = ok && mrp_push_state(m, m->artwork_len > 0);
-    if (ok) {
-        m->state_dirty = false;
-        m->state_include_artwork = false;
-    }
-
-    if (!ok) {
-        LOG_ERROR("[MRP] handshake push failed");
-        ap2_mrp_stop(m);
-        return false;
-    }
-    LOG_INFO("[MRP] handshake pushed (device info, connection state, "
-             "now-playing client, initial state)");
-    return true;
+    /* DEVICE_INFO first, then connection/update configuration. Volume mode
+     * deliberately leaves all now-playing publication on POST /command. */
+    return mrp_data_handshake(m);
 }
 
 bool ap2_mrp_start(struct ap2_mrp_ctx *m)
@@ -1777,7 +1946,6 @@ void ap2_mrp_stop(struct ap2_mrp_ctx *m)
         if (build_set_connection_state(&msg, MRP_CONNECTION_STATE_DISCONNECTED))
             mrp_send_protobuf(m, &msg);
         mbuf_free(&msg);
-        m->connected = false;
     }
     mrp_close_data_channel(m);
     mrp_close_event_channel(m);
@@ -2006,6 +2174,7 @@ bool ap2_mrp_set_stopped(struct ap2_mrp_ctx *m)
 
 void ap2_mrp_tick(struct ap2_mrp_ctx *m)
 {
+    if (m) ap2_volume_tick(&m->volume, ap2_io_monotonic_ms());
     if (!m) return;
     mrp_tick_events(m);
     if (!m->connected || m->sock < 0) return;
@@ -2026,13 +2195,13 @@ void ap2_mrp_tick(struct ap2_mrp_ctx *m)
         mrp_process_frames(m);
         if (!m->connected) return;
     }
-
+    mrp_volume_flush(m);
 }
 
 bool ap2_mrp_prepare_state_push(struct ap2_mrp_ctx *m, uint8_t **out,
                                 int *out_len, uint64_t *generation)
 {
-    if (!m || !out || !out_len || !generation || !m->connected) return false;
+    if (!m || !out || !out_len || !generation || !m->connected || m->volume_mode) return false;
     bool periodic =
         m->playback_state == AP2_MRP_PLAYBACK_PLAYING &&
         time(NULL) - m->last_state_push >= MRP_STATE_REPUSH_S;

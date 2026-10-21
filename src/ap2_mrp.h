@@ -24,8 +24,20 @@
 #include <stdint.h>
 
 #include "ap2_remote.h"
+#include "ap2_volume.h"
 
 struct ap2_mrp_ctx;
+/* Staged backend IPC; no native UI identity or availability claim. */
+bool ap2_mrp_volume_action(struct ap2_mrp_ctx *m, const char *action,
+    const struct ap2_volume_transaction *t);
+void ap2_mrp_set_volume_mode(struct ap2_mrp_ctx *m, bool enabled);
+/* Optional nonblocking backend request callback, configured before attachment.
+ * NULL disables dispatch. No wire identifiers are passed to the backend.
+ * A callback racing unbind may carry the old generation: reject it at the
+ * backend's current-owner guard. Callback/userdata lifetime must extend through
+ * transport-thread shutdown; unbind is not a callback cancellation barrier. */
+void ap2_mrp_set_volume_callback(struct ap2_mrp_ctx *m,
+    ap2_volume_request_cb callback, void *userdata);
 
 /* Receive validated event-channel MediaRemote commands. Set before attaching
  * the event socket; the callback remains fixed for that session. */

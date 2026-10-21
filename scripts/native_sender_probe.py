@@ -23,10 +23,68 @@ from typing import IO
 
 VERSION = re.compile(rb"cliairplay v[0-9A-Za-z][0-9A-Za-z.+_-]{0,127} check\r?\n?$")
 MACHINE = re.compile(rb"\[(STATUS|EVENT)\] ([A-Za-z][A-Za-z0-9_]{0,63})(?: |\r?$)")
+# Public machine outputs in cliairplay.c, ap2_session.c, ap2_client.c and ap2_mrp.c.
+MACHINE_NAMES = {
+    b"STATUS": {
+        b"connected",
+        b"playing",
+        b"paused",
+        b"eof",
+        b"clock_ready",
+        b"started",
+        b"content_cut",
+        b"anchor_corrected",
+        b"clock_verified",
+        b"error",
+        b"announce_done",
+        b"announce_started",
+        b"mrp",
+        b"stopped",
+        b"latency",
+        b"capabilities",
+        b"route",
+        b"audio",
+        b"flushed",
+        b"idle_timeout",
+        b"homepod_remote_admission",
+        b"homepod_remote",
+        b"session_volume",
+        b"session_volume_transport",
+        b"REANCHOR",
+    },
+    b"EVENT": {b"remote", b"session_volume_set", b"stream_volume_result"},
+}
 AUDIO = re.compile(rb"buffered_ms=[1-9][0-9]{0,19}$")
 MRP_STATUS = re.compile(rb"(?:-1|0|1|[1-5][0-9]{2})$")
+TRANSPORT = {"play": b"ACTION=PLAY\n", "pause": b"ACTION=PAUSE\n"}
+TOGGLE_GUARD_SECONDS = 0.25
 SAFE_FIELDS: dict[str, dict[bytes, set[bytes]]] = {
+    "remote": {b"command": {b"play", b"pause", b"play_pause", b"next", b"previous"}},
     "mrp": {b"path": {b"channel", b"command"}},
+    "homepod_remote_admission": {b"enabled": {b"0", b"1"}},
+    "session_volume": {b"version": {b"1"}},
+    "session_volume_transport": {b"ready": {b"0", b"1"}, b"publication": {b"0"}},
+    "stream_volume_result": {b"status": {b"committed", b"failed", b"unknown"}},
+    "homepod_remote": {
+        b"channel": {b"event", b"datastream"},
+        b"frame_kind": {b"command", b"sync", b"reply", b"unknown"},
+        b"classification": {b"command", b"protobuf", b"invalid", b"unknown"},
+        b"command": {b"play", b"pause", b"toggle", b"next", b"previous", b"unknown"},
+        b"dispatched": {b"0", b"1"},
+        b"message": {
+            b"transport",
+            b"receiver_telemetry",
+            b"volume_set_candidate",
+            b"volume_feedback",
+            b"volume_get",
+            b"volume_result",
+            b"volume_capability",
+            b"unknown",
+            b"invalid",
+        },
+        b"target": {b"missing", b"unresolved"},
+        b"value_state": {b"missing", b"valid", b"invalid"},
+    },
     "clock_ready": {
         b"mode": {b"ptp", b"ntp"},
         b"state": {b"cold", b"probing", b"ready", b"stalled"},
@@ -37,6 +95,16 @@ SAFE_FIELDS: dict[str, dict[bytes, set[bytes]]] = {
         b"timing": {b"ptp", b"ntp"},
     },
 }
+SAFE_NUMBERS = {
+    b"ordinal": (1, 128),
+    b"elapsed_ms": (0, 2**63 - 1),
+    b"protobuf_type": (-1, 65535),
+    b"bytes": (0, 65536),
+    b"value_milli": (0, 1000),
+    b"available": (0, 1),
+    b"capabilities": (0, 3),
+}
+NUMBER = re.compile(rb"(?:0|[1-9][0-9]{0,18}|-1)$")
 COMMANDS = (
     b"TITLE=AirPlay relay probe\nARTIST=\nALBUM=\nITEMID=native-relay-probe\n"
     b"DURATION=0\nSTART_UNIX_MS=0\nACTION=SENDMETA\nACTION=START\n"
@@ -53,10 +121,24 @@ def safe_fields(chunk: bytes, name: str) -> dict[str, str]:
     """Retain only fixed protocol enums and bounded MRP status codes."""
     result = {}
     allowed = SAFE_FIELDS.get(name, {})
+    if name == "remote":
+        commands = [
+            field for field in chunk.split()[2:] if field.startswith(b"command=")
+        ]
+        if len(commands) != 1:
+            return {}
     for field in chunk.split()[2:]:
         key, _, value = field.partition(b"=")
-        if value in allowed.get(key, set()) or (
-            name == "mrp" and key == b"status" and MRP_STATUS.fullmatch(value)
+        numeric = (
+            name == "homepod_remote"
+            and key in SAFE_NUMBERS
+            and NUMBER.fullmatch(value)
+            and SAFE_NUMBERS[key][0] <= int(value) <= SAFE_NUMBERS[key][1]
+        )
+        if (
+            numeric
+            or value in allowed.get(key, set())
+            or (name == "mrp" and key == b"status" and MRP_STATUS.fullmatch(value))
         ):
             result[key.decode("ascii")] = value.decode("ascii")
     return result
@@ -65,11 +147,16 @@ def safe_fields(chunk: bytes, name: str) -> dict[str, str]:
 class Reader:
     """Drain bounded lines; retain only protocol names and latched state."""
 
-    def __init__(self, stream: IO[bytes]) -> None:
+    def __init__(self, stream: IO[bytes], respond_transport: bool = False) -> None:
         self.stream = stream
+        self.respond_transport = respond_transport
+        self.commands: queue.Queue[str] = queue.Queue(maxsize=128)
+        self.last_toggle = float("-inf")
         self.records: queue.Queue[tuple[str, str, dict[str, str]]] = queue.Queue(
             maxsize=128
         )
+        self.admission_enabled = threading.Event()
+        self.admission_denied = threading.Event()
         self.connected = threading.Event()
         self.started = threading.Event()
         self.failed = threading.Event()
@@ -94,7 +181,12 @@ class Reader:
             match = MACHINE.match(chunk)
             if not match:
                 continue
-            kind, name = (value.decode("ascii").lower() for value in match.groups())
+            raw_kind, raw_name = match.groups()
+            if raw_name not in MACHINE_NAMES[raw_kind]:
+                continue
+            kind, name = (
+                value.decode("ascii").lower() for value in (raw_kind, raw_name)
+            )
             if kind == "status":
                 fields = set(chunk.split()[2:])
                 if name == "audio" and any(AUDIO.fullmatch(field) for field in fields):
@@ -104,14 +196,40 @@ class Reader:
                         self.ntp_seen.set()
                     if {b"mode=ptp", b"state=ready"} <= fields:
                         self.ptp_ready.set()
+                if name == "homepod_remote_admission":
+                    if b"enabled=0" in fields:
+                        self.admission_denied.set()
+                    if b"enabled=1" in fields:
+                        self.admission_enabled.set()
                 if name == "connected":
                     self.connected.set()
                 elif name == "started":
                     self.started.set()
                 elif name in {"error", "stopped", "eof", "idle_timeout"}:
                     self.failed.set()
+            fields_safe = safe_fields(chunk, name)
+            if (
+                self.respond_transport
+                and kind == "event"
+                and name == "remote"
+                and self.started.is_set()
+                and not self.failed.is_set()
+            ):
+                command = fields_safe.get("command")
+                if command in {"play", "pause", "play_pause"}:
+                    now = time.monotonic()
+                    if (
+                        command != "play_pause"
+                        or now - self.last_toggle >= TOGGLE_GUARD_SECONDS
+                    ):
+                        if command == "play_pause":
+                            self.last_toggle = now
+                        try:
+                            self.commands.put_nowait(command)
+                        except queue.Full:
+                            pass
             try:
-                self.records.put_nowait((kind, name, safe_fields(chunk, name)))
+                self.records.put_nowait((kind, name, fields_safe))
             except queue.Full:
                 pass
 
@@ -127,17 +245,25 @@ def stop(child: subprocess.Popen[bytes]) -> None:
     child.wait()
 
 
-def child_env(type130: int) -> dict[str, str]:
+def child_env(type130: int, experimental_homepod_remote: int = 0) -> dict[str, str]:
     """Pass only platform runtime variables, never inherited auth or tokens."""
-    return {
-        key: os.environ[key]
-        for key in ("PATH", "SYSTEMROOT", "TMPDIR")
-        if key in os.environ
-    } | {
-        "CLIAIRPLAY_MRP": "1",
-        "CLIAIRPLAY_MRP_TYPE130": str(type130),
-        "CLIAIRPLAY_BUFFERED": "0",
-    }
+    return (
+        {
+            key: os.environ[key]
+            for key in ("PATH", "SYSTEMROOT", "TMPDIR")
+            if key in os.environ
+        }
+        | {
+            "CLIAIRPLAY_MRP": "1",
+            "CLIAIRPLAY_MRP_TYPE130": str(type130),
+            "CLIAIRPLAY_BUFFERED": "0",
+        }
+        | (
+            {"CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE": "1"}
+            if experimental_homepod_remote == 1
+            else {}
+        )
+    )
 
 
 def check_binary(binary: str, env: dict[str, str], deadline: float) -> None:
@@ -159,7 +285,7 @@ def check_binary(binary: str, env: dict[str, str], deadline: float) -> None:
 def probe(opts: argparse.Namespace) -> bool:
     """Run one sender within one absolute TTL; always clean up the FIFO and child."""
     deadline = time.monotonic() + opts.duration
-    env = child_env(opts.type130)
+    env = child_env(opts.type130, opts.experimental_homepod_remote)
     check_binary(str(opts.binary), env, deadline)
     if time.monotonic() >= deadline:
         return False
@@ -210,8 +336,8 @@ def probe(opts: argparse.Namespace) -> bool:
                 ) as child,
             ):
                 assert child.stdout is not None
-                reader = Reader(child.stdout)
-                sent = ready = False
+                reader = Reader(child.stdout, opts.respond_transport == 1)
+                sent = ready = paused = False
                 emitted = 0
                 connect_deadline = min(deadline, time.monotonic() + 20)
                 try:
@@ -223,6 +349,11 @@ def probe(opts: argparse.Namespace) -> bool:
                                 break
                             emit(kind, name=name, **fields)
                             emitted += 1
+                        if (
+                            opts.experimental_homepod_remote == 1
+                            and reader.admission_denied.is_set()
+                        ):
+                            break
                         if reader.failed.is_set() or (
                             opts.timing == "ptp" and reader.ntp_seen.is_set()
                         ):
@@ -232,6 +363,10 @@ def probe(opts: argparse.Namespace) -> bool:
                             reader.connected.is_set()
                             and reader.audio.is_set()
                             and clock_ready
+                            and (
+                                opts.experimental_homepod_remote == 0
+                                or reader.admission_enabled.is_set()
+                            )
                             and not sent
                         ):
                             if os.write(fd, COMMANDS) != len(COMMANDS):
@@ -242,6 +377,37 @@ def probe(opts: argparse.Namespace) -> bool:
                             ready = True
                         if child.poll() is not None:
                             break
+                        if ready and opts.respond_transport == 1:
+                            for _ in range(128):
+                                if (
+                                    time.monotonic() >= deadline
+                                    or child.poll() is not None
+                                    or reader.failed.is_set()
+                                    or reader.admission_denied.is_set()
+                                    and opts.experimental_homepod_remote == 1
+                                    or opts.timing == "ptp"
+                                    and reader.ntp_seen.is_set()
+                                ):
+                                    break
+                                try:
+                                    command = reader.commands.get_nowait()
+                                except queue.Empty:
+                                    break
+                                pause = (
+                                    not paused
+                                    if command == "play_pause"
+                                    else command == "pause"
+                                )
+                                if pause == paused:
+                                    continue
+                                action = "pause" if pause else "play"
+                                payload = TRANSPORT[action]
+                                if os.write(fd, payload) != len(payload):
+                                    raise OSError("Incomplete atomic FIFO write")
+                                paused = pause
+                                if emitted < 256:
+                                    emit("fifo_action", action=action)
+                                    emitted += 1
                         if not sent and time.monotonic() >= connect_deadline:
                             break
                         time.sleep(min(0.02, max(0, deadline - time.monotonic())))
@@ -253,6 +419,10 @@ def probe(opts: argparse.Namespace) -> bool:
                     ready
                     and not reader.failed.is_set()
                     and exited is None
+                    and not (
+                        opts.experimental_homepod_remote == 1
+                        and reader.admission_denied.is_set()
+                    )
                     and not (opts.timing == "ptp" and reader.ntp_seen.is_set())
                 )
         finally:
@@ -282,6 +452,10 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--host", type=ipv4, required=True)
     result.add_argument("--bind", type=ipv4, required=True)
     result.add_argument("--type130", type=int, choices=(0, 1), required=True)
+    result.add_argument(
+        "--experimental-homepod-remote", type=int, choices=(0, 1), default=0
+    )
+    result.add_argument("--respond-transport", type=int, choices=(0, 1), default=0)
     result.add_argument("--duration", type=int, choices=range(1, 121), default=45)
     result.add_argument("--debug", type=int, choices=(0, 1), default=0)
     result.add_argument("--timing", choices=("ntp", "ptp"), default="ntp")

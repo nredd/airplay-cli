@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "ap2_bplist.h"
+#include "ap2_plist.h"
 #include "ap2_client.h"
 #include "ap2_hap.h"
 #include "ap2_io.h"
@@ -2715,8 +2716,215 @@ static void test_libraop_ntp_follows_host_clock(void)
     puts("ap2_client libraop host clock test passed");
 }
 
+bool ap2cl_test_homepod_remote_eligible(const char *, const char *, bool, bool, bool, bool, bool);
+int ap2cl_test_session_setup(bool, bool, uint8_t **);
+bool ap2cl_test_remote_attachment_failure(struct ap2cl_s *, int);
+
+static bool remote_policy(const char *txt, unsigned missing)
+{
+    return ap2cl_test_homepod_remote_eligible(txt, NULL,
+        !(missing & 1), !(missing & 2), !(missing & 4), !(missing & 8), missing & 16);
+}
+
+/* Frozen canonical writer shape from 747f03c, independent of the production
+ * policy helper. Compare complete serialized bytes, not a few field names. */
+static ap2_pl_node *canonical_peer(void)
+{
+    ap2_pl_node *d = ap2_pl_dict(), *a = ap2_pl_array();
+    ap2_pl_dict_set(d, "ID", ap2_pl_string("00000000-1111-4222-8333-444444444444"));
+    ap2_pl_dict_set(d, "DeviceType", ap2_pl_int(0));
+    ap2_pl_dict_set(d, "ClockID", ap2_pl_int(123));
+    ap2_pl_dict_set(d, "SupportsClockPortMatchingOverride", ap2_pl_bool(false));
+    ap2_pl_array_append(a, ap2_pl_string("127.0.0.1"));
+    ap2_pl_dict_set(d, "Addresses", a);
+    return d;
+}
+
+static int canonical_session(bool ptp, uint8_t **out)
+{
+    const char *session = "11111111-2222-4333-8444-555555555555";
+    const char *device = "00:11:22:33:44:55";
+    if (!ptp) {
+        struct ap2_plist *sp = ap2_plist_create();
+        ap2_plist_add_string(sp, "deviceID", device);
+        ap2_plist_add_string(sp, "sessionUUID", session);
+        ap2_plist_add_int(sp, "timingPort", 1234);
+        ap2_plist_add_string(sp, "timingProtocol", "NTP");
+        int len = ap2_plist_serialize(sp, out);
+        ap2_plist_free(sp);
+        return len;
+    }
+    ap2_pl_node *d = ap2_pl_dict(), *a = ap2_pl_array();
+    ap2_pl_dict_set(d, "timingProtocol", ap2_pl_string("PTP"));
+    ap2_pl_dict_set(d, "deviceID", ap2_pl_string(device));
+    ap2_pl_dict_set(d, "sessionUUID", ap2_pl_string(session));
+    ap2_pl_dict_set(d, "name", ap2_pl_string("cliairplay"));
+    ap2_pl_dict_set(d, "macAddress", ap2_pl_string(device));
+    ap2_pl_dict_set(d, "groupUUID", ap2_pl_string("AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"));
+    ap2_pl_dict_set(d, "groupContainsGroupLeader", ap2_pl_bool(false));
+    ap2_pl_dict_set(d, "timingPeerInfo", canonical_peer());
+    ap2_pl_array_append(a, canonical_peer());
+    ap2_pl_dict_set(d, "timingPeerList", a);
+    int len = ap2_pl_serialize(d, out);
+    ap2_pl_free(d);
+    return len;
+}
+
+/* Binary-safe key lookup without GNU-only memmem in the portable test build. */
+static bool test_bytes_contain(const uint8_t *data, size_t len, const char *needle)
+{
+    assert(data && needle);
+    size_t size = strlen(needle);
+    if (size > len) return false;
+    for (size_t i = 0; i <= len - size; i++)
+        if (!memcmp(data + i, needle, size)) return true;
+    return false;
+}
+
+static void test_homepod_remote_admission(void)
+{
+    const char *good = "model=AudioAccessory5,1 osvers=27.0 igl=1";
+    unsetenv("CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE");
+    unsetenv("CLIAIRPLAY_MRP");
+    assert(!remote_policy(good, 0));
+    static const char *bad_env[] = {"", "0", "true", "01", "1 ", "on", "false"};
+    for (size_t i = 0; i < sizeof(bad_env)/sizeof(bad_env[0]); i++) {
+        setenv("CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE", bad_env[i], 1);
+        assert(!remote_policy(good, 0));
+    }
+    setenv("CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE", "1", 1);
+    assert(remote_policy(good, 0));
+    assert(ap2cl_test_homepod_remote_eligible("ov=27", "AudioAccessory5,1", true, true, true, true, false));
+    for (unsigned i = 1; i <= 16; i <<= 1) assert(!remote_policy(good, i));
+    static const char *bad_txt[] = {
+        "model=AudioAccessory5,10 osvers=27", "model=AudioAccessory6,1 osvers=27",
+        "model=AppleTV osvers=27", "model=AudioAccessory5,1 osvers=26",
+        "model=AudioAccessory5,1 osvers=28", "model=AudioAccessory5,1 srcvers=980.1",
+        "model=AudioAccessory5,1", "osvers=27", "model=AudioAccessory5,1 osvers=27oops",
+        "model=AudioAccessory5,1 osvers=999999999999999999999999999",
+        "model=AudioAccessory5,1 osvers=27.bad", "model=AudioAccessory5,1 osvers=27.",
+        "model=AudioAccessory5,1 osvers=28 ov=27", "model=AudioAccessory5,1 osvers= ov=27"
+    };
+    for (size_t i = 0; i < sizeof(bad_txt)/sizeof(bad_txt[0]); i++) assert(!remote_policy(bad_txt[i], 0));
+    assert(!ap2cl_test_homepod_remote_eligible("model=AudioAccessory6,1 osvers=27",
+        "AudioAccessory5,1", true, true, true, true, false));
+    setenv("CLIAIRPLAY_MRP", "0", 1);
+    assert(!remote_policy(good, 0));
+    unsetenv("CLIAIRPLAY_MRP");
+    for (unsigned ptp = 0; ptp < 2; ptp++) {
+        uint8_t *baseline = NULL, *actual = NULL;
+        int bl = canonical_session(ptp, &baseline);
+        int al = ap2cl_test_session_setup(ptp, false, &actual);
+        assert(bl == al && !memcmp(baseline, actual, (size_t)bl));
+        free(actual);
+        for (size_t i = 0; i < sizeof(bad_txt)/sizeof(bad_txt[0]); i++) {
+            al = ap2cl_test_session_setup(ptp, remote_policy(bad_txt[i], 0), &actual);
+            assert(bl == al && !memcmp(baseline, actual, (size_t)bl));
+            free(actual);
+        }
+        for (unsigned missing = 1; missing <= 16; missing <<= 1) {
+            al = ap2cl_test_session_setup(ptp, remote_policy(good, missing), &actual);
+            assert(bl == al && !memcmp(baseline, actual, (size_t)bl));
+            free(actual);
+        }
+        free(baseline);
+    }
+    uint8_t *paired = NULL;
+    int len = ap2cl_test_session_setup(true, remote_policy(good, 0), &paired);
+    assert(len > 0 && paired);
+    /* The raw bplist bool markers are checked in the serializer tests too. */
+    assert(test_bytes_contain(paired, (size_t)len, "senderSupportsRelay"));
+    assert(test_bytes_contain(paired, (size_t)len, "isMultiSelectAirPlay"));
+    free(paired);
+    unsetenv("CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE");
+
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    ap2_device_info_t device = {.name="test", .address="127.0.0.1", .port=7000};
+    ap2_audio_format_t format = {.sample_rate=44100, .bit_depth=16, .channels=2};
+    struct ap2cl_s *p = ap2cl_create(&device, &format, NULL, NULL, "0011223344556677", "1", 600, 50);
+    assert(p && ap2cl_test_remote_attachment_failure(p, sockets[0]));
+    assert(fcntl(sockets[0], F_GETFD) == -1 && errno == EBADF);
+    const char *detail;
+    assert(ap2cl_connect_error(p, NULL, &detail) == AP2_CONNECT_ERROR_GENERIC);
+    assert(strstr(detail, "reverse event attachment failed"));
+    ap2cl_destroy(p);
+    close(sockets[1]);
+    puts("HomePod strict admission, canonical session bytes and attachment cleanup tests passed");
+}
+
+/* A checked receipt must represent a receiver response, not the legacy
+ * API's historical optimistic success. Exercise the real RTSP send/parser. */
+static void *run_volume_peer(void *arg)
+{
+    rtsp_peer_t *peer = arg;
+    char buffer[2048] = {0}; size_t fill = 0;
+    for (;;) {
+        ssize_t n = read(peer->fd, buffer + fill, sizeof(buffer) - fill - 1);
+        assert(n > 0); fill += (size_t)n;
+        char *header = strstr(buffer, "\r\n\r\n");
+        char *length = strstr(buffer, "Content-Length: ");
+        unsigned bytes = 0;
+        if (header && length && sscanf(length, "Content-Length: %u", &bytes) == 1 &&
+            fill >= (size_t)(header + 4 - buffer) + bytes) break;
+        assert(fill < sizeof(buffer) - 1);
+    }
+    assert(!strncmp(buffer, "SET_PARAMETER ", 14));
+    assert(strstr(buffer, "volume: -15.000000\r\n"));
+    char *cseq = strstr(buffer, "\r\nCSeq: "); int seq;
+    assert(cseq && sscanf(cseq, "\r\nCSeq: %d", &seq) == 1);
+    char response[128];
+    int n = snprintf(response, sizeof(response),
+        "RTSP/1.0 %d Result\r\nCSeq: %d\r\nContent-Length: 0\r\n\r\n", peer->response_status, seq);
+    assert(write(peer->fd, response, (size_t)n) == n);
+    return NULL;
+}
+int ap2cl_test_volume(struct ap2cl_s *p);
+static void test_checked_volume(void)
+{
+    static const int statuses[] = {200, 204, 400, 500};
+    for (unsigned i = 0; i < 4; ++i) for (unsigned legacy = 0; legacy < 2; ++legacy) {
+        int pair[2]; assert(!socketpair(AF_UNIX, SOCK_STREAM, 0, pair));
+        rtsp_peer_t peer = {.fd = pair[1], .response_status = statuses[i]};
+        pthread_t thread; assert(!pthread_create(&thread, NULL, run_volume_peer, &peer));
+        ap2_device_info_t device = {.name = "volume", .address = "127.0.0.1", .port = 7000};
+        ap2_audio_format_t format = {.sample_rate = 44100, .bit_depth = 16, .channels = 2};
+        struct ap2cl_s *client = ap2cl_create(&device, &format, NULL, NULL, "0011223344556677", "1", 600, 0);
+        assert(client); ap2cl_force_native(client); ap2cl_test_attach_rtsp_socket(client, pair[0]);
+        if (legacy) assert(ap2cl_set_volume(client, 50));
+        else assert(ap2cl_apply_volume(client, 50) == (statuses[i] < 300 ? 1 : 0));
+        assert(ap2cl_test_volume(client) == (legacy || statuses[i] < 300 ? 50 : 0));
+        assert(!pthread_join(thread, NULL));
+        ap2cl_test_detach_rtsp_socket(client); close(pair[1]); ap2cl_destroy(client);
+    }
+    puts("Checked stream volume: 4 RTSP statuses, legacy semantics preserved");
+}
+bool ap2cl_test_session_volume_enabled(bool admitted);
+static void test_session_volume_policy(void)
+{
+    unsetenv("CLIAIRPLAY_SESSION_VOLUME"); unsetenv("CLIAIRPLAY_MRP_TYPE130");
+    assert(!ap2cl_test_session_volume_enabled(true));
+    setenv("CLIAIRPLAY_SESSION_VOLUME", "mrp130", 1);
+    assert(ap2cl_test_session_volume_enabled(true));
+    assert(!ap2cl_test_session_volume_enabled(false));
+    static const char *kills[] = {"0", "false", "off"};
+    for (unsigned i = 0; i < 3; ++i) {
+        setenv("CLIAIRPLAY_MRP_TYPE130", kills[i], 1);
+        assert(!ap2cl_test_session_volume_enabled(true));
+        assert(!ap2cl_test_mrp_type130_enabled());
+    }
+    setenv("CLIAIRPLAY_MRP_TYPE130", "1", 1);
+    assert(ap2cl_test_session_volume_enabled(true) && ap2cl_test_mrp_type130_enabled());
+    assert(!ap2cl_test_session_volume_enabled(false));
+    setenv("CLIAIRPLAY_SESSION_VOLUME", "MRP130", 1);
+    assert(!ap2cl_test_session_volume_enabled(true) && ap2cl_test_mrp_type130_enabled());
+    unsetenv("CLIAIRPLAY_SESSION_VOLUME"); unsetenv("CLIAIRPLAY_MRP_TYPE130");
+}
 int main(void)
 {
+    test_checked_volume();
+    test_session_volume_policy();
+    test_homepod_remote_admission();
     test_host_clock_defaults_to_realtime();
     test_retransmit_responder();
     test_route_with_password();

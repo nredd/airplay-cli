@@ -124,7 +124,7 @@ RAOP_SOURCES = raop_client.c rtsp_client.c \
 	alac.c
 
 # AirPlay 2 sources (new)
-AP2_SOURCES = ap2_client.c ap2_hap.c ap2_io.c ap2_ptp.c ap2_ptp_shm.c ap2_plist.c ap2_mrp.c ap2_session.c
+AP2_SOURCES = ap2_client.c ap2_hap.c ap2_io.c ap2_ptp.c ap2_ptp_shm.c ap2_plist.c ap2_mrp.c ap2_volume.c ap2_session.c
 
 # Common/CLI sources
 CLI_SOURCES = cross_log.c cross_ssl.c cross_util.c cross_net.c platform.c host_clock.c \
@@ -158,7 +158,7 @@ CLIENT_TEST_OBJECTS = $(filter-out $(BUILDDIR)/ap2_client.o \
 
 TEST_EXECUTABLE = $(BUILDDIR)/test-mrp-artwork
 TEST_OBJECTS = $(BUILDDIR)/test_mrp_artwork.o \
-	$(BUILDDIR)/ap2_mrp.o $(BUILDDIR)/ap2_io.o $(BUILDDIR)/ap2_plist.o \
+	$(BUILDDIR)/ap2_mrp.o $(BUILDDIR)/ap2_volume.o $(BUILDDIR)/ap2_io.o $(BUILDDIR)/ap2_plist.o \
 	$(BUILDDIR)/ap2_bplist.o $(BUILDDIR)/bplist.o \
 	$(BUILDDIR)/artwork.o $(BUILDDIR)/cross_log.o
 RAOP_LIFECYCLE_TEST_EXECUTABLE = $(BUILDDIR)/test-ap2-raop-lifecycle
@@ -251,6 +251,7 @@ test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT
 	$(RAOP_SESSION_TEST)
 	$(ANNOUNCE_TEST)
 	$(LIVE_METADATA_TEST)
+	python3 tests/session_volume_ipc.py
 	python3 tests/mrp_artwork_matrix.py --help >/dev/null
 	@missing_pipe="$$($(EXECUTABLE) --protocol raop \
 		127.0.0.1 2>&1 || true)"; \
@@ -305,10 +306,10 @@ $(ANNOUNCE_TEST): tests/test_announce.c src/announce.c src/announce.h Makefile
 	$(CC) $(TEST_CFLAGS) -Isrc tests/test_announce.c src/announce.c \
 		$(EXTRA_LDFLAGS) -lm -o $@
 
-$(SESSION_TEST): tests/test_ap2_session.c src/ap2_session.c src/ap2_session.h \
-		src/ap2_io.c src/ap2_io.h Makefile
+$(SESSION_TEST): tests/test_ap2_session.c tests/ap2_session_poll_fixture.h \
+		src/ap2_session.c src/ap2_session.h src/ap2_io.c src/ap2_io.h Makefile
 	@mkdir -p $(dir $@)
-	$(CC) $(TEST_CFLAGS) $(INCLUDE) -Dpoll=ap2_session_test_poll \
+	$(CC) $(TEST_CFLAGS) $(INCLUDE) -include tests/ap2_session_poll_fixture.h \
 		-c src/ap2_session.c -o build/tests/ap2_session_fifo_test.o
 	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_ap2_session.c \
 		build/tests/ap2_session_fifo_test.o src/ap2_io.c $(TOOLS)/cross_log.c \
@@ -328,13 +329,13 @@ $(TIMELINE_TEST): tests/test_ap2_timeline.c src/ap2_timeline.h Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(TEST_CFLAGS) -Isrc $< $(EXTRA_LDFLAGS) -o $@
 
-$(EVENT_TEST): tests/test_ap2_event.c $(BUILDDIR)/ap2_mrp.o \
+$(EVENT_TEST): tests/test_ap2_event.c $(BUILDDIR)/ap2_mrp.o $(BUILDDIR)/ap2_volume.o \
 		$(BUILDDIR)/ap2_io.o $(BUILDDIR)/ap2_plist.o \
 		$(BUILDDIR)/ap2_bplist.o $(BUILDDIR)/bplist.o \
 		$(BUILDDIR)/cross_log.o Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(TEST_CFLAGS) $(INCLUDE) \
-		$< $(BUILDDIR)/ap2_mrp.o $(BUILDDIR)/ap2_io.o \
+		$< $(BUILDDIR)/ap2_mrp.o $(BUILDDIR)/ap2_volume.o $(BUILDDIR)/ap2_io.o \
 		$(BUILDDIR)/ap2_plist.o $(BUILDDIR)/ap2_bplist.o \
 		$(BUILDDIR)/bplist.o $(BUILDDIR)/cross_log.o \
 		$(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
@@ -367,7 +368,8 @@ $(CLIENT_TEST): build/tests/test_ap2_client_main.o build/tests/ap2_client.o \
 		$(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
 
 # Include CLI/MRP implementations to exercise their private parser/serializers.
-build/tests/test_live_metadata.o: tests/test_live_metadata.c src/cliairplay.c \
+build/tests/test_live_metadata.o: tests/test_live_metadata.c tests/mrp_volume_fixture.h tests/session_volume_fixture.h tests/session_volume_harness.h \
+        tests/fixtures/homepod_volume_diagnostics.txt src/cliairplay.c \
 		src/ap2_mrp.c src/ap2_mrp.h src/ap2_client.h Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@

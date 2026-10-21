@@ -24,8 +24,20 @@
 #include <stdint.h>
 
 #include "ap2_remote.h"
+#include "ap2_volume.h"
 
 struct ap2_mrp_ctx;
+/* Staged backend IPC; no native UI identity or availability claim. */
+bool ap2_mrp_volume_action(struct ap2_mrp_ctx *m, const char *action,
+    const struct ap2_volume_transaction *t);
+void ap2_mrp_set_volume_mode(struct ap2_mrp_ctx *m, bool enabled);
+/* Optional nonblocking backend request callback, configured before attachment.
+ * NULL disables dispatch. No wire identifiers are passed to the backend.
+ * A callback racing unbind may carry the old generation: reject it at the
+ * backend's current-owner guard. Callback/userdata lifetime must extend through
+ * transport-thread shutdown; unbind is not a callback cancellation barrier. */
+void ap2_mrp_set_volume_callback(struct ap2_mrp_ctx *m,
+    ap2_volume_request_cb callback, void *userdata);
 
 /* Receive validated event-channel MediaRemote commands. Set before attaching
  * the event socket; the callback remains fixed for that session. */
@@ -140,6 +152,10 @@ bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed);
  * success. This derives the independent Events-Salt keys and services encrypted
  * reverse HTTP requests with 200 responses from ap2_mrp_tick().
  */
+/* Internal session policy. Set once before publishing the context; callers use
+ * the existing MRP state lock/serializer for subsequent command snapshots. */
+void ap2_mrp_set_experimental_homepod_remote(struct ap2_mrp_ctx *m, bool enabled);
+
 bool ap2_mrp_attach_events(struct ap2_mrp_ctx *m, int event_sock);
 
 /*

@@ -24,8 +24,20 @@
 #include <stdint.h>
 
 #include "ap2_remote.h"
+#include "ap2_volume.h"
 
 struct ap2_mrp_ctx;
+/* Staged backend IPC; no native UI identity or availability claim. */
+bool ap2_mrp_volume_action(struct ap2_mrp_ctx *m, const char *action,
+    const struct ap2_volume_transaction *t);
+void ap2_mrp_set_volume_mode(struct ap2_mrp_ctx *m, bool enabled);
+/* Optional nonblocking backend request callback, configured before attachment.
+ * NULL disables dispatch. No wire identifiers are passed to the backend.
+ * A callback racing unbind may carry the old generation: reject it at the
+ * backend's current-owner guard. Callback/userdata lifetime must extend through
+ * transport-thread shutdown; unbind is not a callback cancellation barrier. */
+void ap2_mrp_set_volume_callback(struct ap2_mrp_ctx *m,
+    ap2_volume_request_cb callback, void *userdata);
 
 /* Receive validated event-channel MediaRemote commands. Set before attaching
  * the event socket; the callback remains fixed for that session. */
@@ -140,6 +152,10 @@ bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed);
  * success. This derives the independent Events-Salt keys and services encrypted
  * reverse HTTP requests with 200 responses from ap2_mrp_tick().
  */
+/* Internal session policy. Set once before publishing the context; callers use
+ * the existing MRP state lock/serializer for subsequent command snapshots. */
+void ap2_mrp_set_experimental_homepod_remote(struct ap2_mrp_ctx *m, bool enabled);
+
 bool ap2_mrp_attach_events(struct ap2_mrp_ctx *m, int event_sock);
 
 /*
@@ -168,7 +184,7 @@ void ap2_mrp_stop(struct ap2_mrp_ctx *m);
  * new bytes stage under a fresh identifier, a rejected image clears staging,
  * and no artwork drops the retained image only when the track changed.
  *
- * :param duration_ms: track duration in milliseconds (0 = unknown/live).
+ * :param duration_ms: track duration in milliseconds (0 = unknown; not a live flag).
  * :param item_id: sender's stable per-track identity ("" or NULL = none).
  * :param mime: artwork MIME type; must be "image/jpeg".
  * :param art: artwork bytes (copied); NULL/empty = no artwork for this track.
@@ -182,13 +198,24 @@ bool ap2_mrp_set_track(struct ap2_mrp_ctx *m, const char *title,
                        const char *mime, const uint8_t *art, int art_len,
                        bool *track_changed_out, ap2_mrp_artwork_info_t *info);
 
+/* Explicit-live variant of set_track. Live clears any retained finite duration
+ * even for the same item and ignores subsequent finite progress totals. The
+ * flag and track/artwork are applied together under the caller's state lock.
+ * Legacy set_track/set_metadata calls select non-live behavior. */
+bool ap2_mrp_set_track_live(struct ap2_mrp_ctx *m, const char *title,
+                            const char *artist, const char *album,
+                            int duration_ms, bool is_live, const char *item_id,
+                            const char *mime, const uint8_t *art, int art_len,
+                            bool *track_changed_out,
+                            ap2_mrp_artwork_info_t *info);
+
 /*
  * Set the now-playing track metadata without artwork: ap2_mrp_set_track with
  * no image, so a track change drops the retained artwork. Values are copied;
  * NULL is treated as empty. Takes effect on the next feedback-worker state
  * push.
  *
- * :param duration_ms: track duration in milliseconds (0 = unknown/live).
+ * :param duration_ms: track duration in milliseconds (0 = unknown; not a live flag).
  * :param item_id: sender's stable per-track identity ("" or NULL = none).
  */
 bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
@@ -234,7 +261,7 @@ const char *ap2_mrp_artwork_result_name(ap2_mrp_artwork_result_t result);
  * Set playback progress and state.
  *
  * :param elapsed_ms: elapsed position in milliseconds.
- * :param duration_ms: track duration in milliseconds (0 = unknown/live).
+ * :param duration_ms: total in milliseconds (0 = unknown; ignored while live).
  * :param playing: true = Playing, false = Paused.
  */
 bool ap2_mrp_set_progress(struct ap2_mrp_ctx *m, int elapsed_ms,

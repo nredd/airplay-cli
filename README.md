@@ -60,6 +60,176 @@ process lifetime. The format is selected with
 `--bitdepth 24` the input must be **s32le**; the binary truncates it to the
 24-bit samples the ALAC encoder consumes.
 
+### Read-only Apple session probe
+
+```bash
+uv run tests/apple_session_probe.py --host 192.168.1.50
+uv run tests/apple_session_probe.py --host 192.168.1.50 --host 192.168.1.51 \
+  --require-controls --expect-title 'Expected title'
+```
+
+Requires `uv` and Python 3.11+; the script pins `pyatv==0.18.0` inline.
+It scans and transiently connects over AirPlay, reads state, then closes without
+sending playback, seek, volume or grouping commands. Stdout is a JSON array with
+host/name, now-playing app, metadata, state, duration/position, control availability,
+volume and output UIDs. Unsupported optional readings are `null`. `discovery`
+contains only present public AirPlay mDNS properties from this allowlist:
+`flags`, `sf`, `gid`, `pgid`, `igl`, `tsid`, `features`, `model`, `osvers`,
+`srcvers`, `deviceid`. No keys, credentials or raw diagnostics are emitted.
+Discovery/connect/read/close deadlines are 5/8/5/3 seconds per host.
+
+`--require-controls` requires protocol availability of `Play`, `Pause`,
+`PlayPause`, `Volume` and `SetVolume`. `SetPosition` is reported separately,
+not required: live radio can be nonseekable. `--expect-title` checks exact equality.
+Required-control failures, title mismatches and connection/read/close failures
+exit nonzero with sanitized per-host errors.
+
+A successful probe does not prove visibility in iPhone **All Speakers & TVs**.
+HomePods can expose metadata and transport controls to a direct controller while
+remaining absent from that native UI. Compare `discovery` and session fields
+against an Apple-source session, then verify visibility and controls on the
+Apple devices themselves.
+
+Run fake-only probe tests with `uv run --script tests/test_apple_session_probe.py`.
+For full updater/probe discovery, run
+`uv run --python 3.13 --with pyatv==0.18.0 python -m unittest discover -s tests -v`.
+CI runs the same discovery in a uv-managed Python 3.13 environment with
+`pyatv==0.18.0`, and checks only the two probe files with Ruff 0.17.1 and ty 0.0.89.
+None of these checks contact speakers. Run `make test STATIC=1` from the
+repository root for native fixtures; the Python half of the captured diagnostic
+contract runs in unittest discovery and CI, not in that Make target.
+
+### Experimental HomePod remote admission
+
+`CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE=1` is a strict literal-`1`, default-off
+experimental opt-in, not production deployment or a full relay claim.
+It snapshots eligibility before session SETUP: exact `AudioAccessory5,1`, known
+OS major 27 (`osvers`/`ov`, no firmware or future-OS guess), encrypted native
+MediaRemote, MRP enabled, a registered remote callback, actual PTP and realtime
+(not buffered). Only eligible sessions emit both `senderSupportsRelay=true` and
+`isMultiSelectAirPlay=true`. All other session SETUP bytes remain unchanged.
+An admitted attempt requires an attached encrypted reverse-event/MRP context
+before connect succeeds; failure uses `connect_failed` and connection cleanup.
+The opt-in neither enables type 130 nor changes PTP follow/clock policy.
+
+In this mode `/command` advertises only implemented Play/Pause/Toggle/Next/
+Previous, in live and non-live metadata and across transitions. It does not
+advertise volume, seek, shuffle, repeat or stop. Admission alone leaves DataStream
+ACK-only; the separately enabled logical-volume backend is described below. Native MRP/group volume and CLI stream gain are separate
+knobs; telemetry is not routed to group volume.
+
+On `1c95c1a`, an owner found the existing HomePod mini in the native iPhone
+remote-speaker picker and paused/resumed the muted probe. Encrypted reverse-event
+traces recorded Pause then Play, matching the owned FIFO actions and producer
+Paused/Playing confirmations. The 120-second run completed and the supported MA
+installation was restored. Type 130 was off; no clock-policy change was needed.
+This validates one OS 27 HomePod/iPhone transport path, not MA radio metadata,
+group routing/volume, physical touch, other Apple controllers or a production
+rollout. Those remain separate acceptance checks.
+
+Eligible sessions emit at most 128 bounded diagnostic records per MRP context,
+then continue servicing traffic. Records contain fixed classifications,
+recognized command names, bounded protobuf field-1 types, lengths, local
+ordinal/relative monotonic time and `dispatched`. That field means recognized
+and callback invoked, NOT that Music Assistant executed an action. No bodies,
+arbitrary type/value strings, keys, tokens, metadata or IDs are included.
+Reverse-event logging, including debug, now contains only fixed classifications
+and lengths, never arbitrary type/value/content-type strings or body hex.
+See `DESIGN.md` §8 for classifier limits.
+
+The default fork-only volume classifier is observe-only, NOT group-volume support.
+Root `receiverVolumeDidChange` is telemetry regardless of its value. Exact root
+`params.data` envelopes can be classified against public pyatv volume schemas,
+with matching protobuf type/extension, bounded structural validation and normalized
+finite values only. Fixed `message`, `target` and `value_state` fields, optional
+`value_milli` (0..1000), `available` (0..1) and `capabilities` (0..3) share the same
+128-record budget. A target UID is only `unresolved`, never a session/group claim;
+UID bytes and unknown fields are not retained; invalid parses clear the target.
+A type-51 set candidate requires a valid normalized float. Missing optional
+feedback/result levels remain missing, never zero or a command; optional
+availability is omitted when absent. Extra extensions are rejected by this narrow
+classifier, which is not a full MRP decoder. All volume observations have
+`dispatched=0`, with no callbacks, actions or publication from the classifier. DataStream remains
+ACK-only unless the separate logical-volume backend below is explicitly enabled. Receiver MRP volume 50 and muted CLI stream gain 0 are separate knobs.
+
+These are known-schema fixtures, not measured native-slider requests or scope.
+The owner corrected the volume evidence: the native volume slider was greyed out;
+no valid slider gesture occurred. No request or UI identity binding was measured.
+The offline operational backend below does NOT solve that native UI limitation. The existing iPhone visibility/pause-play acceptance above stands.
+No upstream submission is authorized: inherited OHF policy requires human review
+before any upstream contribution; the owner will open an upstream draft after review.
+
+### Experimental logical session volume (default off)
+
+`CLIAIRPLAY_SESSION_VOLUME=mrp130` requests a public-MRP DataStream backend
+*only* on an already eligible experimental HomePod remote session. Explicit
+`CLIAIRPLAY_MRP_TYPE130=0|false|off` still kills DataStream; explicit force keeps
+its existing diagnostic semantics and never broadens volume eligibility.
+Optional attachment failure retains reverse-event pause/play. Existing metadata
+stays on `POST /command`, with no DataStream now-playing pushes in volume mode.
+
+Every command reader emits `[STATUS] session_volume version=1`, an additive
+compiled IPC handshake, NOT transport readiness. A requested eligible attempt
+separately reports `[STATUS] session_volume_transport ready=0|1 publication=0`;
+attached channel loss reports `ready=0` and invalidates the backend binding.
+Older consumers can ignore both. The diagnostic helper observes these names but
+never enables volume or responds to session/group requests.
+
+The version-1 IPC names and shapes are frozen:
+- Bind with `SESSION_VOLUME_GENERATION`, `SESSION_VOLUME_OUTPUT_UID_HEX`,
+  explicitly present `SESSION_VOLUME_ENDPOINT_UID_HEX` (may be empty), then
+  `ACTION=SESSION_VOLUME_BIND`. UIDs are private exact byte strings, 1..128
+  output bytes and 0..128 endpoint bytes; generations are positive uint64.
+- Reconcile with `SESSION_VOLUME_GENERATION`, `SESSION_VOLUME_REVISION`,
+  `SESSION_VOLUME_KNOWN=0|1`, and `SESSION_VOLUME_MILLI=0..1000` *only* when
+  known, then `ACTION=SESSION_VOLUME_STATE`. Unknown is NOT zero. Revisions
+  strictly increase inside a generation.
+- Requests emit `[EVENT] session_volume_set generation=7 ordinal=12 milli=630`.
+  This is intent, never committed state. Complete with generation, ordinal,
+  `SESSION_VOLUME_RESULT=committed|rejected|failed|unknown`, revision, known and
+  optional milli as above, then `ACTION=SESSION_VOLUME_COMPLETE`. Committed
+  requires known actual state; noncommitted results require unknown. A request for
+  630 may commit an authoritative actual 610. Failed/uncertain operations never
+  manufacture success. `ACTION=SESSION_VOLUME_UNBIND` takes only generation.
+- Checked device gain uses a SEPARATE ordinal namespace:
+  `STREAM_VOLUME_GENERATION`, `STREAM_VOLUME_ORDINAL`, `STREAM_VOLUME_LEVEL=0..100`,
+  then `ACTION=STREAM_VOLUME_APPLY`. Output is
+  `[EVENT] stream_volume_result generation=7 ordinal=3 status=committed level=50`,
+  or `status=failed|unknown` without level. Native RTSP must accept a 2xx before
+  commit; legacy RAOP requires an active transport and its checked 200 receipt.
+  An uncertain RAOP failure is `unknown`, not a guessed rejection. These are raw
+  device percentages, NOT normalized group volume. Legacy `VOLUME=` is unchanged.
+
+Write every complete transaction in one atomic pipe write (within `PIPE_BUF`).
+Fields are unique, bounded, strict decimal/hex, never logged, and cleared after
+EVERY attempted ACTION, including malformed attempts. No leftovers or mixed
+namespaces are accepted. The driver holds one executing Set plus one coalesced
+trailing Set, a 3-second backend deadline and a 16-identifier replay window.
+Timeout clears known state and blocks more work until newer reconciliation;
+it is not cancellation, and late completions cannot become success.
+
+Public Get49/ext53 serves only the authoritative cache, with exact field-2
+correlation and eight bounded replies per drain. There are no outgoing Gets or
+outstanding-Get registry. Unsolicited type50 results, type52 feedback and `dvlc`
+never dispatch. There is no invented SetVolumeResult or private UI protocol.
+
+Native availability and ALL current-state publication remain OFF in production,
+including Get results and committed-change messages, even with a bound, known
+backend. The native output/UI identity binding is unverified. Test-only synthetic
+identity permits encrypted GetResult50/ext54 and committed Change52/ext56 tests;
+it is absent from the runtime binary. Offline operational success is NOT native
+slider acceptance. See `DESIGN.md` for the offline FIFO integration harness.
+
+For developer-only cross-process acceptance, from the MA source root run
+`.venv/bin/python -m scripts.check_native_airplay_volume --harness /absolute/path/to/airplay-cli/build/tests/test_live_metadata`.
+Supply an already-built executable; the command never builds or installs anything.
+It requires MA's source fixtures/venv, runs real encrypted C requests through the real
+MA controller with two fake confirmed actuators and real FIFO feedback, then requires
+the decrypted committed 610 witness for a requested 630. It emits bounded public JSON
+and exits nonzero on failure or timeout. It uses no network or hardware and is not
+part of ordinary MA tests. Synthetic verified identity is offline proof only, NOT
+native UI binding or native volume availability.
+
 ### The start contract
 
 `START_UNIX_MS=<ms>` followed by `ACTION=START` means: **the first sample is
@@ -287,6 +457,13 @@ stdin, the single persistent audio input for the whole process lifetime.
   metadata and the staged artwork as one bundle; the staged path is consumed
   by that push. `ARTWORK=<local file path or http:// imageproxy URL>` pushes
   artwork on its own, outside a track change.
+- Explicit live metadata: `IS_LIVE=0|1` (default `0`) stages intent for the next
+  `ACTION=SENDMETA` bundle. Send it only when that stream reports
+  `[STATUS] capabilities ... live_metadata=1`; missing/unknown means unsupported.
+  Live mode clears finite duration and advertises only Play/Pause/Toggle/Next/
+  Previous, not seek, shuffle or repeat. Send `0` to restore non-live behavior.
+  This prepares radio semantics, not native iPhone session visibility; receiver
+  acceptance still needs hardware confirmation. See `DESIGN.md` §8.
 
 `[STATUS] stopped` acknowledges `ACTION=STOP` once playback has been torn down.
 `STOP` is terminal: the audio loop exits, the connection is torn down and the
@@ -334,6 +511,70 @@ MRP artwork is omitted without withholding it from DMAP and clears stale state.
 `tests/mrp_artwork_matrix.py` generates the controlled Apple TV size/profile
 matrix or records/sends any existing JPEG cache path with its SHA-256, profile,
 dimensions, and full Pillow/libjpeg decode result; see `DESIGN.md` §8.
+
+## Native sender diagnostic
+
+`scripts/native_sender_probe.py` is a standalone stdlib-only diagnostic, not a
+passive observer. **It replaces the selected receiver session.** Get explicit
+authorization and use an idle target, never a receiver playing another session.
+It sends 44.1 kHz signed 16-bit stereo silence at volume zero, forces native AP2
+with `--timing ntp` by default (no shared PTP conflict), and uses a separate fixed
+DACP identity. `CLIAIRPLAY_BUFFERED=0` forces controlled realtime streaming.
+It does not inspect or make claims about receiver UI state.
+
+Authorized idle-target example (run by the operator on the HA host only):
+
+```bash
+python3 scripts/native_sender_probe.py \
+  --binary /data/airplay-native-probe/cliairplay-linux-aarch64 \
+  --host 192.168.1.50 --bind 192.168.1.10 --type130 1 --duration 45
+```
+
+Use only an independently verified binary. `--host` and `--bind` require literal
+IPv4; `--type130` is required (`0` or `1`). `--duration` is 1..120 seconds (default
+45), including the three-second `--check` and connection/setup wait (at most 20
+seconds). `--timing ptp` requires `clock_ready mode=ptp state=ready`; an NTP
+fallback fails the test. Both modes require connected + buffered audio before
+metadata and START. PTP needs exclusive access to ports 319/320: the operator may
+briefly stop stable MA, run both type-130 values under the same PTP flow, and MUST
+restart MA in their cleanup. This helper neither stops nor restarts MA.
+There are no retries or TTL extensions. Teardown may take three extra seconds
+before KILL. `--debug 0` (default) or `1` does not suppress machine status.
+Metadata and START are sent atomically only after setup readiness. JSON stdout emits
+bounded, per-kind allowlisted status/event names (unknown names are dropped before
+retention or state handling) plus allowlisted route, clock and MRP-path enums/status
+codes, one `ready` on `started`, and a final `result`;
+exit zero requires connected + started with no terminal failure and the child
+still running at the full TTL (even a clean early exit fails). Neither raw
+child output nor metadata fields/pairing material are emitted or persisted;
+credentials are not accepted and inherited auth/token environment is excluded.
+SIGTERM, Ctrl-C and failures reap the child and remove the FIFO.
+
+`--respond-transport 0` (default) observes remote callbacks without responding.
+Opt in with `--respond-transport 1` to test native-phone Pause/Play against this
+muted producer without deploying custom MA. Only normalized `[EVENT] remote`
+`play`, `pause`, and `play_pause` events received after the C `started` status can
+write constant `ACTION=PLAY`/`ACTION=PAUSE` to this owned child's FIFO. Local intent
+suppresses duplicate play/pause; a monotonic 250 ms guard suppresses toggle storms.
+`next`/`previous` remain observations only: no queue/playlist simulation, volume,
+group, API, or other-process actions. The command queue is capped at 128 and JSON
+output at 256 status/event/action records. `fifo_action` records report only FIFO
+writes; C `paused`/`playing` statuses confirm producer transitions, not MA actions
+or UI execution. Failure, child exit, TTL and cleanup stop responses. Readiness,
+admission, clock policy, mute, strict child environment and cleanup stay unchanged.
+This is a pause/play/toggle test consumer, not a full remote relay.
+
+The helper accepts `--experimental-homepod-remote {0,1}` (default `0`). Only
+explicit `1` sets the child opt-in; it is never inherited from the environment.
+When requested, `[STATUS] homepod_remote_admission enabled=1` is mandatory before
+START, in addition to normal readiness. Ineligible (`enabled=0`) or older binaries
+fail without sending metadata/START. Use `--timing ptp` for an eligible attempt;
+NTP remains the helper's default. Fixed diagnostic enums/numeric fields are
+retained in bounded JSON, never raw receiver strings. Existing `--type130` remains
+an independent, required option.
+
+Keep any Apple-source reference playing on a different receiver. This helper
+does not authorize live playback by itself.
 
 ## Building
 

@@ -258,6 +258,7 @@ struct ap2cl_s {
     pthread_mutex_t mrp_lock;
     pthread_mutex_t mrp_publish_lock;
     atomic_int mrp_event_health;
+    bool experimental_homepod_remote; /* immutable before session SETUP */
     bool mrp_device_registered;
     bool mrp_extended_registered;
     bool mrp_progress_push_full;  /* receiver rejected the "update" policy;
@@ -273,6 +274,7 @@ struct ap2cl_s {
     char *meta_album;
     char *meta_item_id;
     int meta_duration;
+    bool metadata_is_live;   /* active bundle intent; protected by mrp_lock */
     bool meta_delivered;
     ap2_remote_command_cb_t remote_command_cb;
     void *remote_command_userdata;
@@ -436,6 +438,8 @@ static ap2_mrp_push_result_t ap2cl_mrp_push_progress_serialized(
     struct ap2cl_s *p);
 static bool ap2_set_nonblocking(int fd, const char *name);
 static void ap2_raop_session_cleanup(struct ap2cl_s *p);
+static void ap2_mrp_ready(struct ap2cl_s *p);
+static bool ap2_homepod_remote_ready(struct ap2cl_s *p);
 static void ap2_clock_verify_disarm(struct ap2cl_s *p);
 static void ap2_clock_verify_reap_poller(struct ap2cl_s *p);
 static void ap2_clock_poller_ensure(struct ap2cl_s *p);
@@ -470,6 +474,13 @@ static bool ap2_env_enabled(const char *name, bool unset_default)
 static bool ap2_mrp_type130_enabled(void)
 {
     return ap2_env_enabled("CLIAIRPLAY_MRP_TYPE130", false);
+}
+/* Explicit diagnostic kill wins. This never broadens admission eligibility. */
+static bool ap2_session_volume_enabled(struct ap2cl_s *p)
+{
+    const char *mode = getenv("CLIAIRPLAY_SESSION_VOLUME");
+    return mode && !strcmp(mode, "mrp130") && p->experimental_homepod_remote &&
+        (!getenv("CLIAIRPLAY_MRP_TYPE130") || ap2_mrp_type130_enabled());
 }
 
 /* ---- Native AP2 failure reporting ---- */
@@ -1352,8 +1363,45 @@ static int ap2_txt_version_major(const char *txt, const char *key)
     const char *v = ap2_txt_field(txt, key);
     if (!v || v[0] < '0' || v[0] > '9') return -1;
     int major = 0;
-    for (; *v >= '0' && *v <= '9'; v++) major = major * 10 + (*v - '0');
+    for (; *v >= '0' && *v <= '9'; v++) {
+        if (major > (INT_MAX - 9) / 10) return -1;
+        major = major * 10 + (*v - '0');
+    }
     return major;
+}
+
+/* Exact model token, not a prefix admitting untested hardware. */
+static bool ap2_homepod_remote_eligible(const char *txt, const char *am,
+    bool encrypted, bool native, bool callback, bool ptp, bool buffered)
+{
+    const char *setting = getenv("CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE");
+    const char *model = ap2_txt_field(txt, "model");
+    if (!model) model = am;
+    const char *tested = "AudioAccessory5,1";
+    size_t len = strlen(tested);
+    const char *version_key = ap2_txt_field(txt, "osvers") ? "osvers" : "ov";
+    const char *version = ap2_txt_field(txt, version_key);
+    int os = ap2_txt_version_major(txt, version_key);
+    bool version_valid = version != NULL;
+    bool digit = false;
+    for (const char *v = version; v && *v && *v != ' '; v++) {
+        if (*v == '.' && digit) digit = false;
+        else if (*v >= '0' && *v <= '9') digit = true;
+        else { version_valid = false; break; }
+    }
+    return setting && !strcmp(setting, "1") && model &&
+           !strncmp(model, tested, len) && (!model[len] || model[len] == ' ') &&
+           version_valid && digit && os == 27 && native && callback && ptp && !buffered &&
+           ap2_mrp_session_eligible(encrypted, false, true) &&
+           ap2_env_enabled("CLIAIRPLAY_MRP", true);
+}
+
+/* Paired admission fields are never emitted independently. */
+static void ap2_homepod_remote_setup(ap2_pl_node *root, bool enabled)
+{
+    if (!enabled) return;
+    ap2_pl_dict_set(root, "senderSupportsRelay", ap2_pl_bool(true));
+    ap2_pl_dict_set(root, "isMultiSelectAirPlay", ap2_pl_bool(true));
 }
 
 /* True only for a receiver advertising HomePod OS 27 or newer. Trust osvers
@@ -1635,22 +1683,23 @@ static void ap2_native_setup_mrp(struct ap2cl_s *p)
         LOG_WARN("[MRP] type-130 SETUP returned no dataPort; no now-playing channel");
         return;
     }
-    LOG_INFO("[MRP] type-130 data-channel SETUP OK (dataPort=%d, seed=%llu)",
-             data_port, (unsigned long long)seed);
+    LOG_INFO("[MRP] type-130 data-channel SETUP accepted");
 
     /* Bind the sender to THIS session's pairing secret and open the channel
      * (TCP connect + DEVICE_INFO-first handshake). */
     if (!p->mrp) {
         size_t kdf_len = 0;
         const uint8_t *kdf = ap2_hap_get_kdf_secret(p->hap, &kdf_len);
-        p->mrp = ap2_mrp_create(p->device.address, p->device.port,
+        struct ap2_mrp_ctx *mrp = ap2_mrp_create(p->device.address, p->device.port,
                                 p->auth_credentials, p->dacp_id, p->device.name,
                                 p->session_uuid, p->group_uuid, kdf, kdf_len);
+        ap2_mrp_set_experimental_homepod_remote(mrp, p->experimental_homepod_remote);
+        p->mrp = mrp;
     }
     if (!p->mrp) return;
     ap2_mrp_set_remote_command_callback(
         p->mrp, ap2_remote_command_received, p);
-    if (!ap2_mrp_attach_events(p->mrp, p->events_sock)) {
+    if (p->events_sock >= 0 && !ap2_mrp_attach_events(p->mrp, p->events_sock)) {
         LOG_WARN("[MRP] event-channel attach failed; degrading to no-MRP");
         ap2_mrp_destroy(p->mrp);
         p->mrp = NULL;
@@ -1658,13 +1707,49 @@ static void ap2_native_setup_mrp(struct ap2cl_s *p)
     }
     p->events_sock = -1;
 
+    bool volume_mode = ap2_session_volume_enabled(p);
+    ap2_mrp_set_volume_mode(p->mrp, volume_mode);
     if (!ap2_mrp_attach(p->mrp, data_port, seed)) {
-        LOG_WARN("[MRP] data-channel attach failed; degrading to no-MRP");
-        ap2_mrp_destroy(p->mrp);
-        p->mrp = NULL;
+        LOG_WARN("[MRP] data-channel attach failed; reverse event channel retained");
         return;
     }
     LOG_INFO("[MRP] remote-control data channel established (now-playing active)");
+}
+
+/* Actual session writers, shared with offline byte-preservation tests. Keep
+ * insertion order: disabled admission must preserve the canonical wire bytes. */
+static int ap2_native_session_plist(struct ap2cl_s *p, const char *dev_colon,
+    const char *mac_colon, bool id_valid, int timing_port, const char *peer_id,
+    uint64_t timeline_id, const char *our_addr, uint8_t **out)
+{
+    if (p->use_ptp) {
+        const char *name = (p->device.name && *p->device.name) ? p->device.name : "cliairplay";
+        ap2_pl_node *root = ap2_pl_dict();
+        ap2_pl_dict_set(root, "timingProtocol", ap2_pl_string("PTP"));
+        ap2_pl_dict_set(root, "deviceID", ap2_pl_string(dev_colon));
+        ap2_pl_dict_set(root, "sessionUUID", ap2_pl_string(p->session_uuid));
+        ap2_pl_dict_set(root, "name", ap2_pl_string(name));
+        ap2_pl_dict_set(root, "macAddress", ap2_pl_string(mac_colon));
+        ap2_pl_dict_set(root, "groupUUID", ap2_pl_string(p->group_uuid));
+        ap2_pl_dict_set(root, "groupContainsGroupLeader", ap2_pl_bool(false));
+        ap2_pl_dict_set(root, "timingPeerInfo",
+                        ap2_make_timing_peer(peer_id, timeline_id, our_addr));
+        ap2_pl_node *peer_list = ap2_pl_array();
+        ap2_pl_array_append(peer_list, ap2_make_timing_peer(peer_id, timeline_id, our_addr));
+        ap2_pl_dict_set(root, "timingPeerList", peer_list);
+        ap2_homepod_remote_setup(root, p->experimental_homepod_remote);
+        int len = ap2_pl_serialize(root, out);
+        ap2_pl_free(root);
+        return len;
+    }
+    struct ap2_plist *sp = ap2_plist_create();
+    if (id_valid) ap2_plist_add_string(sp, "deviceID", dev_colon);
+    ap2_plist_add_string(sp, "sessionUUID", p->session_uuid);
+    ap2_plist_add_int(sp, "timingPort", timing_port);
+    ap2_plist_add_string(sp, "timingProtocol", "NTP");
+    int len = ap2_plist_serialize(sp, out);
+    ap2_plist_free(sp);
+    return len;
 }
 
 /* ---- Native AP2 connect sequence ---- */
@@ -2039,46 +2124,34 @@ static bool ap2_native_connect(struct ap2cl_s *p)
                  p->splice_timeline ? "splice" : "classic");
     }
 
+    /* Snapshot actual timing/encryption, never change clocks or stream type. */
+    p->experimental_homepod_remote = ap2_homepod_remote_eligible(
+        p->device.txt_records, p->am, p->hap != NULL,
+        p->flow == FLOW_NATIVE_AP2, p->remote_command_cb != NULL,
+        p->use_ptp, p->use_buffered);
+    fprintf(stdout, "[STATUS] homepod_remote_admission enabled=%d\n",
+            p->experimental_homepod_remote ? 1 : 0);
+    fflush(stdout);
+
     /* 4. Session SETUP (encrypted). PTP and NTP use different session dicts. */
     uint8_t *plist_data = NULL; int plist_len = 0;
     if (p->use_ptp) {
         char peer_id[37];
         ap2_gen_uuid(peer_id);
-        const char *name = (p->device.name && *p->device.name) ? p->device.name : "cliairplay";
-
         /* Advertise OUR clock as the session timeline (the engine holds
          * grandmaster): receivers only follow masters from the timing-peer
          * list — us — and cannot anchor to their own clock. The media anchor
          * below is expressed against this same clock domain. */
         uint64_t timeline_id = ap2_ptp_master_clock_id(p->ptp);
 
-        ap2_pl_node *root = ap2_pl_dict();
-        ap2_pl_dict_set(root, "timingProtocol", ap2_pl_string("PTP"));
-        ap2_pl_dict_set(root, "deviceID", ap2_pl_string(dev_colon));
-        ap2_pl_dict_set(root, "sessionUUID", ap2_pl_string(p->session_uuid));
-        ap2_pl_dict_set(root, "name", ap2_pl_string(name));
-        ap2_pl_dict_set(root, "macAddress", ap2_pl_string(mac_colon));
-        ap2_pl_dict_set(root, "groupUUID", ap2_pl_string(p->group_uuid));
-        ap2_pl_dict_set(root, "groupContainsGroupLeader", ap2_pl_bool(false));
-        ap2_pl_dict_set(root, "timingPeerInfo",
-                        ap2_make_timing_peer(peer_id, timeline_id, our_addr));
-        ap2_pl_node *peer_list = ap2_pl_array();
-        ap2_pl_array_append(peer_list, ap2_make_timing_peer(peer_id, timeline_id, our_addr));
-        ap2_pl_dict_set(root, "timingPeerList", peer_list);
-
-        plist_len = ap2_pl_serialize(root, &plist_data);
-        ap2_pl_free(root);
+        plist_len = ap2_native_session_plist(p, dev_colon, mac_colon,
+            id_valid, timing_port, peer_id, timeline_id, our_addr, &plist_data);
         LOG_INFO("[AP2] PTP session SETUP (%d bytes, timelineID=%016llx%s, addr=%s)",
                  plist_len, (unsigned long long)timeline_id,
                  timeline_id == clock_id ? " [we are GM]" : " [slaving to peer]", our_addr);
     } else {
-        struct ap2_plist *sp = ap2_plist_create();
-        if (id_valid) ap2_plist_add_string(sp, "deviceID", dev_colon);
-        ap2_plist_add_string(sp, "sessionUUID", p->session_uuid);
-        ap2_plist_add_int(sp, "timingPort", timing_port);
-        ap2_plist_add_string(sp, "timingProtocol", "NTP");
-        plist_len = ap2_plist_serialize(sp, &plist_data);
-        ap2_plist_free(sp);
+        plist_len = ap2_native_session_plist(p, dev_colon, mac_colon,
+            id_valid, timing_port, NULL, 0, our_addr, &plist_data);
     }
 
     uint8_t *resp = NULL; int resp_len = 0;
@@ -2401,8 +2474,17 @@ static bool ap2_native_connect(struct ap2cl_s *p)
      * default; now-playing rides /command (ap2cl_mrp_register + ap2cl_mrp_push).
      * Set CLIAIRPLAY_MRP_TYPE130=1 to re-enable the channel (future remote-
      * control RX). Best-effort; audio is up regardless. */
-    if (ap2_mrp_type130_enabled())
+    bool volume_mode = ap2_session_volume_enabled(p);
+    if (volume_mode && !ap2_homepod_remote_ready(p)) return false;
+    if (ap2_mrp_type130_enabled() || volume_mode)
         ap2_native_setup_mrp(p);
+    if (volume_mode) {
+        printf("[STATUS] session_volume_transport ready=%d publication=0\n",
+            p->mrp && ap2_mrp_is_connected(p->mrp) ? 1 : 0);
+        fflush(stdout);
+    }
+
+    if (!ap2_homepod_remote_ready(p)) return false;
 
     /* Create ALAC encoder */
     p->alac = alac_create_encoder(AP2_FRAMES_PER_CHUNK,
@@ -3444,7 +3526,10 @@ bool ap2cl_connect(struct ap2cl_s *p)
         }
         LOG_INFO("[AP2] Connecting via native AP2 flow to %s:%d",
                  p->device.address, p->device.port);
-        return ap2_native_connect(p);
+        bool connected = ap2_native_connect(p);
+        if (!connected && p->experimental_homepod_remote)
+            ap2cl_disconnect(p);
+        return connected;
     } else {
         if (p->state != AP2_DOWN && p->raopcl)
             ap2cl_disconnect(p);
@@ -4853,24 +4938,48 @@ bool ap2cl_control_healthy(struct ap2cl_s *p)
     return atomic_load(&p->mrp_event_health) != 0;
 }
 
+bool ap2cl_session_volume_action(struct ap2cl_s *p, const char *action,
+    const struct ap2_volume_transaction *t)
+{
+    if (!p) return false;
+    /* Context lifetime is stable until the command thread is joined. The
+     * volume driver has its own lock; callbacks run outside mrp_lock. */
+    return ap2_mrp_volume_action(p->mrp, action, t);
+}
+/* Shared existing curve/send path; checked and legacy callers differ only in
+ * receipt interpretation and when their local volume becomes committed. */
+static int ap2_native_volume_send(struct ap2cl_s *p, int volume, bool legacy_log)
+{
+    float db = volume <= 0 ? -144.0f : raopcl_float_volume(volume > 100 ? 100 : volume);
+    char body[32];
+    int len = snprintf(body, sizeof(body), "volume: %.6f\r\n", db);
+    uint8_t *resp = NULL; int resp_len = 0;
+    int status = ap2_rtsp_send(p, "SET_PARAMETER", p->session_url,
+        (uint8_t *)body, len, "text/parameters", &resp, &resp_len);
+    free(resp);
+    if (legacy_log) LOG_INFO("[AP2] native volume -> %.2f dB (SET_PARAMETER status %d)", db, status);
+    return status;
+}
+int ap2cl_apply_volume(struct ap2cl_s *p, unsigned volume)
+{
+    if (!p || volume > 100) return -1;
+    if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0) {
+        int status = ap2_native_volume_send(p, (int)volume, false);
+        if (status >= 200 && status < 300) { p->volume = (int)volume; return 1; }
+        return status > 0 ? 0 : -1;
+    }
+    if (p->raopcl && raopcl_state(p->raopcl) >= RAOP_FLUSHED) {
+        if (!raopcl_set_volume(p->raopcl, raopcl_float_volume((int)volume))) return -1;
+        p->volume = (int)volume; return 1;
+    }
+    return -1;
+}
 bool ap2cl_set_volume(struct ap2cl_s *p, int volume)
 {
     if (!p) return false;
     p->volume = volume;
     if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0) {
-        /* Same percent->dB mapping as the RAOP path (libraop): linear in dB
-         * over -30..0, mute at 0. This is the AirPlay convention (iOS,
-         * shairport-sync use the same range), so a given slider position is
-         * equally loud on every protocol path and matches other senders. */
-        float vol_db = volume <= 0 ? -144.0f
-                       : raopcl_float_volume(volume > 100 ? 100 : volume);
-        char body[32];
-        int blen = snprintf(body, sizeof(body), "volume: %.6f\r\n", vol_db);
-        uint8_t *resp = NULL; int resp_len = 0;
-        int status = ap2_rtsp_send(p, "SET_PARAMETER", p->session_url,
-                       (uint8_t *)body, blen, "text/parameters", &resp, &resp_len);
-        LOG_INFO("[AP2] native volume -> %.2f dB (SET_PARAMETER status %d)", vol_db, status);
-        free(resp);
+        ap2_native_volume_send(p, volume, true);
         return true;
     }
     if (p->raopcl) return raopcl_set_volume(p->raopcl, raopcl_float_volume(volume));
@@ -4965,13 +5074,16 @@ static void ap2_mrp_ready(struct ap2cl_s *p)
                                   p->apple_model) ||
         p->sock_fd < 0 || p->events_sock < 0 || !p->session_uuid[0])
         return;
-    if (!ap2_env_enabled("CLIAIRPLAY_MRP", true)) return;
+    if (!p->experimental_homepod_remote &&
+        !ap2_env_enabled("CLIAIRPLAY_MRP", true)) return;
     size_t kdf_len = 0;
     const uint8_t *kdf = ap2_hap_get_kdf_secret(p->hap, &kdf_len);
-    p->mrp = ap2_mrp_create(p->device.address, p->device.port, p->auth_credentials,
-                            p->dacp_id, p->device.name,
+    struct ap2_mrp_ctx *mrp = ap2_mrp_create(p->device.address, p->device.port,
+                            p->auth_credentials, p->dacp_id, p->device.name,
                             p->session_uuid, p->group_uuid, kdf, kdf_len);
-    if (!p->mrp) return;
+    if (!mrp) return;
+    ap2_mrp_set_experimental_homepod_remote(mrp, p->experimental_homepod_remote);
+    p->mrp = mrp;
     ap2_mrp_set_remote_command_callback(
         p->mrp, ap2_remote_command_received, p);
     if (!ap2_mrp_attach_events(p->mrp, p->events_sock)) {
@@ -4988,6 +5100,23 @@ static void ap2_mrp_ready(struct ap2cl_s *p)
     else
         ap2_mrp_set_playing(p->mrp, state == AP2_MRP_PLAYBACK_PLAYING);
     atomic_store(&p->mrp_event_health, ap2_mrp_event_status(p->mrp));
+}
+
+/* Connect-time admission is mandatory only for this session's opted-in policy.
+ * Attachment derives keys/transfers ownership, with no blocking socket I/O. */
+static bool ap2_homepod_remote_ready(struct ap2cl_s *p)
+{
+    if (!p->experimental_homepod_remote) return true;
+    pthread_mutex_lock(&p->mrp_publish_lock);
+    pthread_mutex_lock(&p->mrp_lock);
+    ap2_mrp_ready(p);
+    bool ready = p->mrp && ap2_mrp_event_status(p->mrp) == 1;
+    pthread_mutex_unlock(&p->mrp_lock);
+    pthread_mutex_unlock(&p->mrp_publish_lock);
+    if (!ready)
+        ap2_set_connect_error(p, AP2_CONNECT_ERROR_GENERIC, 0,
+            "experimental HomePod reverse event attachment failed");
+    return ready;
 }
 
 /* Log an RTSP response body for diagnosis: a printable-text view (control bytes
@@ -5306,9 +5435,9 @@ static bool ap2_send_dmap_artwork(struct ap2cl_s *p, const char *content_type,
     return false;
 }
 
-bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
+bool ap2cl_set_metadata_live_ex(struct ap2cl_s *p, const char *title,
                            const char *artist, const char *album,
-                           int duration, const char *item_id,
+                           int duration, bool is_live, const char *item_id,
                            const char *content_type, const uint8_t *art_data,
                            int art_len, bool *track_changed_out,
                            ap2_mrp_artwork_info_t *mrp_info,
@@ -5328,11 +5457,17 @@ bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
     ap2_mrp_ready(p);
     bool have_mrp = p->mrp != NULL;
     bool track_changed = false;
+    bool live_changed = p->metadata_is_live != is_live;
+    p->metadata_is_live = is_live;
+    if (is_live) duration = 0;
     if (p->mrp)
-        ap2_mrp_set_track(p->mrp, title, artist, album, duration * 1000,
-                          item_id, content_type, art_data, art_len,
+        ap2_mrp_set_track_live(p->mrp, title, artist, album, duration * 1000,
+                          is_live, item_id, content_type, art_data, art_len,
                           &track_changed, mrp_info);
     pthread_mutex_unlock(&p->mrp_lock);
+    /* Re-advertise controls on either live transition, including retries if
+     * the extended sequence fails. This flag is owned by mrp_publish_lock. */
+    if (live_changed) p->mrp_extended_registered = false;
     if (track_changed_out) *track_changed_out = track_changed;
 
     /* Byte-identical bundle: the receiver already holds exactly this state,
@@ -5343,7 +5478,7 @@ bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
      * field is compared. Only a fully delivered previous bundle is
      * skippable, and artwork riding along must itself be unchanged — without
      * MRP to judge the bytes, the push goes out. */
-    if (p->meta_delivered && p->meta_duration == duration &&
+    if (p->meta_delivered && !live_changed && p->meta_duration == duration &&
         ap2_meta_str_eq(p->meta_title, title) &&
         ap2_meta_str_eq(p->meta_artist, artist) &&
         ap2_meta_str_eq(p->meta_album, album) &&
@@ -5390,6 +5525,19 @@ bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
      * gating a retry on this (the first-START placeholder skip) must not
      * read a DMAP-only success with a failed MRP push as delivered. */
     return delivered;
+}
+
+bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
+                           const char *artist, const char *album,
+                           int duration, const char *item_id,
+                           const char *content_type, const uint8_t *art_data,
+                           int art_len, bool *track_changed_out,
+                           ap2_mrp_artwork_info_t *mrp_info,
+                           ap2_mrp_push_result_t *mrp_push)
+{
+    return ap2cl_set_metadata_live_ex(p, title, artist, album, duration, false,
+                                      item_id, content_type, art_data, art_len,
+                                      track_changed_out, mrp_info, mrp_push);
 }
 
 bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist,
@@ -5462,6 +5610,7 @@ bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s)
     pthread_mutex_lock(&p->mrp_lock);
     ap2_mrp_ready(p);
     bool have_mrp = p->mrp != NULL;
+    if (p->metadata_is_live) duration_s = 0;
     /* The content flags, not the wire state, decide the published rate: a
      * splice pause keeps the client AP2_STREAMING with content_paused set. */
     if (p->mrp)
@@ -5634,6 +5783,40 @@ bool ap2cl_is_playing(struct ap2cl_s *p)
 }
 
 #ifdef AP2_TESTING
+bool ap2cl_test_homepod_remote_eligible(const char *txt, const char *am,
+    bool encrypted, bool native, bool callback, bool ptp, bool buffered)
+{
+    return ap2_homepod_remote_eligible(txt, am, encrypted, native, callback, ptp, buffered);
+}
+
+int ap2cl_test_session_setup(bool ptp, bool enabled, uint8_t **out)
+{
+    struct ap2cl_s p = {0};
+    p.use_ptp = ptp;
+    p.experimental_homepod_remote = enabled;
+    strcpy(p.session_uuid, "11111111-2222-4333-8444-555555555555");
+    strcpy(p.group_uuid, "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE");
+    return ap2_native_session_plist(&p, "00:11:22:33:44:55", "00:11:22:33:44:55",
+        true, 1234, "00000000-1111-4222-8333-444444444444", 123, "127.0.0.1", out);
+}
+
+bool ap2cl_test_remote_attachment_failure(struct ap2cl_s *p, int fd)
+{
+    p->flow = FLOW_NATIVE_AP2;
+    p->experimental_homepod_remote = true;
+    p->apple_model = true;
+    p->hap = ap2_hap_create(NULL); /* deliberately no pairing secret */
+    p->events_sock = fd;
+    p->sock_fd = dup(fd);
+    strcpy(p->session_uuid, "11111111-2222-4333-8444-555555555555");
+    bool result = ap2_homepod_remote_ready(p);
+    /* Same cleanup the connect wrapper runs on failure. Avoid RTSP teardown
+     * on this socketpair; it is not a simulated RTSP receiver. */
+    close(p->sock_fd);
+    p->sock_fd = -1;
+    if (!result) ap2cl_disconnect(p);
+    return !result && p->events_sock == -1 && p->state == AP2_DOWN && !p->mrp;
+}
 /* Hand the client a ready MRP context without a paired session, so a test can
  * drive the /command now-playing path against a scripted RTSP peer. The
  * client takes ownership (ap2cl_destroy frees it). */
@@ -5797,6 +5980,14 @@ bool ap2cl_test_apple_model_default(const char *txt, const char *am)
 bool ap2cl_test_env_enabled(const char *name, bool unset_default)
 {
     return ap2_env_enabled(name, unset_default);
+}
+
+int ap2cl_test_volume(struct ap2cl_s *p) { return p->volume; }
+
+bool ap2cl_test_session_volume_enabled(bool admitted)
+{
+    struct ap2cl_s p = {.experimental_homepod_remote = admitted};
+    return ap2_session_volume_enabled(&p);
 }
 
 bool ap2cl_test_mrp_type130_enabled(void)

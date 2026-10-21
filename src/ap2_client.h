@@ -420,6 +420,11 @@ bool ap2cl_feedback(struct ap2cl_s *p);
 
 /* Set volume (0-100). */
 bool ap2cl_set_volume(struct ap2cl_s *p, int volume);
+struct ap2_volume_transaction;
+/* Checked actuator: 1 accepted, 0 rejected, -1 uncertain/unsupported. */
+int ap2cl_apply_volume(struct ap2cl_s *p, unsigned volume);
+bool ap2cl_session_volume_action(struct ap2cl_s *p, const char *action,
+    const struct ap2_volume_transaction *t);
 
 /*
  * Set the track metadata and artwork as one bundle: DMAP metadata (and, when
@@ -444,6 +449,19 @@ bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
                            int art_len, bool *track_changed_out,
                            ap2_mrp_artwork_info_t *mrp_info,
                            ap2_mrp_push_result_t *mrp_push);
+
+/* Explicit live intent, applied atomically with the metadata/artwork bundle.
+ * Live clears finite duration and limits MRP controls to the existing remote
+ * parser's Play/Pause/Toggle/Next/Previous mappings. State mutation uses the
+ * short mrp_lock; blocking publication happens outside it, serialized by
+ * mrp_publish_lock. Legacy metadata APIs retain non-live behavior. */
+bool ap2cl_set_metadata_live_ex(struct ap2cl_s *p, const char *title,
+                                const char *artist, const char *album,
+                                int duration, bool is_live, const char *item_id,
+                                const char *content_type, const uint8_t *art_data,
+                                int art_len, bool *track_changed_out,
+                                ap2_mrp_artwork_info_t *mrp_info,
+                                ap2_mrp_push_result_t *mrp_push);
 
 /* ap2cl_set_metadata_ex without artwork or result reporting. */
 bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist,

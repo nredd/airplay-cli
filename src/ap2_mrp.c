@@ -217,6 +217,23 @@ struct ap2_mrp_ctx {
     int duration_ms;
     bool is_live;            /* explicit sender intent, never inferred from duration */
     bool experimental_homepod_remote; /* set before publication, immutable */
+    /* Private capture is aggregate-only. It never changes channel setup,
+     * command dispatch, ACKs, publication, or backend bindings. */
+    bool private_native_volume_capture;
+    bool capture_emitted, capture_frozen, data_attached;
+    pthread_mutex_t capture_lock;
+    uint64_t capture_records;
+    bool capture_overflow;
+    uint64_t capture_plane[2][2]; /* [event|datastream][in|out] */
+    uint64_t capture_volume[6]; /* get|result|set|feedback|availability|capabilities */
+    uint64_t capture_kind[2]; /* transport|other inbound only */
+    uint64_t capture_parser[3]; /* valid|invalid|unknown inbound only */
+    bool capture_sender_candidate, capture_session_candidate, capture_group_candidate;
+    bool capture_endpoint_sender_match, capture_endpoint_session_match, capture_endpoint_group_match;
+    bool capture_output_sender_match, capture_output_session_match, capture_output_group_match;
+    int capture_event_cutoff, capture_data_cutoff; /* -1 unattached, 0 closed, 1 connected */
+    uint64_t capture_generation;
+    bool capture_binding;
     unsigned diagnostic_count; /* tick thread only, capped at 128 */
     uint64_t diagnostic_start_ms;
     int elapsed_ms;
@@ -234,6 +251,8 @@ struct ap2_mrp_ctx {
     bool state_dirty;
     bool state_include_artwork;
 };
+
+static void mrp_capture_egress(struct ap2_mrp_ctx *m, bool event);
 
 static void mrp_artwork_info_init(ap2_mrp_artwork_info_t *info, size_t bytes)
 {
@@ -989,7 +1008,9 @@ static bool mrp_send_reply(struct ap2_mrp_ctx *m, uint64_t seqno)
     uint8_t hdr[MRP_DATA_HDR_LEN];
     static const char zero4[4] = {0, 0, 0, 0};
     mrp_write_data_header(hdr, "rply", zero4, seqno, 0);
-    return mrp_send_raw(m, hdr, sizeof(hdr));
+    bool ok = mrp_send_raw(m, hdr, sizeof(hdr));
+    if (ok) mrp_capture_egress(m, false);
+    return ok;
 }
 
 /* Build + push the full current state (metadata, progress, artwork). */
@@ -1154,6 +1175,9 @@ static bool mrp_diag_field(struct mrp_diag_reader *r, struct mrp_diag_field *f)
 struct mrp_diag_volume {
     const char *message, *target, *value_state;
     int value_milli, available, capabilities;
+    const uint8_t *endpoint_bytes, *output_bytes;
+    size_t endpoint_len, output_len;
+    int type;
 };
 
 /* Availability is also nested in capabilities-did-change field 1. */
@@ -1201,6 +1225,13 @@ static bool mrp_diag_volume_body(int type, const uint8_t *p, size_t len,
                    (type == 64 && (f.number == 3 || f.number == 4))) {
             if (f.wire != 2) return false;
             v->target = "unresolved"; /* Presence is NOT a session/group binding. */
+            if ((type == 52 && f.number == 2) || (type == 64 && f.number == 3)) {
+                v->endpoint_bytes = f.data;
+                v->endpoint_len = f.len;
+            } else {
+                v->output_bytes = f.data;
+                v->output_len = f.len;
+            }
         }
     }
     return true;
@@ -1248,6 +1279,7 @@ static struct mrp_diag_volume mrp_diag_volume(const uint8_t *body, size_t len,
         }
     }
     unsigned expected;
+    v.type = type;
     switch (type) {
         case 17: expected = 22; v.message = "volume_capability"; break;
         case 49: expected = 53; v.message = "volume_get"; break;
@@ -1268,13 +1300,132 @@ invalid:
     v.target = "missing";
     if (!strcmp(v.value_state, "valid")) v.value_state = "invalid";
     v.value_milli = v.available = v.capabilities = -1;
+    v.endpoint_bytes = v.output_bytes = NULL;
+    v.endpoint_len = v.output_len = 0;
     return v;
+}
+
+/* Capture no receiver bytes or strings. Candidate role comparisons are exact
+ * process-memory byte comparisons only; no UID normalization or registration
+ * follows from a match. */
+static void mrp_capture_increment(uint64_t *value, bool *overflow)
+{
+    if (*value == UINT64_MAX) { *overflow = true; return; }
+    ++*value;
+}
+
+static void mrp_capture_ingress(struct ap2_mrp_ctx *m, bool event, bool transport,
+    const char *classification, const struct mrp_diag_volume *v)
+{
+    if (!m->private_native_volume_capture) return;
+    pthread_mutex_lock(&m->capture_lock);
+    if (m->capture_frozen) { pthread_mutex_unlock(&m->capture_lock); return; }
+    mrp_capture_increment(&m->capture_records, &m->capture_overflow);
+    mrp_capture_increment(&m->capture_plane[event ? 0 : 1][0], &m->capture_overflow);
+    if (!strcmp(v->message, "volume_get")) mrp_capture_increment(&m->capture_volume[0], &m->capture_overflow);
+    else if (!strcmp(v->message, "volume_result")) mrp_capture_increment(&m->capture_volume[1], &m->capture_overflow);
+    else if (!strcmp(v->message, "volume_set_candidate")) mrp_capture_increment(&m->capture_volume[2], &m->capture_overflow);
+    else if (!strcmp(v->message, "volume_feedback")) mrp_capture_increment(&m->capture_volume[3], &m->capture_overflow);
+    else if (!strcmp(v->message, "volume_capability"))
+        mrp_capture_increment(&m->capture_volume[v->type == 17 ? 4 : 5], &m->capture_overflow);
+    else mrp_capture_increment(&m->capture_kind[transport ? 0 : 1], &m->capture_overflow);
+    if (!strcmp(classification, "invalid") || !strcmp(v->message, "invalid"))
+        mrp_capture_increment(&m->capture_parser[1], &m->capture_overflow);
+    else if (!strcmp(classification, "protobuf"))
+        mrp_capture_increment(&m->capture_parser[0], &m->capture_overflow);
+    else mrp_capture_increment(&m->capture_parser[2], &m->capture_overflow);
+    const char *roles[] = {m->device_uuid, m->session_uuid, m->group_uuid};
+    bool *candidates[] = {&m->capture_sender_candidate, &m->capture_session_candidate,
+        &m->capture_group_candidate};
+    bool *endpoint_matches[] = {&m->capture_endpoint_sender_match,
+        &m->capture_endpoint_session_match, &m->capture_endpoint_group_match};
+    bool *output_matches[] = {&m->capture_output_sender_match,
+        &m->capture_output_session_match, &m->capture_output_group_match};
+    for (unsigned i = 0; i < 3; ++i) if (roles[i] && roles[i][0]) {
+        *candidates[i] = true;
+        if (v->endpoint_bytes && v->endpoint_len == strlen(roles[i]) &&
+            !memcmp(v->endpoint_bytes, roles[i], v->endpoint_len)) *endpoint_matches[i] = true;
+        if (v->output_bytes && v->output_len == strlen(roles[i]) &&
+            !memcmp(v->output_bytes, roles[i], v->output_len)) *output_matches[i] = true;
+    }
+    pthread_mutex_unlock(&m->capture_lock);
+}
+
+static void mrp_capture_egress(struct ap2_mrp_ctx *m, bool event)
+{
+    if (!m->private_native_volume_capture) return;
+    pthread_mutex_lock(&m->capture_lock);
+    if (!m->capture_frozen) {
+        mrp_capture_increment(&m->capture_records, &m->capture_overflow);
+        mrp_capture_increment(&m->capture_plane[event ? 0 : 1][1], &m->capture_overflow);
+    }
+    pthread_mutex_unlock(&m->capture_lock);
+}
+
+static void mrp_capture_freeze(struct ap2_mrp_ctx *m)
+{
+    if (!m->private_native_volume_capture) return;
+    pthread_mutex_lock(&m->capture_lock);
+    if (m->capture_frozen) { pthread_mutex_unlock(&m->capture_lock); return; }
+    m->capture_frozen = true; /* Stop entry is the observation cutoff. */
+    m->capture_event_cutoff = !m->event_attached ? -1 : atomic_load(&m->event_connected) ? 1 : 0;
+    m->capture_data_cutoff = !m->data_attached ? -1 : m->connected ? 1 : 0;
+    pthread_mutex_lock(&m->volume.lock);
+    m->capture_generation = m->volume.generation;
+    m->capture_binding = m->volume.output_len != 0;
+    pthread_mutex_unlock(&m->volume.lock);
+    pthread_mutex_unlock(&m->capture_lock);
+}
+
+static void mrp_capture_summary(struct ap2_mrp_ctx *m)
+{
+    if (!m->private_native_volume_capture) return;
+    pthread_mutex_lock(&m->capture_lock);
+    if (!m->capture_frozen || m->capture_emitted) {
+        pthread_mutex_unlock(&m->capture_lock);
+        return;
+    }
+    m->capture_emitted = true;
+    uint64_t generation = m->capture_generation;
+    bool bound = m->capture_binding;
+    /* Freeze makes every summary field immutable. Never hold the receive-path
+     * mutex while waiting on stderr, which may have a stalled consumer. */
+    pthread_mutex_unlock(&m->capture_lock);
+    flockfile(stderr);
+    fprintf(stderr, "[STATUS] native_volume_capture version=1 records=%llu overflow=%d "
+        "event_in=%llu event_out=%llu datastream_in=%llu datastream_out=%llu "
+        "volume_get=%llu volume_result=%llu volume_set_candidate=%llu volume_feedback=%llu "
+        "volume_availability=%llu volume_capabilities=%llu transport=%llu other=%llu "
+        "parser_valid=%llu parser_invalid=%llu parser_unknown=%llu "
+        "event_at_cutoff=%s datastream_at_cutoff=%s dacp=outside_cli subscription=0 publication=0 capability=0 "
+        "generation_at_cutoff=%llu binding_at_cutoff=%d sender_candidate=%d endpoint_sender_match=%d output_sender_match=%d "
+        "session_candidate=%d endpoint_session_match=%d output_session_match=%d "
+        "group_candidate=%d endpoint_group_match=%d output_group_match=%d\n",
+        (unsigned long long)m->capture_records, m->capture_overflow ? 1 : 0,
+        (unsigned long long)m->capture_plane[0][0], (unsigned long long)m->capture_plane[0][1],
+        (unsigned long long)m->capture_plane[1][0], (unsigned long long)m->capture_plane[1][1],
+        (unsigned long long)m->capture_volume[0], (unsigned long long)m->capture_volume[1],
+        (unsigned long long)m->capture_volume[2], (unsigned long long)m->capture_volume[3],
+        (unsigned long long)m->capture_volume[4], (unsigned long long)m->capture_volume[5],
+        (unsigned long long)m->capture_kind[0], (unsigned long long)m->capture_kind[1],
+        (unsigned long long)m->capture_parser[0], (unsigned long long)m->capture_parser[1],
+        (unsigned long long)m->capture_parser[2],
+        m->capture_event_cutoff > 0 ? "connected" : m->capture_event_cutoff == 0 ? "closed" : "unattached",
+        m->capture_data_cutoff > 0 ? "connected" : m->capture_data_cutoff == 0 ? "closed" : "unattached",
+        (unsigned long long)generation, bound ? 1 : 0,
+        m->capture_sender_candidate ? 1 : 0, m->capture_endpoint_sender_match ? 1 : 0,
+        m->capture_output_sender_match ? 1 : 0, m->capture_session_candidate ? 1 : 0,
+        m->capture_endpoint_session_match ? 1 : 0, m->capture_output_session_match ? 1 : 0,
+        m->capture_group_candidate ? 1 : 0, m->capture_endpoint_group_match ? 1 : 0,
+        m->capture_output_group_match ? 1 : 0);
+    funlockfile(stderr);
 }
 
 static void mrp_diagnostic(struct ap2_mrp_ctx *m, bool event,
     const char *kind, const uint8_t *body, size_t len, int command, bool handled)
 {
-    if (!m->experimental_homepod_remote || m->diagnostic_count >= 128) return;
+    if (!m->experimental_homepod_remote || m->private_native_volume_capture ||
+        m->diagnostic_count >= 128) return;
     uint64_t now = ap2_io_monotonic_ms();
     if (!m->diagnostic_count) m->diagnostic_start_ms = now;
     int type = -1;
@@ -1461,6 +1612,14 @@ static void mrp_process_frames(struct ap2_mrp_ctx *m)
 
         bool sync = !memcmp(h + 4, "sync\0\0\0\0\0\0\0\0", 12);
         bool reply = !memcmp(h + 4, "rply\0\0\0\0\0\0\0\0", 12);
+        if (m->private_native_volume_capture) {
+            int type = -1;
+            const uint8_t *body = h + MRP_DATA_HDR_LEN;
+            size_t body_len = size - MRP_DATA_HDR_LEN;
+            const char *classification = mrp_diag_protobuf(body, body_len, &type);
+            struct mrp_diag_volume volume = mrp_diag_volume(body, body_len, -1, classification);
+            mrp_capture_ingress(m, false, false, classification, &volume);
+        }
         mrp_diagnostic(m, false, sync ? "sync" : reply ? "reply" : "unknown",
             h + MRP_DATA_HDR_LEN, size - MRP_DATA_HDR_LEN, -1, false);
         if (memcmp(h + 4, "sync", 4) == 0) {
@@ -1580,6 +1739,7 @@ static bool mrp_event_send_response(struct ap2_mrp_ctx *m,
     bool ok = enc_len > 0 && enc &&
               mrp_write_all(m->event_sock, enc, enc_len);
     free(enc);
+    if (ok) mrp_capture_egress(m, true);
     if (!ok) {
         LOG_ERROR("[MRP] event channel write failed: %s", strerror(errno));
         mrp_close_event_channel(m);
@@ -1631,8 +1791,20 @@ static bool mrp_process_event_requests(struct ap2_mrp_ctx *m)
                           strcmp(path, "/command") == 0;
         ap2_remote_command_t remote_command;
         bool have_remote_command = false;
+        const uint8_t *body = m->event_plain + off + header_len;
+        if (m->private_native_volume_capture) {
+            int capture_type = -1;
+            const char *capture_classification = mrp_diag_protobuf(body, (size_t)content_len,
+                &capture_type);
+            struct mrp_diag_volume capture_volume = mrp_diag_volume(body,
+                (size_t)content_len, -1, capture_classification);
+            ap2_remote_command_t capture_command;
+            /* Classification is before dispatch; unknown requests remain `other`. */
+            bool transport = is_command && mrp_parse_remote_command(body, content_len,
+                &capture_command);
+            mrp_capture_ingress(m, true, transport, capture_classification, &capture_volume);
+        }
         if (is_command) {
-            const uint8_t *body = m->event_plain + off + header_len;
             have_remote_command =
                 mrp_parse_remote_command(body, content_len, &remote_command);
             LOG_DEBUG("[MRP] event command classification=%s bytes=%d",
@@ -1770,6 +1942,7 @@ struct ap2_mrp_ctx *ap2_mrp_create(const char *host, int port,
     m->sock = -1;
     m->event_sock = -1;
     pthread_mutex_init(&m->send_lock, NULL);
+    pthread_mutex_init(&m->capture_lock, NULL);
     atomic_init(&m->event_connected, false);
 
     if (secret) {
@@ -1792,6 +1965,7 @@ void ap2_mrp_destroy(struct ap2_mrp_ctx *m)
     if (!m) return;
     ap2_mrp_stop(m);
     pthread_mutex_destroy(&m->send_lock);
+    pthread_mutex_destroy(&m->capture_lock);
     ap2_volume_destroy(&m->volume);
     OPENSSL_cleanse(m->shared_secret, sizeof(m->shared_secret));
     OPENSSL_cleanse(m->out_key, sizeof(m->out_key));
@@ -1817,6 +1991,12 @@ void ap2_mrp_set_experimental_homepod_remote(struct ap2_mrp_ctx *m, bool enabled
 {
     if (!m) return;
     m->experimental_homepod_remote = enabled;
+}
+
+void ap2_mrp_set_private_native_volume_capture(struct ap2_mrp_ctx *m, bool enabled)
+{
+    if (!m || !m->experimental_homepod_remote) return;
+    m->private_native_volume_capture = enabled;
 }
 
 bool ap2_mrp_attach_events(struct ap2_mrp_ctx *m, int event_sock)
@@ -1917,6 +2097,7 @@ bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed)
     int one = 1;
     setsockopt(m->sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     m->connected = true;
+    m->data_attached = true;
     LOG_INFO("[MRP] data channel connected to %s:%d", m->host, data_port);
 
     /* DEVICE_INFO first, then connection/update configuration. Volume mode
@@ -1941,6 +2122,7 @@ bool ap2_mrp_start(struct ap2_mrp_ctx *m)
 void ap2_mrp_stop(struct ap2_mrp_ctx *m)
 {
     if (!m) return;
+    mrp_capture_freeze(m);
     if (m->connected) {
         mbuf msg = {0};
         if (build_set_connection_state(&msg, MRP_CONNECTION_STATE_DISCONNECTED))
@@ -1953,6 +2135,7 @@ void ap2_mrp_stop(struct ap2_mrp_ctx *m)
     m->rx_msg_len = 0;
     m->event_rx_enc_len = 0;
     m->event_plain_len = 0;
+    mrp_capture_summary(m);
 }
 
 bool ap2_mrp_set_track_live(struct ap2_mrp_ctx *m, const char *title,

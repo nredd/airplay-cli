@@ -483,6 +483,14 @@ static bool ap2_session_volume_enabled(struct ap2cl_s *p)
         (!getenv("CLIAIRPLAY_MRP_TYPE130") || ap2_mrp_type130_enabled());
 }
 
+/* Private Phase 1 observation requires the already-snapshotted experimental
+ * eligibility. It neither requests type-130 nor changes any session bytes. */
+static bool ap2_private_native_volume_capture_enabled(struct ap2cl_s *p)
+{
+    const char *setting = getenv("CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE");
+    return p->experimental_homepod_remote && setting && !strcmp(setting, "1");
+}
+
 /* ---- Native AP2 failure reporting ---- */
 
 /* True for the statuses a receiver uses to refuse an unauthenticated or
@@ -1694,6 +1702,8 @@ static void ap2_native_setup_mrp(struct ap2cl_s *p)
                                 p->auth_credentials, p->dacp_id, p->device.name,
                                 p->session_uuid, p->group_uuid, kdf, kdf_len);
         ap2_mrp_set_experimental_homepod_remote(mrp, p->experimental_homepod_remote);
+        ap2_mrp_set_private_native_volume_capture(mrp,
+            ap2_private_native_volume_capture_enabled(p));
         p->mrp = mrp;
     }
     if (!p->mrp) return;
@@ -5083,6 +5093,8 @@ static void ap2_mrp_ready(struct ap2cl_s *p)
                             p->session_uuid, p->group_uuid, kdf, kdf_len);
     if (!mrp) return;
     ap2_mrp_set_experimental_homepod_remote(mrp, p->experimental_homepod_remote);
+    ap2_mrp_set_private_native_volume_capture(mrp,
+        ap2_private_native_volume_capture_enabled(p));
     p->mrp = mrp;
     ap2_mrp_set_remote_command_callback(
         p->mrp, ap2_remote_command_received, p);

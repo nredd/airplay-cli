@@ -456,6 +456,8 @@ int main(int argc, char **argv)
     assert(argc == 1);
     test_session_volume_contract();
     test_observe_only_volume();
+    test_private_native_volume_capture();
+    test_private_capture_summary_releases_receive_lock();
     test_paired_setup_booleans();
     test_diagnostic_classifier();
     test_encrypted_diagnostics_and_cap();

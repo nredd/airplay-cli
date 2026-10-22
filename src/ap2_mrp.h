@@ -155,6 +155,9 @@ bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed);
 /* Internal session policy. Set once before publishing the context; callers use
  * the existing MRP state lock/serializer for subsequent command snapshots. */
 void ap2_mrp_set_experimental_homepod_remote(struct ap2_mrp_ctx *m, bool enabled);
+/* Private, aggregate-only observation. Call only for an already eligible
+ * experimental HomePod-remote session; it never enables or attaches a plane. */
+void ap2_mrp_set_private_native_volume_capture(struct ap2_mrp_ctx *m, bool enabled);
 
 bool ap2_mrp_attach_events(struct ap2_mrp_ctx *m, int event_sock);
 

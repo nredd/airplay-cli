@@ -259,3 +259,147 @@ static void test_observe_only_volume(void)
     close(events[1]);
     close(data[1]);
 }
+
+/* Private capture is aggregate-only: real encrypted fixture traffic reaches
+ * both pre-whitelist event ingress and post-decrypt DataStream ingress without
+ * retaining the fixture's injected strings or identifiers. */
+static void test_private_native_volume_capture(void)
+{
+    struct ap2_mrp_ctx *off = ap2_mrp_create("127.0.0.1", 7000, NULL, "1",
+        "SECRET_METADATA", "SECRET_SESSION", "SECRET_GROUP", NULL, 0);
+    assert(off);
+    int saved = dup(STDERR_FILENO);
+    FILE *capture = tmpfile();
+    assert(saved >= 0 && capture && dup2(fileno(capture), STDERR_FILENO) >= 0);
+    ap2_mrp_stop(off);
+    fflush(stderr);
+    rewind(capture);
+    char line[2048];
+    assert(!fgets(line, sizeof(line), capture)); /* default off */
+    assert(dup2(saved, STDERR_FILENO) >= 0);
+    close(saved);
+    fclose(capture);
+    ap2_mrp_destroy(off);
+
+    int events[2], data[2];
+    assert(!socketpair(AF_UNIX, SOCK_STREAM, 0, events));
+    assert(!socketpair(AF_UNIX, SOCK_STREAM, 0, data));
+    uint8_t secret[32] = {3};
+    struct ap2_mrp_ctx *m = ap2_mrp_create("127.0.0.1", 7000, NULL, "1",
+        "SECRET_METADATA", "SECRET_SESSION", "SECRET_GROUP", secret, sizeof(secret));
+    assert(m && ap2_mrp_attach_events(m, events[0]));
+    m->sock = data[0];
+    m->connected = true;
+    m->data_attached = true;
+    ap2_mrp_set_experimental_homepod_remote(m, true);
+    ap2_mrp_set_private_native_volume_capture(m, true);
+    saved = dup(STDERR_FILENO);
+    capture = tmpfile();
+    assert(saved >= 0 && capture && dup2(fileno(capture), STDERR_FILENO) >= 0);
+    uint64_t event_in = 0, data_in = 0, event_out = 0, data_out = 0;
+    int len;
+    static const uint8_t malformed_change[] = {13,0,0,0,63,18,14,
+        'S','E','C','R','E','T','_','S','E','S','S','I','O','N',24,1};
+    uint8_t *malformed = volume_payload(52, 56, malformed_change,
+        sizeof(malformed_change), &len);
+    volume_send(m, data[1], false, &data_in, &data_out, malformed, len);
+    free(malformed);
+    assert(!m->capture_endpoint_session_match);
+    assert(!m->capture_output_session_match);
+    static const uint8_t candidate[] = {13,0,0,0,63,18,13,
+        'S','E','C','R','E','T','_','T','A','R','G','E','T'};
+    uint8_t *body = volume_payload(51, 55, candidate, sizeof(candidate), &len);
+    volume_send(m, events[1], true, &event_in, &event_out, body, len);
+    for (unsigned i = 0; i < 64; ++i)
+        volume_send(m, data[1], false, &data_in, &data_out, body, len);
+    free(body);
+    static const uint8_t get[] = {10,5,'O','T','H','E','R'};
+    static const uint8_t result[] = {13,0,0,0,63};
+    static const uint8_t change[] = {13,0,0,0,63,18,14,
+        'S','E','C','R','E','T','_','S','E','S','S','I','O','N',26,5,'O','T','H','E','R'};
+    static const uint8_t availability[] = {8,1,16,3};
+    static const uint8_t capabilities[] = {10,4,8,1,16,2,26,5,'O','T','H','E','R'};
+    const unsigned types[] = {49,50,52,17,64};
+    const unsigned extensions[] = {53,54,56,22,68};
+    const uint8_t *payloads[] = {get,result,change,availability,capabilities};
+    const size_t sizes[] = {sizeof(get),sizeof(result),sizeof(change),sizeof(availability),sizeof(capabilities)};
+    for (unsigned i = 0; i < 5; ++i) {
+        body = volume_payload(types[i], extensions[i], payloads[i], sizes[i], &len);
+        volume_send(m, data[1], false, &data_in, &data_out, body, len);
+        free(body);
+    }
+    ap2_pl_node *transport_root = ap2_pl_dict();
+    ap2_pl_dict_set(transport_root, "type", ap2_pl_string("sendMediaRemoteCommand"));
+    ap2_pl_dict_set(transport_root, "value", ap2_pl_string("play"));
+    len = ap2_pl_serialize(transport_root, &body);
+    ap2_pl_free(transport_root);
+    volume_send(m, events[1], true, &event_in, &event_out, body, len);
+    free(body);
+    m->volume.generation = UINT64_C(4294967297);
+    m->capture_records = UINT64_MAX;
+    mrp_capture_egress(m, true); /* Force saturation without unbounded traffic. */
+    ap2_mrp_stop(m);
+    fflush(stderr);
+    assert(dup2(saved, STDERR_FILENO) >= 0);
+    close(saved);
+    rewind(capture);
+    assert(fgets(line, sizeof(line), capture));
+    assert(strstr(line, "[STATUS] native_volume_capture version=1") &&
+        strstr(line, "overflow=1") && strstr(line, "volume_get=2") &&
+        strstr(line, "volume_result=2") && strstr(line, "volume_set_candidate=130") &&
+        strstr(line, "volume_feedback=2") && strstr(line, "volume_availability=2") &&
+        strstr(line, "volume_capabilities=2") && strstr(line, "transport=2") &&
+        strstr(line, "parser_valid=140") && strstr(line, "parser_invalid=2") &&
+        strstr(line, "parser_unknown=2") && strstr(line, "generation_at_cutoff=4294967297") && strstr(line, "event_at_cutoff=connected") &&
+        strstr(line, "datastream_at_cutoff=connected") && strstr(line, "endpoint_session_match=1") &&
+        strstr(line, "output_session_match=0") && strstr(line, "dacp=outside_cli") &&
+        strstr(line, "publication=0") &&
+        !strstr(line, "SECRET") && !strstr(line, "TARGET") && !strstr(line, "534543"));
+    assert(!fgets(line, sizeof(line), capture));
+    fclose(capture);
+    ap2_mrp_destroy(m);
+    close(events[1]);
+    close(data[1]);
+}
+
+static void *capture_summary_thread(void *context)
+{
+    mrp_capture_summary(context);
+    return NULL;
+}
+
+/* A stalled stderr consumer must not hold the receive-path capture mutex. */
+static void test_private_capture_summary_releases_receive_lock(void)
+{
+    struct ap2_mrp_ctx *m = ap2_mrp_create("127.0.0.1", 7000, NULL,
+        "1", "capture", NULL, NULL, NULL, 0);
+    assert(m);
+    ap2_mrp_set_experimental_homepod_remote(m, true);
+    ap2_mrp_set_private_native_volume_capture(m, true);
+    mrp_capture_freeze(m);
+    int saved = dup(STDERR_FILENO);
+    FILE *output = tmpfile();
+    assert(saved >= 0 && output && dup2(fileno(output), STDERR_FILENO) >= 0);
+    flockfile(stderr);
+    pthread_t thread;
+    assert(!pthread_create(&thread, NULL, capture_summary_thread, m));
+    bool available = false;
+    uint64_t deadline = ap2_io_monotonic_ms() + 2000;
+    while (ap2_io_monotonic_ms() < deadline) {
+        if (!pthread_mutex_trylock(&m->capture_lock)) {
+            available = m->capture_emitted;
+            pthread_mutex_unlock(&m->capture_lock);
+            if (available) break;
+        }
+        usleep(1000);
+    }
+    if (available) mrp_capture_egress(m, true);
+    funlockfile(stderr);
+    assert(!pthread_join(thread, NULL));
+    fflush(stderr);
+    assert(dup2(saved, STDERR_FILENO) >= 0);
+    close(saved);
+    fclose(output);
+    ap2_mrp_destroy(m);
+    assert(available);
+}

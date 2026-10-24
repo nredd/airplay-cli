@@ -241,6 +241,16 @@ authority. The engine (`ap2_ptp.c`) implements:
   from the SETPEERS timing-peer list — i.e. us — so giving up the timeline
   mutes them. The BMCA/slave path remains for diagnostics and the synthetic
   harness.
+- **Private strict-peer trial** — only when context-creation environment
+  `CLIAIRPLAY_PTP_STRICT_PEERS` is exactly `1`, receive-side effects are
+  admitted solely from the live `SETPEERS`/daemon registration set. This gates
+  Delay/Pdelay response, exchange accounting, Announce/BMCA, followed-clock
+  processing and Signaling grants before dispatch. Membership testing shares
+  the peer-set lock with replacement/removal, so retirement before admission
+  wins. It is deliberately default-off: ordinary PTP can legitimately observe
+  a shared grandmaster outside a session receiver list. It does not isolate
+  mDNS discovery or MA lifecycle traffic and is not a complete household or
+  office isolation claim.
 
 ## 5. Shared clock daemon (multi-room)
 

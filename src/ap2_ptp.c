@@ -198,6 +198,10 @@ struct ap2_ptp_ctx {
      * the session clock as unicast PTP and never join an open multicast election. */
     char *peers[PTP_MAX_PEERS];
     int npeers;
+    /* Private trial gate: only addresses in `peers` may affect this engine.
+     * Off by default because ordinary PTP/BMCA deployments can legitimately
+     * hear a shared grandmaster outside their unicast receiver list. */
+    bool strict_peers;
 
     /* ---- BMCA / slave state (guarded by lock) ---- */
     pthread_mutex_t lock;
@@ -1049,6 +1053,24 @@ static void ptp_handle_follow_up(struct ap2_ptp_ctx *ctx, const uint8_t *buf, in
  * slot: extends the streak if the gap since the last probe is within
  * PTP_EXCHANGE_GAP_NS, otherwise starts a fresh one. Tracked in any BMCA role,
  * independent of whether we currently answer as grandmaster. */
+/* `peers` is protected by `lock`, so a packet admitted here is linearized
+ * before a concurrent SETPEERS retirement. The receive path never retains a
+ * peer string or address after this check. */
+static bool ptp_peer_is_registered(struct ap2_ptp_ctx *ctx, struct in_addr addr)
+{
+    bool registered = false;
+    pthread_mutex_lock(&ctx->lock);
+    for (int i = 0; i < ctx->npeers; i++) {
+        struct in_addr peer;
+        if (inet_pton(AF_INET, ctx->peers[i], &peer) == 1 && peer.s_addr == addr.s_addr) {
+            registered = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&ctx->lock);
+    return registered;
+}
+
 static void ptp_track_exchange(struct ap2_ptp_ctx *ctx, struct in_addr addr, uint64_t rx)
 {
     pthread_mutex_lock(&ctx->lock);
@@ -1165,6 +1187,12 @@ static void *ptp_thread_func(void *arg)
             for (int k = 0; k < 8; k++) src_clock = (src_clock << 8) | buf[20 + k];
             if (src_clock == ctx->clock_id) continue;
 
+            /* This private trial gate applies to every input effect: responses,
+             * exchange accounting, BMCA, followed-clock state and unicast
+             * grants. Its membership check is serialized with SETPEERS, so an
+             * address retired before admission cannot act on the engine. */
+            if (ctx->strict_peers && !ptp_peer_is_registered(ctx, src.sin_addr)) continue;
+
             switch (msg_type) {
             case PTP_MSG_DELAY_REQ:
                 ptp_track_exchange(ctx, src.sin_addr, rx);
@@ -1226,6 +1254,8 @@ struct ap2_ptp_ctx *ap2_ptp_create(void)
      * before the engine ever runs. */
     ctx->is_grandmaster = true;
     ctx->hold_master = true;
+    const char *strict_peers = getenv("CLIAIRPLAY_PTP_STRICT_PEERS");
+    ctx->strict_peers = strict_peers && strcmp(strict_peers, "1") == 0;
     return ctx;
 }
 

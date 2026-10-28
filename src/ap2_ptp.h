@@ -21,6 +21,13 @@ struct ap2_ptp_ctx *ap2_ptp_create(void);
 void ap2_ptp_destroy(struct ap2_ptp_ctx *ctx);
 
 /*
+ * Whether this context admits PTP receive-side effects only from registered
+ * peers (CLIAIRPLAY_PTP_STRICT_PEERS=1 at creation). The daemon attests this
+ * on its "daemon up" line so a supervisor can verify the gate is live.
+ */
+bool ap2_ptp_strict_peers(const struct ap2_ptp_ctx *ctx);
+
+/*
  * Set PTP-to-local clock offset in nanoseconds.
  * Provided by the MA provider which runs a centralized PTP client.
  * Positive offset means PTP clock is ahead of local clock.

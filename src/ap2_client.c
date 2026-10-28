@@ -2497,7 +2497,12 @@ static bool ap2_native_connect(struct ap2cl_s *p)
      * Set CLIAIRPLAY_MRP_TYPE130=1 to re-enable the channel (future remote-
      * control RX). Best-effort; audio is up regardless. */
     bool volume_mode = ap2_session_volume_enabled(p);
-    if (volume_mode && !ap2_homepod_remote_ready(p)) return false;
+    /* Admission (and with it the MRP context with its initial playback state)
+     * comes first for every datastream requester, so the context setup_mrp
+     * reuses is the same one a non-capture session gets. */
+    if ((volume_mode || ap2_private_native_volume_capture_enabled(p)) &&
+        !ap2_homepod_remote_ready(p))
+        return false;
     if (ap2_mrp_datastream_requested(p, volume_mode))
         ap2_native_setup_mrp(p);
     if (volume_mode) {

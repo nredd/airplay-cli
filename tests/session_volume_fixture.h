@@ -185,13 +185,18 @@ static void test_capture_datastream_receive_only(void)
             off += size;
         }
         assert(off == (size_t)n);
+        uint8_t drain[8192];
         if (capture) {
             assert(count == 3 && types[0] == 15 && types[1] == 38 && types[2] == 16);
             uint8_t *state = NULL; int state_len = 0; uint64_t generation;
             m->state_dirty = true;
             assert(!ap2_mrp_prepare_state_push(m, &state, &state_len, &generation));
+            ap2_mrp_clear_artwork(m);
+            assert(recv(data[1], drain, sizeof(drain), MSG_DONTWAIT) < 0 && errno == EAGAIN);
         } else {
             assert(count > 3); /* plain attach still carries now-playing */
+            ap2_mrp_clear_artwork(m);
+            assert(recv(data[1], drain, sizeof(drain), MSG_DONTWAIT) > 0);
         }
         ap2_mrp_destroy(m); close(data[1]); close(event[1]);
     }

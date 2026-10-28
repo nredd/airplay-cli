@@ -484,11 +484,23 @@ static bool ap2_session_volume_enabled(struct ap2cl_s *p)
 }
 
 /* Private Phase 1 observation requires the already-snapshotted experimental
- * eligibility. It neither requests type-130 nor changes any session bytes. */
+ * eligibility. It changes no session bytes; it does request the type-130
+ * datastream receive-only (ap2_mrp_datastream_requested), because a record
+ * needs both MRP planes and the datastream is where volume traffic rides. */
 static bool ap2_private_native_volume_capture_enabled(struct ap2cl_s *p)
 {
     const char *setting = getenv("CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE");
     return p->experimental_homepod_remote && setting && !strcmp(setting, "1");
+}
+
+/* The type-130 datastream is set up for the explicit diagnostic force, for
+ * session-volume mode, or for private capture. An explicit kill still wins for
+ * capture, exactly as it does for volume mode. */
+static bool ap2_mrp_datastream_requested(struct ap2cl_s *p, bool volume_mode)
+{
+    if (ap2_mrp_type130_enabled() || volume_mode) return true;
+    return ap2_private_native_volume_capture_enabled(p) &&
+        (!getenv("CLIAIRPLAY_MRP_TYPE130") || ap2_mrp_type130_enabled());
 }
 
 /* ---- Native AP2 failure reporting ---- */
@@ -2485,8 +2497,13 @@ static bool ap2_native_connect(struct ap2cl_s *p)
      * Set CLIAIRPLAY_MRP_TYPE130=1 to re-enable the channel (future remote-
      * control RX). Best-effort; audio is up regardless. */
     bool volume_mode = ap2_session_volume_enabled(p);
-    if (volume_mode && !ap2_homepod_remote_ready(p)) return false;
-    if (ap2_mrp_type130_enabled() || volume_mode)
+    /* Admission (and with it the MRP context with its initial playback state)
+     * comes first for every datastream requester, so the context setup_mrp
+     * reuses is the same one a non-capture session gets. */
+    if ((volume_mode || ap2_private_native_volume_capture_enabled(p)) &&
+        !ap2_homepod_remote_ready(p))
+        return false;
+    if (ap2_mrp_datastream_requested(p, volume_mode))
         ap2_native_setup_mrp(p);
     if (volume_mode) {
         printf("[STATUS] session_volume_transport ready=%d publication=0\n",
@@ -6005,6 +6022,12 @@ bool ap2cl_test_session_volume_enabled(bool admitted)
 bool ap2cl_test_mrp_type130_enabled(void)
 {
     return ap2_mrp_type130_enabled();
+}
+
+bool ap2cl_test_mrp_datastream_requested(bool admitted)
+{
+    struct ap2cl_s p = {.experimental_homepod_remote = admitted};
+    return ap2_mrp_datastream_requested(&p, ap2_session_volume_enabled(&p));
 }
 
 bool ap2cl_test_mrp_session_eligible(bool encrypted, bool stored_credentials,

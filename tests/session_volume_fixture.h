@@ -155,9 +155,56 @@ static void test_volume_optional_transport(void)
     assert(callbacks == 2); free(body);
     ap2_mrp_destroy(m); close(event[1]);
 }
+/* Private capture attaches the datastream receive-only: the handshake registers the
+ * sender (DEVICE_INFO, connection state, updates config) and nothing else, and no
+ * now-playing push is ever prepared; a plain type-130 attach still publishes. */
+static void test_capture_datastream_receive_only(void)
+{
+    for (int capture = 0; capture < 2; ++capture) {
+        int data[2], event[2];
+        assert(!socketpair(AF_UNIX, SOCK_STREAM, 0, data));
+        assert(!socketpair(AF_UNIX, SOCK_STREAM, 0, event));
+        uint8_t secret[32] = {5};
+        struct ap2_mrp_ctx *m = ap2_mrp_create("127.0.0.1", 7000, NULL, "1", "offline", NULL, NULL, secret, sizeof(secret));
+        assert(m && ap2_mrp_attach_events(m, event[0]));
+        m->sock = data[0]; m->connected = true;
+        ap2_mrp_set_experimental_homepod_remote(m, true);
+        ap2_mrp_set_private_native_volume_capture(m, capture != 0);
+        ap2_mrp_set_track(m, "title", "artist", "album", 0, NULL, NULL, NULL, 0, NULL, NULL);
+        assert(mrp_data_handshake(m));
+        uint8_t plain[8192]; uint64_t counter = 0;
+        int n = contract_read(m, data[1], &counter, plain);
+        unsigned types[8]; unsigned count = 0; size_t off = 0;
+        while (off < (size_t)n && count < 8) {
+            uint32_t size = (uint32_t)test_be(plain + off, 4);
+            assert(size >= MRP_DATA_HDR_LEN && off + size <= (size_t)n);
+            int type;
+            assert(!strcmp(mrp_diag_protobuf(plain + off + MRP_DATA_HDR_LEN,
+                size - MRP_DATA_HDR_LEN, &type), "protobuf"));
+            types[count++] = (unsigned)type;
+            off += size;
+        }
+        assert(off == (size_t)n);
+        uint8_t drain[8192];
+        if (capture) {
+            assert(count == 3 && types[0] == 15 && types[1] == 38 && types[2] == 16);
+            uint8_t *state = NULL; int state_len = 0; uint64_t generation;
+            m->state_dirty = true;
+            assert(!ap2_mrp_prepare_state_push(m, &state, &state_len, &generation));
+            ap2_mrp_clear_artwork(m);
+            assert(recv(data[1], drain, sizeof(drain), MSG_DONTWAIT) < 0 && errno == EAGAIN);
+        } else {
+            assert(count > 3); /* plain attach still carries now-playing */
+            ap2_mrp_clear_artwork(m);
+            assert(recv(data[1], drain, sizeof(drain), MSG_DONTWAIT) > 0);
+        }
+        ap2_mrp_destroy(m); close(data[1]); close(event[1]);
+    }
+}
 static void test_session_volume_contract(void)
 {
     test_volume_optional_transport();
+    test_capture_datastream_receive_only();
     test_volume_driver();
     struct ap2_mrp_ctx *m = ap2_mrp_create("127.0.0.1", 7000, NULL, "1", "test", NULL, NULL, NULL, 0);
     assert(m);

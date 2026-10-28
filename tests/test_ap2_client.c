@@ -2900,6 +2900,28 @@ static void test_checked_volume(void)
     puts("Checked stream volume: 4 RTSP statuses, legacy semantics preserved");
 }
 bool ap2cl_test_session_volume_enabled(bool admitted);
+bool ap2cl_test_mrp_datastream_requested(bool admitted);
+static void test_capture_datastream_policy(void)
+{
+    unsetenv("CLIAIRPLAY_SESSION_VOLUME"); unsetenv("CLIAIRPLAY_MRP_TYPE130");
+    unsetenv("CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE");
+    assert(!ap2cl_test_mrp_datastream_requested(true));
+    setenv("CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE", "1", 1);
+    assert(ap2cl_test_mrp_datastream_requested(true));
+    assert(!ap2cl_test_mrp_datastream_requested(false)); /* admission still gates capture */
+    assert(!ap2cl_test_session_volume_enabled(true));     /* and volume mode stays off */
+    static const char *kills[] = {"0", "false", "off"};
+    for (unsigned i = 0; i < 3; ++i) {
+        setenv("CLIAIRPLAY_MRP_TYPE130", kills[i], 1);
+        assert(!ap2cl_test_mrp_datastream_requested(true));
+    }
+    setenv("CLIAIRPLAY_MRP_TYPE130", "1", 1);
+    assert(ap2cl_test_mrp_datastream_requested(true));
+    unsetenv("CLIAIRPLAY_MRP_TYPE130");
+    setenv("CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE", "0", 1);
+    assert(!ap2cl_test_mrp_datastream_requested(true));
+    unsetenv("CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE");
+}
 static void test_session_volume_policy(void)
 {
     unsetenv("CLIAIRPLAY_SESSION_VOLUME"); unsetenv("CLIAIRPLAY_MRP_TYPE130");
@@ -2924,6 +2946,7 @@ int main(void)
 {
     test_checked_volume();
     test_session_volume_policy();
+    test_capture_datastream_policy();
     test_homepod_remote_admission();
     test_host_clock_defaults_to_realtime();
     test_retransmit_responder();

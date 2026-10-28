@@ -225,6 +225,7 @@ static void test_strict_peers_reject_unregistered_loopback(void)
     memset(bound_port, 0, sizeof(bound_port));
     struct ap2_ptp_ctx *ctx = ap2_ptp_create();
     assert(ctx);
+    assert(ap2_ptp_strict_peers(ctx));
     const char *peers[1] = {"127.0.0.1"};
     assert(ap2_ptp_engine_start(ctx, any_iface(), NULL));
     assert(bound_port[0] != 0 && bound_port[1] != 0);
@@ -269,6 +270,8 @@ static void test_default_keeps_unregistered_responses(void)
     memset(bound_port, 0, sizeof(bound_port));
     struct ap2_ptp_ctx *ctx = ap2_ptp_create();
     assert(ctx);
+    assert(!ap2_ptp_strict_peers(ctx));
+    assert(!ap2_ptp_strict_peers(NULL));
     assert(ap2_ptp_engine_start(ctx, any_iface(), NULL));
     sends_reset();
 

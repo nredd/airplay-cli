@@ -1259,6 +1259,11 @@ struct ap2_ptp_ctx *ap2_ptp_create(void)
     return ctx;
 }
 
+bool ap2_ptp_strict_peers(const struct ap2_ptp_ctx *ctx)
+{
+    return ctx && ctx->strict_peers;
+}
+
 void ap2_ptp_destroy(struct ap2_ptp_ctx *ctx)
 {
     if (!ctx) return;
@@ -1909,8 +1914,9 @@ int ap2_ptp_run_daemon(struct in_addr bind_addr, uint64_t clock_id,
 
     uint64_t start_ns = ap2_ptp_now_ns(ctx);
     struct ptp_peerset ps = {0};
-    LOG_INFO("[PTP] daemon up: engine on 319/320, clock in %s, control on %s:%d",
-             AP2_PTP_SHM_NAME, AP2_PTP_CTRL_ADDR, AP2_PTP_CTRL_PORT);
+    LOG_INFO("[PTP] daemon up: engine on 319/320, clock in %s, control on %s:%d, strict-peers=%s",
+             AP2_PTP_SHM_NAME, AP2_PTP_CTRL_ADDR, AP2_PTP_CTRL_PORT,
+             ap2_ptp_strict_peers(ctx) ? "on" : "off");
 
     /* Publish immediately so an early-attaching stream sees a live sample. */
     struct ap2_ptp_shm_sample sample;

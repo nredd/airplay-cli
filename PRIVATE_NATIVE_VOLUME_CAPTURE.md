@@ -11,7 +11,9 @@ CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE=1
 CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE=1
 ```
 
-The capture flag is strict literal `1`. It does not request type 130, alter session declarations, client-update subscriptions, attachment, command dispatch, callbacks, publication, metadata, audio, or authorization. Production volume publication remains hard-closed outside `AP2_VOLUME_TESTING`.
+The capture flag is strict literal `1`. It does not alter session declarations, client-update subscriptions, command dispatch, callbacks, publication, metadata, audio, or authorization. Production volume publication remains hard-closed outside `AP2_VOLUME_TESTING`.
+
+It does request the type-130 DataStream, receive-only. The first live windows (2026-10-28) showed every summary ending with `datastream=unattached`, because the channel was set up only in session-volume mode or under the explicit `CLIAIRPLAY_MRP_TYPE130=1` diagnostic force, and that force also moves now-playing `SET_STATE` publication onto the DataStream, which would make the observed session a different session. So with capture on and volume mode off, the DataStream handshake registers the sender (`DEVICE_INFO`, connection state, updates config) and nothing more: no `SET_NOW_PLAYING_CLIENT`, no `SET_STATE`, no periodic state pushes; now-playing stays on `POST /command` exactly as without capture. An explicit `CLIAIRPLAY_MRP_TYPE130=0|false|off` kill still wins. The attach itself is one extra `SETUP` (type 130, dedicated socket) after `SETPEERS` and one TCP connection to the receiver's `dataPort`; `ap2_mrp_ready` ordering differs from a non-capture session in the same way it does in volume mode.
 
 At MRP teardown, stderr receives one bounded allowlisted line:
 

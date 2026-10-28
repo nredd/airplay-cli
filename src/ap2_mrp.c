@@ -2029,6 +2029,14 @@ bool ap2_mrp_attach_events(struct ap2_mrp_ctx *m, int event_sock)
     return true;
 }
 
+/* Now-playing rides the datastream only on a plain type-130 attach. Volume mode keeps
+ * it on POST /command, and private capture attaches the datastream receive-only: the
+ * session under observation must not gain a second now-playing publisher. */
+static bool mrp_now_playing_on_datastream(const struct ap2_mrp_ctx *m)
+{
+    return !m->volume_mode && !m->private_native_volume_capture;
+}
+
 /* Separated only to exercise actual opening/failure behavior with socketpairs. */
 static bool mrp_data_handshake(struct ap2_mrp_ctx *m)
 {
@@ -2039,7 +2047,7 @@ static bool mrp_data_handshake(struct ap2_mrp_ctx *m)
     mbuf_free(&msg);
     ok = ok && build_client_updates_config(&msg) && mrp_send_protobuf(m, &msg);
     mbuf_free(&msg);
-    if (!m->volume_mode) {
+    if (mrp_now_playing_on_datastream(m)) {
         ok = ok && build_set_now_playing_client(m, &msg) && mrp_send_protobuf(m, &msg);
         mbuf_free(&msg);
         ok = ok && mrp_push_state(m, m->artwork_len > 0);
@@ -2308,7 +2316,7 @@ void ap2_mrp_clear_artwork(struct ap2_mrp_ctx *m)
 {
     if (!m) return;
     mrp_reset_artwork(m);
-    if (m->connected) mrp_push_state(m, false);
+    if (m->connected && mrp_now_playing_on_datastream(m)) mrp_push_state(m, false);
 }
 
 bool ap2_mrp_set_progress(struct ap2_mrp_ctx *m, int elapsed_ms,
@@ -2384,7 +2392,9 @@ void ap2_mrp_tick(struct ap2_mrp_ctx *m)
 bool ap2_mrp_prepare_state_push(struct ap2_mrp_ctx *m, uint8_t **out,
                                 int *out_len, uint64_t *generation)
 {
-    if (!m || !out || !out_len || !generation || !m->connected || m->volume_mode) return false;
+    if (!m || !out || !out_len || !generation || !m->connected ||
+        !mrp_now_playing_on_datastream(m))
+        return false;
     bool periodic =
         m->playback_state == AP2_MRP_PLAYBACK_PLAYING &&
         time(NULL) - m->last_state_push >= MRP_STATE_REPUSH_S;

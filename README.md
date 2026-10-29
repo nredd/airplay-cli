@@ -90,10 +90,13 @@ uv run tests/apple_session_probe.py --host 192.168.1.50 --host 192.168.1.51 \
 ```
 
 Requires `uv` and Python 3.11+; the script pins `pyatv==0.18.0` inline.
-It scans and transiently connects over AirPlay, reads state, then closes without
-sending playback, seek, volume or grouping commands. Stdout is a JSON array with
-host/name, now-playing app, metadata, state, duration/position, control availability,
-volume and output UIDs. Unsupported optional readings are `null`. `discovery`
+It scans the requested IP and fails closed unless pyatv returns that exact address,
+then opens a transient AirPlay controller connection, reads state, and closes without
+sending playback, seek, volume or grouping commands. This is not passive: opening the
+controller connection and taking snapshots can perturb receiver UI. It is not a
+phone-rail oracle. Stdout is a JSON array with host/name, now-playing app, metadata,
+state, duration/position, control availability, volume and output UIDs. Unsupported
+optional readings are `null`. `discovery`
 contains only present public AirPlay mDNS properties from this allowlist:
 `flags`, `sf`, `gid`, `pgid`, `igl`, `tsid`, `features`, `model`, `osvers`,
 `srcvers`, `deviceid`. No keys, credentials or raw diagnostics are emitted.

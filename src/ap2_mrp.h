@@ -137,8 +137,9 @@ void ap2_mrp_destroy(struct ap2_mrp_ctx *m);
  * Attach to a remote-control data channel negotiated by the audio session
  * (piggyback model). Derives the DataStream channel keys from the shared
  * secret given at create time, opens the TCP connection to the receiver's
- * dataPort, and pushes the opening messages (DEVICE_INFO,
- * SET_CONNECTION_STATE, SET_NOW_PLAYING_CLIENT, initial SET_STATE).
+ * dataPort, and pushes DEVICE_INFO, SET_CONNECTION_STATE, and client updates
+ * configuration. The optional now-playing messages follow only when the
+ * selected channel policy permits a DataStream publisher.
  *
  * :param data_port: dataPort from the type-130 stream SETUP response.
  * :param seed: the random seed sent in the type-130 SETUP request (the
@@ -164,6 +165,12 @@ void ap2_mrp_set_private_native_volume_capture(struct ap2_mrp_ctx *m, bool enabl
  * does not establish native volume-rail availability; volume feedback arrives
  * on DACP. Now-playing stays on /command. */
 void ap2_mrp_set_native_volume_rail(struct ap2_mrp_ctx *m, bool enabled);
+
+/* Permit private now-playing DataStream writes only alongside an admitted rail,
+ * never with private capture or session-volume mode. This setter mirrors the
+ * CLI gate so direct callers cannot broaden the experiment. */
+void ap2_mrp_set_private_now_playing_datastream(struct ap2_mrp_ctx *m,
+                                                bool enabled);
 
 bool ap2_mrp_attach_events(struct ap2_mrp_ctx *m, int event_sock);
 

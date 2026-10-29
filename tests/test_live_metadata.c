@@ -445,6 +445,91 @@ static void test_encrypted_diagnostics_and_cap(void)
     close(data[1]);
 }
 
+static unsigned test_data_handshake_types(struct ap2_mrp_ctx *m, int types[5])
+{
+    int sockets[2];
+    assert(!socketpair(AF_UNIX, SOCK_STREAM, 0, sockets));
+    m->sock = sockets[0];
+    m->connected = true;
+    assert(mrp_data_handshake(m));
+    assert(shutdown(sockets[0], SHUT_WR) == 0);
+
+    uint8_t encrypted[8192], plain[8192];
+    int encrypted_len = 0;
+    ssize_t received;
+    while ((received = read(sockets[1], encrypted + encrypted_len,
+                            sizeof(encrypted) - (size_t)encrypted_len)) > 0)
+        encrypted_len += (int)received;
+    assert(received == 0);
+    int plain_len = 0;
+    uint64_t counter = 0;
+    assert(mrp_drain_channel_frames(encrypted, &encrypted_len, plain, &plain_len,
+        sizeof(plain), m->out_key, &counter, "handshake"));
+    assert(encrypted_len == 0);
+
+    unsigned count = 0;
+    for (int offset = 0; offset < plain_len;) {
+        assert(plain_len - offset >= MRP_DATA_HDR_LEN);
+        uint32_t frame_len = (uint32_t)test_be(plain + offset, 4);
+        assert(frame_len >= MRP_DATA_HDR_LEN && frame_len <= (uint32_t)(plain_len - offset));
+        int type = -1;
+        assert(!strcmp(mrp_diag_protobuf(plain + offset + MRP_DATA_HDR_LEN,
+            frame_len - MRP_DATA_HDR_LEN, &type), "protobuf"));
+        assert(count < 5);
+        types[count++] = type;
+        offset += (int)frame_len;
+    }
+    m->connected = false;
+    m->sock = -1;
+    close(sockets[0]);
+    close(sockets[1]);
+    return count;
+}
+
+static void test_private_now_playing_datastream_handshake(void)
+{
+    static const int baseline[] = {15, 38, 16};
+    static const int treatment[] = {15, 38, 16, 46, 4}; /* SET_STATE is type 4 */
+    struct {
+        bool private_publisher;
+        bool capture;
+        bool volume;
+        const int *expected;
+        unsigned expected_count;
+        bool periodic;
+    } cases[] = {
+        {false, false, false, baseline, 3, false},
+        {true, false, false, treatment, 5, true},
+        {true, true, false, baseline, 3, false},
+        {true, false, true, baseline, 3, false},
+    };
+    uint8_t secret[32] = {3};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        struct ap2_mrp_ctx *m = ap2_mrp_create("127.0.0.1", 7000, NULL, "1",
+            "Handshake test", NULL, NULL, secret, sizeof(secret));
+        assert(m);
+        ap2_mrp_set_experimental_homepod_remote(m, true);
+        ap2_mrp_set_native_volume_rail(m, true);
+        ap2_mrp_set_private_native_volume_capture(m, cases[i].capture);
+        ap2_mrp_set_volume_mode(m, cases[i].volume);
+        ap2_mrp_set_private_now_playing_datastream(m, cases[i].private_publisher);
+        int types[5] = {0};
+        unsigned count = test_data_handshake_types(m, types);
+        assert(count == cases[i].expected_count);
+        assert(!memcmp(types, cases[i].expected, count * sizeof(*types)));
+        m->connected = true;
+        assert(ap2_mrp_set_metadata(m, "Track", "Artist", "Album", 1, "item"));
+        uint8_t *state = NULL;
+        int state_len = 0;
+        uint64_t generation = 0;
+        assert(ap2_mrp_prepare_state_push(m, &state, &state_len, &generation) ==
+            cases[i].periodic);
+        free(state);
+        m->connected = false;
+        ap2_mrp_destroy(m);
+    }
+}
+
 #include "mrp_volume_fixture.h"
 #include "session_volume_fixture.h"
 #include "session_volume_harness.h"
@@ -461,6 +546,7 @@ int main(int argc, char **argv)
     test_paired_setup_booleans();
     test_diagnostic_classifier();
     test_encrypted_diagnostics_and_cap();
+    test_private_now_playing_datastream_handshake();
     test_live_bundle(false);
     test_live_bundle(true);
     test_live_remote_mapping();

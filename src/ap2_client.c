@@ -509,6 +509,14 @@ static bool ap2_datastream_receive_only_requested(struct ap2cl_s *p)
         ap2_native_volume_rail_enabled(p);
 }
 
+/* Every datastream requester other than the bare diagnostic force needs
+ * HomePod-remote admission to run BEFORE the attach, so the MRP context setup
+ * reuses carries the same initial playback state as a non-requesting session. */
+static bool ap2_datastream_admission_first(struct ap2cl_s *p, bool volume_mode)
+{
+    return volume_mode || ap2_datastream_receive_only_requested(p);
+}
+
 /* The type-130 datastream is set up for the explicit diagnostic force, for
  * session-volume mode, or for a receive-only requester. An explicit kill still
  * wins for the receive-only requesters, exactly as it does for volume mode. */
@@ -2517,8 +2525,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     /* Admission (and with it the MRP context with its initial playback state)
      * comes first for every datastream requester, so the context setup_mrp
      * reuses is the same one a non-capture session gets. */
-    if ((volume_mode || ap2_datastream_receive_only_requested(p)) &&
-        !ap2_homepod_remote_ready(p))
+    if (ap2_datastream_admission_first(p, volume_mode) && !ap2_homepod_remote_ready(p))
         return false;
     if (ap2_mrp_datastream_requested(p, volume_mode))
         ap2_native_setup_mrp(p);
@@ -6040,6 +6047,12 @@ bool ap2cl_test_session_volume_enabled(bool admitted)
 bool ap2cl_test_mrp_type130_enabled(void)
 {
     return ap2_mrp_type130_enabled();
+}
+
+bool ap2cl_test_datastream_admission_first(bool admitted)
+{
+    struct ap2cl_s p = {.experimental_homepod_remote = admitted};
+    return ap2_datastream_admission_first(&p, ap2_session_volume_enabled(&p));
 }
 
 bool ap2cl_test_mrp_datastream_requested(bool admitted)

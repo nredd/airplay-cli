@@ -169,6 +169,10 @@ static void test_capture_datastream_receive_only(void)
         struct ap2_mrp_ctx *m = ap2_mrp_create("127.0.0.1", 7000, NULL, "1", "offline", NULL, NULL, secret, sizeof(secret));
         assert(m && ap2_mrp_attach_events(m, event[0]));
         m->sock = data[0]; m->connected = true;
+        /* Neither receive-only flag can be set before admission is recorded. */
+        ap2_mrp_set_private_native_volume_capture(m, true);
+        ap2_mrp_set_native_volume_rail(m, true);
+        assert(!m->private_native_volume_capture && !m->native_volume_rail);
         ap2_mrp_set_experimental_homepod_remote(m, true);
         ap2_mrp_set_private_native_volume_capture(m, mode == 1);
         ap2_mrp_set_native_volume_rail(m, mode == 2);

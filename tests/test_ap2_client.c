@@ -2901,6 +2901,7 @@ static void test_checked_volume(void)
 }
 bool ap2cl_test_session_volume_enabled(bool admitted);
 bool ap2cl_test_mrp_datastream_requested(bool admitted);
+bool ap2cl_test_datastream_admission_first(bool admitted);
 static void test_capture_datastream_policy(void)
 {
     unsetenv("CLIAIRPLAY_SESSION_VOLUME"); unsetenv("CLIAIRPLAY_MRP_TYPE130");
@@ -2921,9 +2922,17 @@ static void test_capture_datastream_policy(void)
     setenv("CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE", "0", 1);
     assert(!ap2cl_test_mrp_datastream_requested(true));
     unsetenv("CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE");
-    /* The native rail is a second receive-only requester with the same gates. */
+    /* The native rail is a second receive-only requester with the same gates,
+     * and like capture and volume mode it runs admission before the attach. */
+    assert(!ap2cl_test_datastream_admission_first(true));
     setenv("CLIAIRPLAY_NATIVE_VOLUME_RAIL", "1", 1);
     assert(ap2cl_test_mrp_datastream_requested(true));
+    assert(ap2cl_test_datastream_admission_first(true));
+    unsetenv("CLIAIRPLAY_NATIVE_VOLUME_RAIL");
+    setenv("CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE", "1", 1);
+    assert(ap2cl_test_datastream_admission_first(true));
+    unsetenv("CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE");
+    setenv("CLIAIRPLAY_NATIVE_VOLUME_RAIL", "1", 1);
     assert(!ap2cl_test_mrp_datastream_requested(false));
     assert(!ap2cl_test_session_volume_enabled(true));
     setenv("CLIAIRPLAY_MRP_TYPE130", "off", 1);

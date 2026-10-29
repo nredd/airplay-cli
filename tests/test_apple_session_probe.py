@@ -110,6 +110,7 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.atv = fake_atv()
         self.scan = AsyncMock(return_value=[MagicMock(name="cfg")])
         self.scan.return_value[0].name = "Speaker"
+        self.scan.return_value[0].address = probe.ip_address(HOST)
         self.service = self.scan.return_value[0].get_service.return_value
         self.service.properties = {
             "flags": "0x4",
@@ -197,6 +198,14 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         """No matching device is a failed observation, not an empty success."""
         self.scan.return_value = []
         self.assertFalse((await probe.probe(HOST))["ok"])
+        self.connect.assert_not_called()
+
+    async def test_mismatched_scan_address_never_connects(self) -> None:
+        """Fail closed when discovery returns another device's address."""
+        self.scan.return_value[0].address = probe.ip_address("192.0.2.25")
+        result = await probe.probe(HOST)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["errors"], ["Scan returned a different address"])
         self.connect.assert_not_called()
 
     async def test_failures_are_sanitized(self) -> None:

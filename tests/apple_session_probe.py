@@ -151,6 +151,11 @@ async def _probe(
         if len(devices) != 1:
             return result | {"ok": False, "errors": ["Expected one AirPlay device"]}
         cfg = devices[0]
+        if cfg.address != ip_address(host):
+            return result | {
+                "ok": False,
+                "errors": ["Scan returned a different address"],
+            }
         service = cfg.get_service(Protocol.AirPlay)
         properties = service.properties if service is not None else {}
         result["discovery"] = {

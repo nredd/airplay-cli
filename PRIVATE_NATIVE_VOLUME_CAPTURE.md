@@ -17,7 +17,7 @@ It does request the type-130 DataStream, receive-only. The first live windows (2
 
 ### Evidence correction (2026-10-29)
 
-The owner corrected the 2026-10-28 A/B conclusion: no MA AirPlay HomePod stream was observed with an active iPhone rail, so the receive-only registration is not evidence that it un-greys or keeps that rail live. The 2026-10-29 office-pod test did observe physical adoption of DACP feedback, which is separate from phone-rail evidence. Siri-started HomePod playback, not an external Apple sender baseline, is the confirmed usable phone-rail case.
+The owner corrected the 2026-10-28 A/B conclusion: no MA AirPlay HomePod stream was observed with an active iPhone rail, so the receive-only registration is not evidence that it un-greys or keeps that rail live. The 2026-10-29 office-pod test did observe physical adoption of DACP feedback, which is separate from phone-rail evidence. Siri-started HomePod playback, not an external Apple sender baseline, is the confirmed usable phone-rail case. The Mac external-sender baseline remains pending.
 
 At MRP teardown, stderr receives one bounded allowlisted line:
 

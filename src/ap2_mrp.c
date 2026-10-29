@@ -220,6 +220,7 @@ struct ap2_mrp_ctx {
     /* Private capture is aggregate-only. It never changes channel setup,
      * command dispatch, ACKs, publication, or backend bindings. */
     bool private_native_volume_capture;
+    bool native_volume_rail;
     bool capture_emitted, capture_frozen, data_attached;
     pthread_mutex_t capture_lock;
     uint64_t capture_records;
@@ -1999,6 +2000,12 @@ void ap2_mrp_set_private_native_volume_capture(struct ap2_mrp_ctx *m, bool enabl
     m->private_native_volume_capture = enabled;
 }
 
+void ap2_mrp_set_native_volume_rail(struct ap2_mrp_ctx *m, bool enabled)
+{
+    if (!m || !m->experimental_homepod_remote) return;
+    m->native_volume_rail = enabled;
+}
+
 bool ap2_mrp_attach_events(struct ap2_mrp_ctx *m, int event_sock)
 {
     if (!m || event_sock < 0) return false;
@@ -2034,7 +2041,7 @@ bool ap2_mrp_attach_events(struct ap2_mrp_ctx *m, int event_sock)
  * session under observation must not gain a second now-playing publisher. */
 static bool mrp_now_playing_on_datastream(const struct ap2_mrp_ctx *m)
 {
-    return !m->volume_mode && !m->private_native_volume_capture;
+    return !m->volume_mode && !m->private_native_volume_capture && !m->native_volume_rail;
 }
 
 /* Separated only to exercise actual opening/failure behavior with socketpairs. */

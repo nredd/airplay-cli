@@ -493,9 +493,9 @@ static bool ap2_private_native_volume_capture_enabled(struct ap2cl_s *p)
     return p->experimental_homepod_remote && setting && !strcmp(setting, "1");
 }
 
-/* Receive-only DataStream registration under HomePod-remote admission. Live
- * A/B on 2026-10-28: the receiver's native volume rail is grey without this
- * registration and live with it, while volume itself always rides DACP. */
+/* Receive-only DataStream registration under HomePod-remote admission. This
+ * is a transport-registration experiment, not proof that it activates or
+ * keeps a receiver's native volume rail live; volume feedback rides DACP. */
 static bool ap2_native_volume_rail_enabled(struct ap2cl_s *p)
 {
     const char *setting = getenv("CLIAIRPLAY_NATIVE_VOLUME_RAIL");

@@ -493,13 +493,29 @@ static bool ap2_private_native_volume_capture_enabled(struct ap2cl_s *p)
     return p->experimental_homepod_remote && setting && !strcmp(setting, "1");
 }
 
+/* Receive-only DataStream registration under HomePod-remote admission. Live
+ * A/B on 2026-10-28: the receiver's native volume rail is grey without this
+ * registration and live with it, while volume itself always rides DACP. */
+static bool ap2_native_volume_rail_enabled(struct ap2cl_s *p)
+{
+    const char *setting = getenv("CLIAIRPLAY_NATIVE_VOLUME_RAIL");
+    return p->experimental_homepod_remote && setting && !strcmp(setting, "1");
+}
+
+/* Receive-only datastream requesters: private capture and the native rail. */
+static bool ap2_datastream_receive_only_requested(struct ap2cl_s *p)
+{
+    return ap2_private_native_volume_capture_enabled(p) ||
+        ap2_native_volume_rail_enabled(p);
+}
+
 /* The type-130 datastream is set up for the explicit diagnostic force, for
- * session-volume mode, or for private capture. An explicit kill still wins for
- * capture, exactly as it does for volume mode. */
+ * session-volume mode, or for a receive-only requester. An explicit kill still
+ * wins for the receive-only requesters, exactly as it does for volume mode. */
 static bool ap2_mrp_datastream_requested(struct ap2cl_s *p, bool volume_mode)
 {
     if (ap2_mrp_type130_enabled() || volume_mode) return true;
-    return ap2_private_native_volume_capture_enabled(p) &&
+    return ap2_datastream_receive_only_requested(p) &&
         (!getenv("CLIAIRPLAY_MRP_TYPE130") || ap2_mrp_type130_enabled());
 }
 
@@ -1716,6 +1732,7 @@ static void ap2_native_setup_mrp(struct ap2cl_s *p)
         ap2_mrp_set_experimental_homepod_remote(mrp, p->experimental_homepod_remote);
         ap2_mrp_set_private_native_volume_capture(mrp,
             ap2_private_native_volume_capture_enabled(p));
+        ap2_mrp_set_native_volume_rail(mrp, ap2_native_volume_rail_enabled(p));
         p->mrp = mrp;
     }
     if (!p->mrp) return;
@@ -2500,7 +2517,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     /* Admission (and with it the MRP context with its initial playback state)
      * comes first for every datastream requester, so the context setup_mrp
      * reuses is the same one a non-capture session gets. */
-    if ((volume_mode || ap2_private_native_volume_capture_enabled(p)) &&
+    if ((volume_mode || ap2_datastream_receive_only_requested(p)) &&
         !ap2_homepod_remote_ready(p))
         return false;
     if (ap2_mrp_datastream_requested(p, volume_mode))
@@ -5112,6 +5129,7 @@ static void ap2_mrp_ready(struct ap2cl_s *p)
     ap2_mrp_set_experimental_homepod_remote(mrp, p->experimental_homepod_remote);
     ap2_mrp_set_private_native_volume_capture(mrp,
         ap2_private_native_volume_capture_enabled(p));
+    ap2_mrp_set_native_volume_rail(mrp, ap2_native_volume_rail_enabled(p));
     p->mrp = mrp;
     ap2_mrp_set_remote_command_callback(
         p->mrp, ap2_remote_command_received, p);

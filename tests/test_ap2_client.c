@@ -2921,6 +2921,17 @@ static void test_capture_datastream_policy(void)
     setenv("CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE", "0", 1);
     assert(!ap2cl_test_mrp_datastream_requested(true));
     unsetenv("CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE");
+    /* The native rail is a second receive-only requester with the same gates. */
+    setenv("CLIAIRPLAY_NATIVE_VOLUME_RAIL", "1", 1);
+    assert(ap2cl_test_mrp_datastream_requested(true));
+    assert(!ap2cl_test_mrp_datastream_requested(false));
+    assert(!ap2cl_test_session_volume_enabled(true));
+    setenv("CLIAIRPLAY_MRP_TYPE130", "off", 1);
+    assert(!ap2cl_test_mrp_datastream_requested(true));
+    unsetenv("CLIAIRPLAY_MRP_TYPE130");
+    setenv("CLIAIRPLAY_NATIVE_VOLUME_RAIL", "true", 1);
+    assert(!ap2cl_test_mrp_datastream_requested(true)); /* strict literal 1 */
+    unsetenv("CLIAIRPLAY_NATIVE_VOLUME_RAIL");
 }
 static void test_session_volume_policy(void)
 {

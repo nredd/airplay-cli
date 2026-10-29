@@ -159,6 +159,12 @@ void ap2_mrp_set_experimental_homepod_remote(struct ap2_mrp_ctx *m, bool enabled
  * experimental HomePod-remote session; it never enables or attaches a plane. */
 void ap2_mrp_set_private_native_volume_capture(struct ap2_mrp_ctx *m, bool enabled);
 
+/* Attach the DataStream receive-only under experimental HomePod-remote
+ * admission (CLIAIRPLAY_NATIVE_VOLUME_RAIL=1). The registration alone makes the
+ * receiver treat this sender as remote-controllable, which un-greys its native
+ * volume rail; volume changes still arrive on DACP. Now-playing stays on /command. */
+void ap2_mrp_set_native_volume_rail(struct ap2_mrp_ctx *m, bool enabled);
+
 bool ap2_mrp_attach_events(struct ap2_mrp_ctx *m, int event_sock);
 
 /*

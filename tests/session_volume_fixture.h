@@ -160,7 +160,8 @@ static void test_volume_optional_transport(void)
  * now-playing push is ever prepared; a plain type-130 attach still publishes. */
 static void test_capture_datastream_receive_only(void)
 {
-    for (int capture = 0; capture < 2; ++capture) {
+    for (int mode = 0; mode < 3; ++mode) {
+        int capture = mode != 0; /* 1 = capture, 2 = native rail: both receive-only */
         int data[2], event[2];
         assert(!socketpair(AF_UNIX, SOCK_STREAM, 0, data));
         assert(!socketpair(AF_UNIX, SOCK_STREAM, 0, event));
@@ -169,7 +170,8 @@ static void test_capture_datastream_receive_only(void)
         assert(m && ap2_mrp_attach_events(m, event[0]));
         m->sock = data[0]; m->connected = true;
         ap2_mrp_set_experimental_homepod_remote(m, true);
-        ap2_mrp_set_private_native_volume_capture(m, capture != 0);
+        ap2_mrp_set_private_native_volume_capture(m, mode == 1);
+        ap2_mrp_set_native_volume_rail(m, mode == 2);
         ap2_mrp_set_track(m, "title", "artist", "album", 0, NULL, NULL, NULL, 0, NULL, NULL);
         assert(mrp_data_handshake(m));
         uint8_t plain[8192]; uint64_t counter = 0;

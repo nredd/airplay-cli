@@ -182,6 +182,15 @@ RAOP_LIFECYCLE_TEST_DEFINES = \
 	-Draopcl_sample_rate=ap2_test_raopcl_sample_rate
 RAOP_SESSION_TEST = build/tests/test_raop_session
 ANNOUNCE_TEST = build/tests/test_announce
+RAOP_EARLY_FAILURE_TEST = build/tests/test_raop_early_failure
+
+# libraop 81c2182 joins RTP threads that were never created when raopcl_connect
+# fails early (a zeroed pthread_t can crash Linux). The submodule stays pristine:
+# the fix is a patch applied to a build-local copy of raop_client.c.
+RAOP_CLIENT_PATCH = patches/libraop-raop-client-thread-join.patch
+RAOP_CLIENT_PATCHED = build/patched/raop_client.c
+RTSP_CLIENT_PATCH = patches/libraop-rtsp-setup-cleanup.patch
+RTSP_CLIENT_PATCHED = build/patched/rtsp_client.c
 
 all: directory $(EXECUTABLE)
 
@@ -222,6 +231,20 @@ $(BUILDDIR)/ap2_client_raop_lifecycle_test.o: $(SRC)/ap2_client.c Makefile
 $(BUILDDIR)/raop_session_raop_lifecycle_test.o: $(SRC)/raop_session.c Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $(RAOP_LIFECYCLE_TEST_DEFINES) $< -c -o $@
 
+$(RAOP_CLIENT_PATCHED): $(LIBRAOP)/src/raop_client.c $(RAOP_CLIENT_PATCH)
+	@mkdir -p $(dir $@)
+	patch -s -o $@ $< $(RAOP_CLIENT_PATCH)
+
+$(RTSP_CLIENT_PATCHED): $(LIBRAOP)/src/rtsp_client.c $(RTSP_CLIENT_PATCH)
+	@mkdir -p $(dir $@)
+	patch -s -o $@ $< $(RTSP_CLIENT_PATCH)
+
+$(BUILDDIR)/rtsp_client.o: $(RTSP_CLIENT_PATCHED)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
+
+$(BUILDDIR)/raop_client.o: $(RAOP_CLIENT_PATCHED)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
+
 $(BUILDDIR)/%.o: %.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
 
@@ -229,7 +252,7 @@ $(BUILDDIR)/%.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
 
 clean:
-	rm -rf $(BUILDDIR) $(EXECUTABLE) $(LIBCODECS_PATCHED) build/tests
+	rm -rf $(BUILDDIR) $(EXECUTABLE) $(LIBCODECS_PATCHED) build/tests build/patched
 
 # The CLI checks in `test` expect the binary to fail and swallow its exit
 # status, so they rely on this to fail on a sanitizer report (and show it).
@@ -238,7 +261,7 @@ no_sanitizer_report = case "$(1)" in *Sanitizer*|*"runtime error:"*) \
 
 test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT_TEST) \
 		$(SESSION_TEST) $(PTP_TEST) $(TEST_EXECUTABLE) $(RAOP_LIFECYCLE_TEST_EXECUTABLE) \
-		$(RAOP_SESSION_TEST) $(ANNOUNCE_TEST)
+		$(RAOP_SESSION_TEST) $(ANNOUNCE_TEST) $(RAOP_EARLY_FAILURE_TEST)
 	$(TIMELINE_TEST)
 	$(EVENT_TEST)
 	$(IO_TEST)
@@ -249,6 +272,7 @@ test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT
 	$(RAOP_LIFECYCLE_TEST_EXECUTABLE)
 	$(RAOP_SESSION_TEST)
 	$(ANNOUNCE_TEST)
+	$(RAOP_EARLY_FAILURE_TEST) $(EXECUTABLE)
 	python3 tests/mrp_artwork_matrix.py --help >/dev/null
 	@missing_pipe="$$($(EXECUTABLE) --protocol raop \
 		127.0.0.1 2>&1 || true)"; \
@@ -280,17 +304,17 @@ test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT
 		grep -q "Failed to create command pipe"
 # An Apple TV advertising a public key may still accept unpaired RAOP, so no
 # secret is demanded up front: the connect attempt (to a closed port) must run.
-# Skipped under sanitizers: libraop joins never-started RTP threads on a failed
-# connect, which ASan aborts on.
-ifeq ($(SANITIZE),)
+# The failed connect must also exit normally: libraop used to join RTP threads
+# it never started there, which killed the process with SIGSEGV on Linux.
 	@pipe_dir="$$(mktemp -d)"; \
 		appletv_pk="$$($(EXECUTABLE) --protocol raop --port 1 --cmdpipe \
 		"$$pipe_dir/pipe" --am AppleTV2,1 \
 		--pk 0000000000000000000000000000000000000000000000000000000000000000 \
-		127.0.0.1 < /dev/null 2>&1 || true)"; \
+		127.0.0.1 < /dev/null 2>&1; echo "exit=$$?")"; \
 		rm -rf "$$pipe_dir"; \
-		printf '%s\n' "$$appletv_pk" | grep -q 'detail="RAOP connect failed"'
-endif
+		$(call no_sanitizer_report,$$appletv_pk) && \
+		printf '%s\n' "$$appletv_pk" | grep -q 'detail="RAOP connect failed"' && \
+		printf '%s\n' "$$appletv_pk" | grep -q '^exit=1$$'
 
 $(RAOP_SESSION_TEST): tests/test_raop_session.c src/raop_session.c \
 		src/raop_session.h Makefile
@@ -362,6 +386,26 @@ $(CLIENT_TEST): build/tests/test_ap2_client_main.o build/tests/ap2_client.o \
 		build/tests/cross_ssl.o \
 		$(CLIENT_TEST_OBJECTS) $(LIBCODECS_PATCHED) \
 		$(MDNS)/$(HOST)/$(PLATFORM)/libmdns.a \
+		$(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
+
+# Same raop_client.c as the binary, with its thread calls routed via the hooks.
+build/tests/raop_client_early_failure.o: $(RAOP_CLIENT_PATCHED) \
+		tests/raop_thread_hooks.h Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -include tests/raop_thread_hooks.h \
+		$< -c -o $@
+
+$(RAOP_EARLY_FAILURE_TEST): tests/test_raop_early_failure.c \
+		build/tests/raop_client_early_failure.o build/tests/cross_ssl.o \
+		$(filter-out $(BUILDDIR)/raop_client.o,$(CLIENT_TEST_OBJECTS)) \
+		$(LIBCODECS_PATCHED) Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_raop_early_failure.c -c \
+		-o build/tests/test_raop_early_failure.o
+	$(CXX) build/tests/test_raop_early_failure.o \
+		build/tests/raop_client_early_failure.o build/tests/cross_ssl.o \
+		$(filter-out $(BUILDDIR)/raop_client.o,$(CLIENT_TEST_OBJECTS)) \
+		$(LIBCODECS_PATCHED) $(MDNS)/$(HOST)/$(PLATFORM)/libmdns.a \
 		$(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
 
 .PHONY: all directory clean test

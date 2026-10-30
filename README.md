@@ -349,7 +349,21 @@ make test STATIC=1
 ```
 
 Requires the libraop submodule with pre-built static libraries (OpenSSL,
-libcodecs, libmdns).
+libcodecs, libmdns), plus `patch`. The build applies
+`patches/libraop-raop-client-thread-join.patch` to `build/patched/raop_client.c`,
+leaving the pinned submodule source unchanged. Both legacy RAOP and AirPlay 2
+RAOP-compat use this copy: failed connects only join successfully created RTP
+threads, and repeated cleanup does not rejoin them. A failed `pthread_create`
+also fails the connect cleanly. A second build-local patch,
+`patches/libraop-rtsp-setup-cleanup.patch`, frees the SETUP request's Transport
+header on failure; the SETUP 500 sanitizer regression exposed that leak.
+
+`make test STATIC=1` checks real loopback refusal, ANNOUNCE 401, peer close,
+SETUP failure, injected thread-creation failures, reconnect/repair, and reaping
+already-exited threads. It also runs both CLI routes against refusal/401/close,
+requiring exit code 1, a `connect_failed` status, and command FIFO removal.
+The same suite runs under ASan/UBSan on Linux with
+`make test STATIC=1 CC=gcc CXX=g++ SANITIZE=address,undefined` after `make clean`.
 
 ## Platforms and CI
 

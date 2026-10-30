@@ -1,0 +1,58 @@
+diff --git a/src/raop_client.c b/src/raop_client.c
+index 84a60a5..00acfad 100644
+--- a/src/raop_client.c
++++ b/src/raop_client.c
+@@ -162,6 +162,8 @@ typedef struct raopcl_s {
+ 	uint32_t latency_frames;
+ 	int chunk_len;
+ 	pthread_t time_thread, ctrl_thread;
++	// set only once pthread_create succeeded, so terminate never joins a zeroed pthread_t
++	bool time_started, ctrl_started;
+ 	pthread_mutex_t mutex;
+ 	bool time_running, ctrl_running;
+ 	int sample_rate, sample_size, channels;
+@@ -735,10 +737,16 @@ static void _raopcl_terminate_rtp(struct raopcl_s *p)
+ {
+ 	// Terminate RTP threads and close sockets
+ 	p->ctrl_running = false;
+-	pthread_join(p->ctrl_thread, NULL);
++	if (p->ctrl_started) {
++		pthread_join(p->ctrl_thread, NULL);
++		p->ctrl_started = false;
++	}
+ 
+ 	p->time_running = false;
+-	pthread_join(p->time_thread, NULL);
++	if (p->time_started) {
++		pthread_join(p->time_thread, NULL);
++		p->time_started = false;
++	}
+ 
+ 	if (p->rtp_ports.ctrl.fd != -1) closesocket(p->rtp_ports.ctrl.fd);
+ 	if (p->rtp_ports.time.fd != -1) closesocket(p->rtp_ports.time.fd);
+@@ -1033,7 +1041,11 @@ bool raopcl_connect(struct raopcl_s *p, struct in_addr peer, uint16_t destport,
+ 	if (p->rtp_ports.time.fd < 0) goto erexit;
+ 
+ 	p->time_running = true;
+-	pthread_create(&p->time_thread, NULL, _rtp_timing_thread, (void*) p);
++	if (pthread_create(&p->time_thread, NULL, _rtp_timing_thread, (void*) p)) {
++		p->time_running = false;
++		goto erexit;
++	}
++	p->time_started = true;
+ 
+ 	// RTSP ANNOUNCE
+ 	if (p->auth && p->crypto) {
+@@ -1077,7 +1089,11 @@ bool raopcl_connect(struct raopcl_s *p, struct in_addr peer, uint16_t destport,
+ 	kd_free(kd);
+ 
+ 	p->ctrl_running = true;
+-	pthread_create(&p->ctrl_thread, NULL, _rtp_control_thread, (void*) p);
++	if (pthread_create(&p->ctrl_thread, NULL, _rtp_control_thread, (void*) p)) {
++		p->ctrl_running = false;
++		goto erexit;
++	}
++	p->ctrl_started = true;
+ 
+ 	pthread_mutex_lock(&p->mutex);
+ 	// as connect might take time, state might already have been set

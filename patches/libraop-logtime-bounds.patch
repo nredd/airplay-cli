@@ -1,0 +1,17 @@
+--- a/crosstools/src/cross_log.c
++++ b/crosstools/src/cross_log.c
+@@ -29,12 +29,12 @@
+ #ifdef _WIN32
+ 	SYSTEMTIME lt;
+ 	GetLocalTime(&lt);
+-	sprintf(buf, "[%02d:%02d:%02d.%03d]", lt.wHour, lt.wMinute, lt.wSecond, lt.wMilliseconds);
++	snprintf(buf, sizeof(buf), "[%02d:%02d:%02d.%03d]", lt.wHour, lt.wMinute, lt.wSecond, lt.wMilliseconds);
+ #else
+ 	struct timeval tv;
+ 	gettimeofday(&tv, NULL);
+ 	strftime(buf, sizeof(buf), "[%T.", localtime(&tv.tv_sec));
+-	sprintf(buf+strlen(buf), "%03ld]", (long)tv.tv_usec/1000);
++	snprintf(buf+strlen(buf), sizeof(buf)-strlen(buf), "%03ld]", (long)tv.tv_usec/1000);
+ #endif
+ 	return buf;
+ }

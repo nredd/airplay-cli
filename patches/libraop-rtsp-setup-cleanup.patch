@@ -1,6 +1,14 @@
 --- a/src/rtsp_client.c
 +++ b/src/rtsp_client.c
-@@ -248,8 +248,9 @@ bool rtspcl_setup(struct rtspcl_s *p, struct rtp_port_s *port, key_data_t *rkd) {
+@@ -28,6 +28,7 @@
+ #include "cross_util.h"
+ #include "cross_log.h"
+ #include "rtsp_client.h"
++#include "raop_response.h"
+ 
+ #define PUBLIC_KEY_SIZE 32
+ #define SECRET_KEY_SIZE 32
+@@ -248,8 +249,9 @@
  	if (!hds[0].data) return false;
  	hds[1].key = NULL;
  
@@ -11,3 +19,22 @@
  
  	if ((temp = kd_lookup(rkd, "Session")) != NULL) {
  		p->session = strdup(strtrim(temp));
+@@ -650,10 +652,17 @@
+ 	}
+ 
+ 	if (!get_response) return true;
++	if (get_response == 1)
++		return raop_read_required_response(&rtspcld->fd, rkd, resp_content, resp_len);
+ 
+ 	if (http_read_line(rtspcld->fd, line, sizeof(line), timeout, true) <= 0) {
+ 		LOG_ERROR("[%p]: response : %s request failed", rtspcld, line);
+-		if (get_response == 1) return false;
++		if (get_response == 1) {
++			/* A failed required response cannot be reused during cleanup. */
++			closesocket(rtspcld->fd);
++			rtspcld->fd = -1;
++			return false;
++		}
+ 		else return true;
+ 	}
+ 

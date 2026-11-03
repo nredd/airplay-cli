@@ -128,7 +128,7 @@ AP2_SOURCES = ap2_client.c ap2_hap.c ap2_io.c ap2_ptp.c ap2_ptp_shm.c ap2_plist.
 
 # Common/CLI sources
 CLI_SOURCES = cross_log.c cross_ssl.c cross_util.c cross_net.c platform.c host_clock.c \
-	cliairplay.c raop_session.c artwork.c announce.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
+	cliairplay.c net_address.c raop_response.c raop_session.c artwork.c announce.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
 
 # Pre-built static libraries
 # We use a patched copy of libcodecs.a with the buggy alac_create_encoder removed,
@@ -191,6 +191,10 @@ RAOP_CLIENT_PATCH = patches/libraop-raop-client-thread-join.patch
 RAOP_CLIENT_PATCHED = build/patched/raop_client.c
 RTSP_CLIENT_PATCH = patches/libraop-rtsp-setup-cleanup.patch
 RTSP_CLIENT_PATCHED = build/patched/rtsp_client.c
+CROSS_NET_PATCH = patches/libraop-http-read-poll.patch
+CROSS_NET_PATCHED = build/patched/cross_net.c
+CROSS_LOG_PATCH = patches/libraop-logtime-bounds.patch
+CROSS_LOG_PATCHED = build/patched/cross_log.c
 
 all: directory $(EXECUTABLE)
 
@@ -238,6 +242,20 @@ $(RAOP_CLIENT_PATCHED): $(LIBRAOP)/src/raop_client.c $(RAOP_CLIENT_PATCH)
 $(RTSP_CLIENT_PATCHED): $(LIBRAOP)/src/rtsp_client.c $(RTSP_CLIENT_PATCH)
 	@mkdir -p $(dir $@)
 	patch -s -o $@ $< $(RTSP_CLIENT_PATCH)
+
+$(CROSS_NET_PATCHED): $(TOOLS)/cross_net.c $(CROSS_NET_PATCH)
+	@mkdir -p $(dir $@)
+	patch -s -o $@ $< $(CROSS_NET_PATCH)
+
+$(BUILDDIR)/cross_net.o: $(CROSS_NET_PATCHED)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
+
+$(CROSS_LOG_PATCHED): $(TOOLS)/cross_log.c $(CROSS_LOG_PATCH)
+	@mkdir -p $(dir $@)
+	patch -s -o $@ $< $(CROSS_LOG_PATCH)
+
+$(BUILDDIR)/cross_log.o: $(CROSS_LOG_PATCHED)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
 
 $(BUILDDIR)/rtsp_client.o: $(RTSP_CLIENT_PATCHED)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
@@ -328,22 +346,22 @@ $(ANNOUNCE_TEST): tests/test_announce.c src/announce.c src/announce.h Makefile
 		$(EXTRA_LDFLAGS) -lm -o $@
 
 $(SESSION_TEST): tests/test_ap2_session.c src/ap2_session.c src/ap2_session.h \
-		src/ap2_io.c src/ap2_io.h Makefile
+		src/ap2_io.c src/ap2_io.h $(CROSS_LOG_PATCHED) Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(TEST_CFLAGS) $(INCLUDE) -Dpoll=ap2_session_test_poll \
 		-c src/ap2_session.c -o build/tests/ap2_session_fifo_test.o
 	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_ap2_session.c \
-		build/tests/ap2_session_fifo_test.o src/ap2_io.c $(TOOLS)/cross_log.c \
+		build/tests/ap2_session_fifo_test.o src/ap2_io.c $(CROSS_LOG_PATCHED) \
 		$(EXTRA_LDFLAGS) -lpthread -o $@
 
 # ap2_ptp.c binds ephemeral ports and records datagrams instead of sending them.
 $(PTP_TEST): tests/test_ap2_ptp.c src/ap2_ptp.c src/ap2_ptp.h src/ap2_ptp_shm.c \
-		src/ap2_ptp_shm.h src/host_clock.c src/host_clock.h Makefile
+		src/ap2_ptp_shm.h src/host_clock.c src/host_clock.h $(CROSS_LOG_PATCHED) Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -Dbind=ap2_ptp_test_bind \
 		-Dsendto=ap2_ptp_test_sendto -c src/ap2_ptp.c -o build/tests/ap2_ptp_test.o
 	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_ap2_ptp.c \
-		build/tests/ap2_ptp_test.o src/ap2_ptp_shm.c src/host_clock.c $(TOOLS)/cross_log.c \
+		build/tests/ap2_ptp_test.o src/ap2_ptp_shm.c src/host_clock.c $(CROSS_LOG_PATCHED) \
 		$(LDFLAGS) -o $@
 
 $(TIMELINE_TEST): tests/test_ap2_timeline.c src/ap2_timeline.h Makefile
@@ -409,3 +427,65 @@ $(RAOP_EARLY_FAILURE_TEST): tests/test_raop_early_failure.c \
 		$(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
 
 .PHONY: all directory clean test
+
+CLI_STOP_HEALTH_TEST = build/tests/test_cli_stop_health
+$(CLI_STOP_HEALTH_TEST): tests/test_cli_stop_health.c src/cliairplay.c \
+		$(filter-out $(BUILDDIR)/cliairplay.o,$(OBJECTS_ALL)) $(LIBCODECS_PATCHED)
+	@mkdir -p build/tests
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o build/tests/test_cli_stop_health.o
+	$(CXX) build/tests/test_cli_stop_health.o \
+		$(filter-out $(BUILDDIR)/cliairplay.o,$(OBJECTS_ALL)) $(LIBRARY) $(LDFLAGS) -o $@
+
+test-stop-health: directory $(CLI_STOP_HEALTH_TEST)
+	$(CLI_STOP_HEALTH_TEST)
+
+test: test-stop-health
+.PHONY: test-stop-health
+
+NET_ADDRESS_TEST = build/tests/test_net_address
+$(NET_ADDRESS_TEST): tests/test_net_address.c src/net_address.c src/net_address.h Makefile
+	@mkdir -p build/tests
+	$(CC) $(TEST_CFLAGS) -Isrc -Dgetaddrinfo=test_getaddrinfo \
+		-Dfreeaddrinfo=test_freeaddrinfo -c src/net_address.c -o build/tests/net_address_test.o
+	$(CC) $(TEST_CFLAGS) -Isrc tests/test_net_address.c build/tests/net_address_test.o \
+		$(EXTRA_LDFLAGS) -o $@
+
+test-net-address: $(NET_ADDRESS_TEST)
+	$(NET_ADDRESS_TEST)
+
+test: test-net-address
+.PHONY: test-net-address
+
+# Link the full production translation unit, not a copied read implementation.
+# Dead stripping keeps unrelated network utilities out of this focused fixture.
+ifeq ($(HOST),macos)
+HTTP_TEST_GC = -Wl,-dead_strip
+else
+HTTP_TEST_GC = -Wl,--gc-sections
+endif
+HTTP_READ_SOURCE ?= $(CROSS_NET_PATCHED)
+build/tests/cross_net_read_test.o: $(HTTP_READ_SOURCE) tests/http_read_hooks.h Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -include tests/http_read_hooks.h $< -c -o $@
+
+build/tests/test_http_read_line: tests/test_http_read_line.c build/tests/cross_net_read_test.o $(BUILDDIR)/cross_log.o Makefile
+	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_http_read_line.c build/tests/cross_net_read_test.o $(BUILDDIR)/cross_log.o $(HTTP_TEST_GC) $(LDFLAGS) -o $@
+
+test-http-read: directory build/tests/test_http_read_line
+	build/tests/test_http_read_line
+
+.PHONY: test-http-read
+test: test-http-read
+
+build/tests/rtsp_response_fixture.o: tests/rtsp_response_fixture.c tests/rtsp_response_fixture.h src/raop_response.c src/raop_response.h $(RTSP_CLIENT_PATCHED) Makefile
+	@mkdir -p build/tests
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -c $< -o $@
+
+build/tests/test_rtsp_response_failure: tests/test_rtsp_response_failure.c $(RTSP_CLIENT_PATCHED) build/tests/rtsp_response_fixture.o $(BUILDDIR)/cross_net.o $(BUILDDIR)/cross_util.o $(BUILDDIR)/cross_log.o Makefile
+	$(CC) $(TEST_CFLAGS) -DOPENSSL_SUPPRESS_DEPRECATED $(INCLUDE) -ffunction-sections -fdata-sections tests/test_rtsp_response_failure.c build/tests/rtsp_response_fixture.o $(BUILDDIR)/cross_net.o $(BUILDDIR)/cross_util.o $(BUILDDIR)/cross_log.o $(OPENSSL)/libopenssl.a $(HTTP_TEST_GC) $(LDFLAGS) -o $@
+
+test-rtsp-response: directory build/tests/test_rtsp_response_failure
+	build/tests/test_rtsp_response_failure
+
+.PHONY: test-rtsp-response
+test: test-rtsp-response

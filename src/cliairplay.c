@@ -36,6 +36,7 @@
 #include "cross_util.h"
 #include "cross_log.h"
 #include "ap2_client.h"
+#include "net_address.h"
 #include "ap2_session.h"
 #include "ap2_io.h"
 #include "ap2_ptp.h"
@@ -1266,7 +1267,6 @@ static bool start_stream_session(cli_config_t *cfg, int input_bpf,
 static int run_raop(cli_config_t *cfg)
 {
     struct in_addr host_addr, player_addr;
-    struct hostent *hostent;
     uint32_t netmask;
     char *iface = NULL;
     raop_crypto_t crypto = RAOP_CLEAR;
@@ -1277,14 +1277,12 @@ static int run_raop(cli_config_t *cfg)
     NFREE(iface);
 
     /* Resolve player */
-    hostent = gethostbyname(cfg->host);
-    if (!hostent) {
+    if (!resolve_ipv4_address(cfg->host, &player_addr)) {
         status_error_ex(ERROR_CODE_CONNECT_FAILED, 0,
                         "cannot resolve the device hostname",
                         "Cannot resolve hostname");
         return 1;
     }
-    memcpy(&player_addr.s_addr, hostent->h_addr_list[0], hostent->h_length);
 
     /* Encryption setup */
     if ((cfg->encrypt) && cfg->et && strchr(cfg->et, '1'))
@@ -1537,6 +1535,22 @@ static bool ap2_send_silence_chunk(const cli_config_t *cfg, uint8_t *buf,
            AP2_SEND_FATAL;
 }
 
+/* STOP and the health decision share the send lock: a completed STOP makes
+ * the transport disconnected intentionally, not a playback failure. */
+static bool airplay2_should_exit(bool *playback_failed)
+{
+    pthread_mutex_lock(&g_audio_send_lock);
+    bool stopped = g_status == STATUS_STOPPED;
+    bool control_failed = !stopped &&
+        (!ap2cl_is_connected(g_ap2cl) || !ap2cl_control_healthy(g_ap2cl));
+    pthread_mutex_unlock(&g_audio_send_lock);
+    if (control_failed) {
+        status_error("AirPlay 2 control channel failed");
+        *playback_failed = true;
+    }
+    return stopped || control_failed;
+}
+
 static int run_airplay2(cli_config_t *cfg)
 {
     ap2_device_info_t device = {
@@ -1686,12 +1700,7 @@ static int run_airplay2(cli_config_t *cfg)
         if (ap2_session_state(g_session) == AP2_SESSION_ENDED)
             break;   /* DISCONNECT or idle timeout */
 
-        if (!ap2cl_is_connected(g_ap2cl) ||
-            !ap2cl_control_healthy(g_ap2cl)) {
-            status_error("AirPlay 2 control channel failed");
-            playback_failed = true;
-            break;
-        }
+        if (airplay2_should_exit(&playback_failed)) break;
 
         /* Each START bumps the epoch; elapsed restarts at the new anchor. */
         uint64_t epoch = ap2_session_epoch(g_session);

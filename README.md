@@ -289,6 +289,9 @@ stdin, the single persistent audio input for the whole process lifetime.
   artwork on its own, outside a track change.
 
 `[STATUS] stopped` acknowledges `ACTION=STOP` once playback has been torn down.
+The main-loop control-health decision is synchronized with STOP, so its intentional
+disconnection is not reported as a control-channel failure.
+
 `STOP` is terminal: the audio loop exits, the connection is torn down and the
 process exits 0, the same shape as `ACTION=DISCONNECT`. To keep a session
 reusable, use `ACTION=FLUSH` (warm seek/next) or `ACTION=STANDBY` (warm park) —
@@ -357,6 +360,40 @@ threads, and repeated cleanup does not rejoin them. A failed `pthread_create`
 also fails the connect cleanly. A second build-local patch,
 `patches/libraop-rtsp-setup-cleanup.patch`, frees the SETUP request's Transport
 header on failure; the SETUP 500 sanitizer regression exposed that leak.
+`patches/libraop-logtime-bounds.patch` bounds timestamp formatting with
+`snprintf`, including the Windows path. Production and tests compile the same
+build-local logging source; pinned dependency files remain unchanged. This also
+keeps sanitizer builds compatible with SDKs that deprecate `sprintf`.
+
+`make test-stop-health STATIC=1` compiles the CLI source and exercises its STOP
+handler on a command thread before the main-loop health decision. It verifies
+that intentional STOP exits cleanly while real control failures still fail.
+This regression also runs in the full test target.
+
+Both RAOP connection paths resolve IPv4 destinations through `getaddrinfo`,
+copying a validated IPv4 socket address rather than dereferencing legacy
+`hostent` pointer storage. `make test-net-address STATIC=1` covers resolver errors,
+invalid address records and bounded copying; the full loopback suite exercises
+real numeric-host resolution.
+
+The RTSP patch also closes a connection when a required initial response read
+returns timeout, EOF, or error. The response boundary is then unknown, so
+cleanup must not send FLUSH/TEARDOWN and wait again on that stream. Complete
+RTSP error responses and optional-response requests retain their existing
+handling. The build-local
+`libraop-http-read-poll.patch` prevents failed or interrupted `poll()` calls
+from entering a blocking `recv()` without readiness.
+
+`make test-http-read test-rtsp-response STATIC=1` exercises actual dependency
+source with deterministic syscall/response seams. It checks interrupted and
+failed polling, timeout, normal reads, EOF and EAGAIN, plus RTSP timeout/error
+invalidation, normal 200/401 responses, and unchanged optional-response
+handling. These are also part of `make test`.
+They do not establish a total handshake deadline or reliable signal
+cancellation: per-character/header waits, body reads, and signal delivery
+remain separate concerns. Positive line reads are not newly validated for
+newline termination by this patch. Closing a failed transport proves local resource
+release, not receiver teardown.
 
 `make test STATIC=1` checks real loopback refusal, ANNOUNCE 401, peer close,
 SETUP failure, injected thread-creation failures, reconnect/repair, and reaping
@@ -409,6 +446,35 @@ src/ap2_ptp_shm.c     Shared PTP clock: POSIX shm double-buffer + control channe
 src/alac_ext.cpp      ALAC encoder override with proper 24-bit support
 libraop/              Upstream philippe44/libraop (RAOP protocol + crypto)
 ```
+
+### Required RAOP response deadline
+
+The build-local RTSP adapter routes required responses (`get_response == 1`)
+through `src/raop_response.c`. It uses the existing shared `ap2_io` monotonic
+clock and nonblocking deadline reads: one ten-second budget spans status,
+headers, and body. Bytes arriving slowly do not reset that budget. An incomplete
+status/header/body, allocation failure, invalid length, or malformed response
+closes and invalidates the local transport. Partial headers/body are released;
+no partial body or advertised-but-unread body length is returned. Complete
+non-200 responses are drained within the same budget and return false while
+retaining the transport, including OPTIONS 501 keepalive responses.
+
+Limits are 2047 bytes per line, 64 KiB total status/header wire bytes, 63 headers,
+and a 1 MiB body. Status lines require RTSP/1.0; lines require exact CRLF.
+Invalid header-name tokens, negative, malformed, duplicate or oversized
+Content-Length and folded headers fail closed. These are explicit supported-response limits,
+not observed receiver capabilities. Optional metadata/auth-challenge response
+handling remains on the existing path. Connection establishment, request
+writes, optional responses, and reliable external-signal cancellation remain
+outside this response deadline. Closing a transport is not wire TEARDOWN or
+proof of receiver restoration.
+
+`make test-rtsp-response STATIC=1` compiles the actual RTSP adapter and response
+reader with deterministic byte/time seams. It checks complete and truncated
+bodies, missing header termination, trickled data crossing the absolute budget,
+length bounds/syntax/duplicates, empty bodies, error statuses, partial status
+lines and folded headers. Production source uses production compiler flags;
+the assertions compile separately with `-Wall -Wextra -Werror`.
 
 ## Credits and references
 

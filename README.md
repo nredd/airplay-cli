@@ -360,6 +360,10 @@ threads, and repeated cleanup does not rejoin them. A failed `pthread_create`
 also fails the connect cleanly. A second build-local patch,
 `patches/libraop-rtsp-setup-cleanup.patch`, frees the SETUP request's Transport
 header on failure; the SETUP 500 sanitizer regression exposed that leak.
+`patches/libraop-logtime-bounds.patch` bounds timestamp formatting with
+`snprintf`, including the Windows path. Production and tests compile the same
+build-local logging source; pinned dependency files remain unchanged. This also
+keeps sanitizer builds compatible with SDKs that deprecate `sprintf`.
 
 `make test-stop-health STATIC=1` compiles the CLI source and exercises its STOP
 handler on a command thread before the main-loop health decision. It verifies

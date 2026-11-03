@@ -191,6 +191,8 @@ RAOP_CLIENT_PATCH = patches/libraop-raop-client-thread-join.patch
 RAOP_CLIENT_PATCHED = build/patched/raop_client.c
 RTSP_CLIENT_PATCH = patches/libraop-rtsp-setup-cleanup.patch
 RTSP_CLIENT_PATCHED = build/patched/rtsp_client.c
+CROSS_LOG_PATCH = patches/libraop-logtime-bounds.patch
+CROSS_LOG_PATCHED = build/patched/cross_log.c
 
 all: directory $(EXECUTABLE)
 
@@ -238,6 +240,13 @@ $(RAOP_CLIENT_PATCHED): $(LIBRAOP)/src/raop_client.c $(RAOP_CLIENT_PATCH)
 $(RTSP_CLIENT_PATCHED): $(LIBRAOP)/src/rtsp_client.c $(RTSP_CLIENT_PATCH)
 	@mkdir -p $(dir $@)
 	patch -s -o $@ $< $(RTSP_CLIENT_PATCH)
+
+$(CROSS_LOG_PATCHED): $(TOOLS)/cross_log.c $(CROSS_LOG_PATCH)
+	@mkdir -p $(dir $@)
+	patch -s -o $@ $< $(CROSS_LOG_PATCH)
+
+$(BUILDDIR)/cross_log.o: $(CROSS_LOG_PATCHED)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
 
 $(BUILDDIR)/rtsp_client.o: $(RTSP_CLIENT_PATCHED)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
@@ -328,22 +337,22 @@ $(ANNOUNCE_TEST): tests/test_announce.c src/announce.c src/announce.h Makefile
 		$(EXTRA_LDFLAGS) -lm -o $@
 
 $(SESSION_TEST): tests/test_ap2_session.c src/ap2_session.c src/ap2_session.h \
-		src/ap2_io.c src/ap2_io.h Makefile
+		src/ap2_io.c src/ap2_io.h $(CROSS_LOG_PATCHED) Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(TEST_CFLAGS) $(INCLUDE) -Dpoll=ap2_session_test_poll \
 		-c src/ap2_session.c -o build/tests/ap2_session_fifo_test.o
 	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_ap2_session.c \
-		build/tests/ap2_session_fifo_test.o src/ap2_io.c $(TOOLS)/cross_log.c \
+		build/tests/ap2_session_fifo_test.o src/ap2_io.c $(CROSS_LOG_PATCHED) \
 		$(EXTRA_LDFLAGS) -lpthread -o $@
 
 # ap2_ptp.c binds ephemeral ports and records datagrams instead of sending them.
 $(PTP_TEST): tests/test_ap2_ptp.c src/ap2_ptp.c src/ap2_ptp.h src/ap2_ptp_shm.c \
-		src/ap2_ptp_shm.h src/host_clock.c src/host_clock.h Makefile
+		src/ap2_ptp_shm.h src/host_clock.c src/host_clock.h $(CROSS_LOG_PATCHED) Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -Dbind=ap2_ptp_test_bind \
 		-Dsendto=ap2_ptp_test_sendto -c src/ap2_ptp.c -o build/tests/ap2_ptp_test.o
 	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_ap2_ptp.c \
-		build/tests/ap2_ptp_test.o src/ap2_ptp_shm.c src/host_clock.c $(TOOLS)/cross_log.c \
+		build/tests/ap2_ptp_test.o src/ap2_ptp_shm.c src/host_clock.c $(CROSS_LOG_PATCHED) \
 		$(LDFLAGS) -o $@
 
 $(TIMELINE_TEST): tests/test_ap2_timeline.c src/ap2_timeline.h Makefile

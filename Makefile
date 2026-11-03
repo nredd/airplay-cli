@@ -128,7 +128,7 @@ AP2_SOURCES = ap2_client.c ap2_hap.c ap2_io.c ap2_ptp.c ap2_ptp_shm.c ap2_plist.
 
 # Common/CLI sources
 CLI_SOURCES = cross_log.c cross_ssl.c cross_util.c cross_net.c platform.c host_clock.c \
-	cliairplay.c net_address.c raop_session.c artwork.c announce.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
+	cliairplay.c net_address.c raop_response.c raop_session.c artwork.c announce.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
 
 # Pre-built static libraries
 # We use a patched copy of libcodecs.a with the buggy alac_create_encoder removed,
@@ -477,7 +477,7 @@ test-http-read: directory build/tests/test_http_read_line
 .PHONY: test-http-read
 test: test-http-read
 
-build/tests/rtsp_response_fixture.o: tests/rtsp_response_fixture.c tests/rtsp_response_fixture.h $(RTSP_CLIENT_PATCHED) Makefile
+build/tests/rtsp_response_fixture.o: tests/rtsp_response_fixture.c tests/rtsp_response_fixture.h src/raop_response.c src/raop_response.h $(RTSP_CLIENT_PATCHED) Makefile
 	@mkdir -p build/tests
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -c $< -o $@
 

@@ -447,6 +447,35 @@ src/alac_ext.cpp      ALAC encoder override with proper 24-bit support
 libraop/              Upstream philippe44/libraop (RAOP protocol + crypto)
 ```
 
+### Required RAOP response deadline
+
+The build-local RTSP adapter routes required responses (`get_response == 1`)
+through `src/raop_response.c`. It uses the existing shared `ap2_io` monotonic
+clock and nonblocking deadline reads: one ten-second budget spans status,
+headers, and body. Bytes arriving slowly do not reset that budget. An incomplete
+status/header/body, allocation failure, invalid length, or malformed response
+closes and invalidates the local transport. Partial headers/body are released;
+no partial body or advertised-but-unread body length is returned. Complete
+non-200 responses are drained within the same budget and return false while
+retaining the transport, including OPTIONS 501 keepalive responses.
+
+Limits are 2047 bytes per line, 64 KiB total status/header wire bytes, 63 headers,
+and a 1 MiB body. Status lines require RTSP/1.0; lines require exact CRLF.
+Invalid header-name tokens, negative, malformed, duplicate or oversized
+Content-Length and folded headers fail closed. These are explicit supported-response limits,
+not observed receiver capabilities. Optional metadata/auth-challenge response
+handling remains on the existing path. Connection establishment, request
+writes, optional responses, and reliable external-signal cancellation remain
+outside this response deadline. Closing a transport is not wire TEARDOWN or
+proof of receiver restoration.
+
+`make test-rtsp-response STATIC=1` compiles the actual RTSP adapter and response
+reader with deterministic byte/time seams. It checks complete and truncated
+bodies, missing header termination, trickled data crossing the absolute budget,
+length bounds/syntax/duplicates, empty bodies, error statuses, partial status
+lines and folded headers. Production source uses production compiler flags;
+the assertions compile separately with `-Wall -Wextra -Werror`.
+
 ## Credits and references
 
 This binary follows the trail blazed by **Brad Keifer**

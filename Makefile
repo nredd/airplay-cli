@@ -409,3 +409,18 @@ $(RAOP_EARLY_FAILURE_TEST): tests/test_raop_early_failure.c \
 		$(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
 
 .PHONY: all directory clean test
+
+CLI_STOP_HEALTH_TEST = build/tests/test_cli_stop_health
+$(CLI_STOP_HEALTH_TEST): tests/test_cli_stop_health.c src/cliairplay.c \
+		$(filter-out $(BUILDDIR)/cliairplay.o,$(OBJECTS_ALL)) $(LIBCODECS_PATCHED)
+	@mkdir -p build/tests
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o build/tests/test_cli_stop_health.o
+	$(CXX) build/tests/test_cli_stop_health.o \
+		$(filter-out $(BUILDDIR)/cliairplay.o,$(OBJECTS_ALL)) $(LIBRARY) $(LDFLAGS) -o $@
+
+test-stop-health: directory $(CLI_STOP_HEALTH_TEST)
+	$(CLI_STOP_HEALTH_TEST)
+
+test: test-stop-health
+.PHONY: test-stop-health
+

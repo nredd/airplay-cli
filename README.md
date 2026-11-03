@@ -289,6 +289,9 @@ stdin, the single persistent audio input for the whole process lifetime.
   artwork on its own, outside a track change.
 
 `[STATUS] stopped` acknowledges `ACTION=STOP` once playback has been torn down.
+The main-loop control-health decision is synchronized with STOP, so its intentional
+disconnection is not reported as a control-channel failure.
+
 `STOP` is terminal: the audio loop exits, the connection is torn down and the
 process exits 0, the same shape as `ACTION=DISCONNECT`. To keep a session
 reusable, use `ACTION=FLUSH` (warm seek/next) or `ACTION=STANDBY` (warm park) —
@@ -357,6 +360,11 @@ threads, and repeated cleanup does not rejoin them. A failed `pthread_create`
 also fails the connect cleanly. A second build-local patch,
 `patches/libraop-rtsp-setup-cleanup.patch`, frees the SETUP request's Transport
 header on failure; the SETUP 500 sanitizer regression exposed that leak.
+
+`make test-stop-health STATIC=1` compiles the CLI source and exercises its STOP
+handler on a command thread before the main-loop health decision. It verifies
+that intentional STOP exits cleanly while real control failures still fail.
+This regression also runs in the full test target.
 
 `make test STATIC=1` checks real loopback refusal, ANNOUNCE 401, peer close,
 SETUP failure, injected thread-creation failures, reconnect/repair, and reaping

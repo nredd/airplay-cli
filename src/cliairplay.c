@@ -1537,6 +1537,22 @@ static bool ap2_send_silence_chunk(const cli_config_t *cfg, uint8_t *buf,
            AP2_SEND_FATAL;
 }
 
+/* STOP and the health decision share the send lock: a completed STOP makes
+ * the transport disconnected intentionally, not a playback failure. */
+static bool airplay2_should_exit(bool *playback_failed)
+{
+    pthread_mutex_lock(&g_audio_send_lock);
+    bool stopped = g_status == STATUS_STOPPED;
+    bool control_failed = !stopped &&
+        (!ap2cl_is_connected(g_ap2cl) || !ap2cl_control_healthy(g_ap2cl));
+    pthread_mutex_unlock(&g_audio_send_lock);
+    if (control_failed) {
+        status_error("AirPlay 2 control channel failed");
+        *playback_failed = true;
+    }
+    return stopped || control_failed;
+}
+
 static int run_airplay2(cli_config_t *cfg)
 {
     ap2_device_info_t device = {
@@ -1686,12 +1702,7 @@ static int run_airplay2(cli_config_t *cfg)
         if (ap2_session_state(g_session) == AP2_SESSION_ENDED)
             break;   /* DISCONNECT or idle timeout */
 
-        if (!ap2cl_is_connected(g_ap2cl) ||
-            !ap2cl_control_healthy(g_ap2cl)) {
-            status_error("AirPlay 2 control channel failed");
-            playback_failed = true;
-            break;
-        }
+        if (airplay2_should_exit(&playback_failed)) break;
 
         /* Each START bumps the epoch; elapsed restarts at the new anchor. */
         uint64_t epoch = ap2_session_epoch(g_session);

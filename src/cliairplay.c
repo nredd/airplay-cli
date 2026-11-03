@@ -36,6 +36,7 @@
 #include "cross_util.h"
 #include "cross_log.h"
 #include "ap2_client.h"
+#include "net_address.h"
 #include "ap2_session.h"
 #include "ap2_io.h"
 #include "ap2_ptp.h"
@@ -1266,7 +1267,6 @@ static bool start_stream_session(cli_config_t *cfg, int input_bpf,
 static int run_raop(cli_config_t *cfg)
 {
     struct in_addr host_addr, player_addr;
-    struct hostent *hostent;
     uint32_t netmask;
     char *iface = NULL;
     raop_crypto_t crypto = RAOP_CLEAR;
@@ -1277,14 +1277,12 @@ static int run_raop(cli_config_t *cfg)
     NFREE(iface);
 
     /* Resolve player */
-    hostent = gethostbyname(cfg->host);
-    if (!hostent) {
+    if (!resolve_ipv4_address(cfg->host, &player_addr)) {
         status_error_ex(ERROR_CODE_CONNECT_FAILED, 0,
                         "cannot resolve the device hostname",
                         "Cannot resolve hostname");
         return 1;
     }
-    memcpy(&player_addr.s_addr, hostent->h_addr_list[0], hostent->h_length);
 
     /* Encryption setup */
     if ((cfg->encrypt) && cfg->et && strchr(cfg->et, '1'))

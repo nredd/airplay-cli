@@ -128,7 +128,7 @@ AP2_SOURCES = ap2_client.c ap2_hap.c ap2_io.c ap2_ptp.c ap2_ptp_shm.c ap2_plist.
 
 # Common/CLI sources
 CLI_SOURCES = cross_log.c cross_ssl.c cross_util.c cross_net.c platform.c host_clock.c \
-	cliairplay.c raop_session.c artwork.c announce.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
+	cliairplay.c net_address.c raop_session.c artwork.c announce.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
 
 # Pre-built static libraries
 # We use a patched copy of libcodecs.a with the buggy alac_create_encoder removed,
@@ -432,4 +432,19 @@ test-stop-health: directory $(CLI_STOP_HEALTH_TEST)
 
 test: test-stop-health
 .PHONY: test-stop-health
+
+
+NET_ADDRESS_TEST = build/tests/test_net_address
+$(NET_ADDRESS_TEST): tests/test_net_address.c src/net_address.c src/net_address.h Makefile
+	@mkdir -p build/tests
+	$(CC) $(TEST_CFLAGS) -Isrc -Dgetaddrinfo=test_getaddrinfo \
+		-Dfreeaddrinfo=test_freeaddrinfo -c src/net_address.c -o build/tests/net_address_test.o
+	$(CC) $(TEST_CFLAGS) -Isrc tests/test_net_address.c build/tests/net_address_test.o \
+		$(EXTRA_LDFLAGS) -o $@
+
+test-net-address: $(NET_ADDRESS_TEST)
+	$(NET_ADDRESS_TEST)
+
+test: test-net-address
+.PHONY: test-net-address
 

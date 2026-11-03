@@ -49,6 +49,7 @@
 #include "cross_log.h"
 #include "ap2_mrp.h"
 #include "ap2_client.h"
+#include "net_address.h"
 #include "ap2_hap.h"
 #include "ap2_io.h"
 #include "ap2_plist.h"
@@ -3115,9 +3116,7 @@ static bool ap2_raop_compat_connect(struct ap2cl_s *p)
     host_addr = get_interface(p->iface, &iface, &netmask);
     NFREE(iface);
 
-    struct hostent *hostent = gethostbyname(p->device.address);
-    if (!hostent) return false;
-    memcpy(&player_addr.s_addr, hostent->h_addr_list[0], hostent->h_length);
+    if (!resolve_ipv4_address(p->device.address, &player_addr)) return false;
 
     int latency_frames = MS2TS(p->lead_ms, p->format.sample_rate);
     bool mfi_auth = p->am && strcasestr(p->am, "airport");

@@ -370,6 +370,12 @@ handler on a command thread before the main-loop health decision. It verifies
 that intentional STOP exits cleanly while real control failures still fail.
 This regression also runs in the full test target.
 
+Both RAOP connection paths resolve IPv4 destinations through `getaddrinfo`,
+copying a validated IPv4 socket address rather than dereferencing legacy
+`hostent` pointer storage. `make test-net-address STATIC=1` covers resolver errors,
+invalid address records and bounded copying; the full loopback suite exercises
+real numeric-host resolution.
+
 `make test STATIC=1` checks real loopback refusal, ANNOUNCE 401, peer close,
 SETUP failure, injected thread-creation failures, reconnect/repair, and reaping
 already-exited threads. It also runs both CLI routes against refusal/401/close,

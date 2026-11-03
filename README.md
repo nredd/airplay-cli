@@ -376,6 +376,25 @@ copying a validated IPv4 socket address rather than dereferencing legacy
 invalid address records and bounded copying; the full loopback suite exercises
 real numeric-host resolution.
 
+The RTSP patch also closes a connection when a required initial response read
+returns timeout, EOF, or error. The response boundary is then unknown, so
+cleanup must not send FLUSH/TEARDOWN and wait again on that stream. Complete
+RTSP error responses and optional-response requests retain their existing
+handling. The build-local
+`libraop-http-read-poll.patch` prevents failed or interrupted `poll()` calls
+from entering a blocking `recv()` without readiness.
+
+`make test-http-read test-rtsp-response STATIC=1` exercises actual dependency
+source with deterministic syscall/response seams. It checks interrupted and
+failed polling, timeout, normal reads, EOF and EAGAIN, plus RTSP timeout/error
+invalidation, normal 200/401 responses, and unchanged optional-response
+handling. These are also part of `make test`.
+They do not establish a total handshake deadline or reliable signal
+cancellation: per-character/header waits, body reads, and signal delivery
+remain separate concerns. Positive line reads are not newly validated for
+newline termination by this patch. Closing a failed transport proves local resource
+release, not receiver teardown.
+
 `make test STATIC=1` checks real loopback refusal, ANNOUNCE 401, peer close,
 SETUP failure, injected thread-creation failures, reconnect/repair, and reaping
 already-exited threads. It also runs both CLI routes against refusal/401/close,

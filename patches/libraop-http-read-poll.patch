@@ -1,0 +1,19 @@
+--- a/crosstools/src/cross_net.c
++++ b/crosstools/src/cross_net.c
+@@ -1088,8 +1088,14 @@
+ 	pfds.events = POLLIN;
+ 
+ 	for (i = 0; i < maxlen; i++) {
+-		if (!polling || poll(&pfds, 1, timeout)) rval = recv(fd, &ch, 1, 0);
+-		else return 0;
++		if (polling) {
++			int ready = poll(&pfds, 1, timeout);
++			/* An interrupted/failed poll is not socket readiness. In particular,
++			 * do not enter a blocking recv after a termination signal. */
++			if (ready < 0) return -1;
++			if (ready == 0) return 0;
++		}
++		rval = recv(fd, &ch, 1, 0);
+ 
+ 		if (rval == -1) {
+ 			if (errno == EAGAIN) return 0;

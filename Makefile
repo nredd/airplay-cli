@@ -191,6 +191,8 @@ RAOP_CLIENT_PATCH = patches/libraop-raop-client-thread-join.patch
 RAOP_CLIENT_PATCHED = build/patched/raop_client.c
 RTSP_CLIENT_PATCH = patches/libraop-rtsp-setup-cleanup.patch
 RTSP_CLIENT_PATCHED = build/patched/rtsp_client.c
+CROSS_NET_PATCH = patches/libraop-http-read-poll.patch
+CROSS_NET_PATCHED = build/patched/cross_net.c
 CROSS_LOG_PATCH = patches/libraop-logtime-bounds.patch
 CROSS_LOG_PATCHED = build/patched/cross_log.c
 
@@ -240,6 +242,13 @@ $(RAOP_CLIENT_PATCHED): $(LIBRAOP)/src/raop_client.c $(RAOP_CLIENT_PATCH)
 $(RTSP_CLIENT_PATCHED): $(LIBRAOP)/src/rtsp_client.c $(RTSP_CLIENT_PATCH)
 	@mkdir -p $(dir $@)
 	patch -s -o $@ $< $(RTSP_CLIENT_PATCH)
+
+$(CROSS_NET_PATCHED): $(TOOLS)/cross_net.c $(CROSS_NET_PATCH)
+	@mkdir -p $(dir $@)
+	patch -s -o $@ $< $(CROSS_NET_PATCH)
+
+$(BUILDDIR)/cross_net.o: $(CROSS_NET_PATCHED)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
 
 $(CROSS_LOG_PATCHED): $(TOOLS)/cross_log.c $(CROSS_LOG_PATCH)
 	@mkdir -p $(dir $@)
@@ -433,7 +442,6 @@ test-stop-health: directory $(CLI_STOP_HEALTH_TEST)
 test: test-stop-health
 .PHONY: test-stop-health
 
-
 NET_ADDRESS_TEST = build/tests/test_net_address
 $(NET_ADDRESS_TEST): tests/test_net_address.c src/net_address.c src/net_address.h Makefile
 	@mkdir -p build/tests
@@ -448,3 +456,36 @@ test-net-address: $(NET_ADDRESS_TEST)
 test: test-net-address
 .PHONY: test-net-address
 
+# Link the full production translation unit, not a copied read implementation.
+# Dead stripping keeps unrelated network utilities out of this focused fixture.
+ifeq ($(HOST),macos)
+HTTP_TEST_GC = -Wl,-dead_strip
+else
+HTTP_TEST_GC = -Wl,--gc-sections
+endif
+HTTP_READ_SOURCE ?= $(CROSS_NET_PATCHED)
+build/tests/cross_net_read_test.o: $(HTTP_READ_SOURCE) tests/http_read_hooks.h Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -include tests/http_read_hooks.h $< -c -o $@
+
+build/tests/test_http_read_line: tests/test_http_read_line.c build/tests/cross_net_read_test.o $(BUILDDIR)/cross_log.o Makefile
+	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_http_read_line.c build/tests/cross_net_read_test.o $(BUILDDIR)/cross_log.o $(HTTP_TEST_GC) $(LDFLAGS) -o $@
+
+test-http-read: directory build/tests/test_http_read_line
+	build/tests/test_http_read_line
+
+.PHONY: test-http-read
+test: test-http-read
+
+build/tests/rtsp_response_fixture.o: tests/rtsp_response_fixture.c tests/rtsp_response_fixture.h $(RTSP_CLIENT_PATCHED) Makefile
+	@mkdir -p build/tests
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -c $< -o $@
+
+build/tests/test_rtsp_response_failure: tests/test_rtsp_response_failure.c $(RTSP_CLIENT_PATCHED) build/tests/rtsp_response_fixture.o $(BUILDDIR)/cross_net.o $(BUILDDIR)/cross_util.o $(BUILDDIR)/cross_log.o Makefile
+	$(CC) $(TEST_CFLAGS) -DOPENSSL_SUPPRESS_DEPRECATED $(INCLUDE) -ffunction-sections -fdata-sections tests/test_rtsp_response_failure.c build/tests/rtsp_response_fixture.o $(BUILDDIR)/cross_net.o $(BUILDDIR)/cross_util.o $(BUILDDIR)/cross_log.o $(OPENSSL)/libopenssl.a $(HTTP_TEST_GC) $(LDFLAGS) -o $@
+
+test-rtsp-response: directory build/tests/test_rtsp_response_failure
+	build/tests/test_rtsp_response_failure
+
+.PHONY: test-rtsp-response
+test: test-rtsp-response

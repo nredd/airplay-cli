@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -38,6 +39,64 @@ def require_rejection(binary: Path, args: list[str]) -> None:
         raise AssertionError(f"invalid attestation invocation succeeded: {args!r}")
 
 
+def require_hostname_cleanup(binary: Path, cmdpipe: Path) -> None:
+    """Require a hostname-resolved loopback connection and bounded FIFO cleanup."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(5)
+        process = subprocess.Popen(
+            [
+                str(binary),
+                "--protocol",
+                "raop",
+                "--port",
+                str(listener.getsockname()[1]),
+                "--cmdpipe",
+                str(cmdpipe),
+                "localhost",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        connected = False
+        timed_out = False
+        try:
+            try:
+                connection, _ = listener.accept()
+                with connection:
+                    connected = True
+            except TimeoutError:
+                timed_out = True
+                process.kill()
+            try:
+                stdout, stderr = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                process.kill()
+                stdout, stderr = process.communicate()
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+    if (
+        not connected
+        or timed_out
+        or process.returncode != 1
+        or b'[STATUS] error code=connect_failed http=0 detail="RAOP connect failed"'
+        not in stderr
+        or cmdpipe.exists()
+    ):
+        raise AssertionError(
+            "localhost resolution or failed-connection cleanup changed: "
+            f"connected={connected} timed_out={timed_out} "
+            f"status={process.returncode} fifo_exists={cmdpipe.exists()} "
+            f"stdout={stdout!r} stderr={stderr!r}"
+        )
+
+
 def main(binary: Path) -> None:
     """Validate parser rejection and Linux FD-bound acknowledgement semantics."""
     binary = binary.resolve(strict=True)
@@ -56,8 +115,9 @@ def main(binary: Path) -> None:
     result = invoke(binary, ["--help", "--attest-only"])
     if result.returncode == 0 or result.stdout:
         raise AssertionError("help bypassed attestation parser rejection")
+    with tempfile.TemporaryDirectory() as directory:
+        require_hostname_cleanup(binary, Path(directory) / "command")
     if sys.platform != "linux":
-
         return
 
     descriptor = os.open(binary, os.O_RDONLY)
@@ -67,7 +127,13 @@ def main(binary: Path) -> None:
             while block := stream.read(65536):
                 hasher.update(block)
         digest = hasher.hexdigest()
-        args = ["--attest-fd", str(descriptor), "--attest-nonce", NONCE, "--attest-only"]
+        args = [
+            "--attest-fd",
+            str(descriptor),
+            "--attest-nonce",
+            NONCE,
+            "--attest-only",
+        ]
         result = invoke(binary, args, descriptor)
         if result.returncode != 0 or result.stderr:
             raise AssertionError("FD-bound image acknowledgement failed")
@@ -94,38 +160,26 @@ def main(binary: Path) -> None:
                 or json.loads(lines[0][len(b"[ATTEST] ") :]) != expected_ack
                 or not lines[1].endswith(b" check")
             ):
-                raise AssertionError("attestation did not precede continued --check output")
+                raise AssertionError(
+                    "attestation did not precede continued --check output"
+                )
     finally:
         os.close(descriptor)
 
     with tempfile.TemporaryDirectory() as directory:
-        cmdpipe = Path(directory) / "command"
-        result = invoke(
-            binary,
-            [
-                "--protocol",
-                "raop",
-                "--port",
-                "1",
-                "--cmdpipe",
-                str(cmdpipe),
-                "localhost",
-            ],
-        )
-        if (
-            result.returncode != 1
-            or b"detail=\"RAOP connect failed\"" not in result.stdout
-            or cmdpipe.exists()
-        ):
-            raise AssertionError("localhost resolution or failed-connection cleanup changed")
-
         other = Path(directory) / "other"
         other.write_bytes(b"not the executing image")
         descriptor = os.open(other, os.O_RDONLY)
         try:
             result = invoke(
                 binary,
-                ["--attest-fd", str(descriptor), "--attest-nonce", NONCE, "--attest-only"],
+                [
+                    "--attest-fd",
+                    str(descriptor),
+                    "--attest-nonce",
+                    NONCE,
+                    "--attest-only",
+                ],
                 descriptor,
                 bind=False,
             )

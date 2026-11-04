@@ -225,7 +225,7 @@ class NativeSenderProbeTest(unittest.TestCase):
             (opts.sender_relay, opts.multiselect, opts.ptp_follow), (0, 0, "auto")
         )
         for flag in ("--sender-relay", "--multiselect", "--ptp-follow"):
-            for value in ("2", "yes", "private"):
+            for value in ("2", "yes", "private", "01", "+1"):
                 with (
                     self.subTest(flag=flag, value=value),
                     contextlib.redirect_stderr(io.StringIO()),

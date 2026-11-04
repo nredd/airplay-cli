@@ -142,6 +142,55 @@ jobs:
           path: bin/cliairplay-linux-${{ matrix.platform }}
           if-no-files-found: error
 
+  build-linux-static-aarch64:
+    name: Build fully static Linux ARM64 trial artifact
+    # This is a distinct compatibility artifact. Existing dynamic Linux outputs
+    # retain their names and ABI while this build proves current-image identity
+    # without a dynamic ELF interpreter requirement.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+          submodules: recursive
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+      - name: Install cross toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
+      - name: Build fully static trial artifact
+        run: make STATIC=1 FULL_STATIC=1 CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++
+      - name: Verify static ELF contract
+        run: |
+          set -euo pipefail
+          bin=bin/cliairplay-linux-aarch64-static
+          test -f "$bin"
+          file "$bin" | grep -qi "aarch64"
+          if aarch64-linux-gnu-readelf -l "$bin" | grep -q "Requesting program interpreter"; then
+            echo "::error::$bin has PT_INTERP"
+            exit 1
+          fi
+          if aarch64-linux-gnu-readelf -d "$bin" | grep -q "(NEEDED)"; then
+            echo "::error::$bin has DT_NEEDED entries"
+            exit 1
+          fi
+      - name: Verify attestation on ARM64 Alpine
+        run: |
+          docker run --rm --platform linux/arm64 \
+            --volume "$PWD:/workspace:ro" --workdir /workspace alpine:3.21 \
+            sh -ec 'apk add --no-cache python3; python3 tests/attestation_cli.py bin/cliairplay-linux-aarch64-static'
+      - name: Verify attestation on ARM64 Debian
+        run: |
+          docker run --rm --platform linux/arm64 \
+            --volume "$PWD:/workspace:ro" --workdir /workspace debian:bookworm-slim \
+            sh -ec 'apt-get update; apt-get install -y --no-install-recommends python3; python3 tests/attestation_cli.py bin/cliairplay-linux-aarch64-static'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cliairplay-linux-aarch64-static
+          path: bin/cliairplay-linux-aarch64-static
+          if-no-files-found: error
+
   sanitize-linux:
     name: Test with sanitizers
     # AddressSanitizer + UndefinedBehaviorSanitizer over the test suite. Linux

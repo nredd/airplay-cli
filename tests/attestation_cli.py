@@ -99,6 +99,26 @@ def main(binary: Path) -> None:
         os.close(descriptor)
 
     with tempfile.TemporaryDirectory() as directory:
+        cmdpipe = Path(directory) / "command"
+        result = invoke(
+            binary,
+            [
+                "--protocol",
+                "raop",
+                "--port",
+                "1",
+                "--cmdpipe",
+                str(cmdpipe),
+                "localhost",
+            ],
+        )
+        if (
+            result.returncode != 1
+            or b"detail=\"RAOP connect failed\"" not in result.stdout
+            or cmdpipe.exists()
+        ):
+            raise AssertionError("localhost resolution or failed-connection cleanup changed")
+
         other = Path(directory) / "other"
         other.write_bytes(b"not the executing image")
         descriptor = os.open(other, os.O_RDONLY)

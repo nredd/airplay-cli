@@ -40,11 +40,26 @@ endif
 # Directories
 SRC         = src
 LIBRAOP     = libraop
-BUILDDIR    = build/$(HOST)/$(PLATFORM)
 BINDIR      = bin
 
+# FULL_STATIC is deliberately a distinct Linux-only artifact: the ordinary
+# STATIC=1 builds retain their dynamic libc ABI and artifact names.
+BUILD_SUFFIX :=
+ifneq ($(FULL_STATIC),)
+ifeq ($(HOST),linux)
+else
+$(error FULL_STATIC=1 is supported only for Linux)
+endif
+ifeq ($(STATIC),)
+$(error FULL_STATIC=1 requires STATIC=1)
+endif
+BUILD_SUFFIX := -static
+LDFLAGS += -static -static-libgcc -static-libstdc++
+endif
+BUILDDIR    = build/$(HOST)/$(PLATFORM)$(BUILD_SUFFIX)
+
 # Output binary
-EXECUTABLE  = $(BINDIR)/cliairplay-$(HOST)-$(PLATFORM)
+EXECUTABLE  = $(BINDIR)/cliairplay-$(HOST)-$(PLATFORM)$(BUILD_SUFFIX)
 IO_TEST       = build/tests/test_ap2_io
 TIMELINE_TEST = build/tests/test_ap2_timeline
 EVENT_TEST    = build/tests/test_ap2_event

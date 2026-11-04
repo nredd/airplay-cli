@@ -27,8 +27,9 @@ bool ap2_volume_init(struct ap2_volume *v);
 void ap2_volume_destroy(struct ap2_volume *v);
 bool ap2_volume_bind(struct ap2_volume *v, uint64_t generation,
     const uint8_t *output, size_t output_len, const uint8_t *endpoint, size_t endpoint_len);
+/* Authoritative reconciliation expires overdue local work before committing. */
 bool ap2_volume_state(struct ap2_volume *v, uint64_t generation, uint64_t revision,
-    bool known, unsigned milli);
+    bool known, unsigned milli, uint64_t now);
 bool ap2_volume_complete(struct ap2_volume *v, uint64_t generation, uint64_t ordinal,
     const char *result, uint64_t revision, bool known, unsigned milli, uint64_t now);
 void ap2_volume_unbind(struct ap2_volume *v, uint64_t generation);

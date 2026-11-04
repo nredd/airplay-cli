@@ -1510,7 +1510,8 @@ bool ap2_mrp_volume_action(struct ap2_mrp_ctx *m, const char *action,
         ap2_volume_unbind(&m->volume, t->generation); return true;
     }
     if (!strcmp(action, "SESSION_VOLUME_STATE"))
-        return ap2_volume_state(&m->volume, t->generation, t->revision, t->known, t->milli);
+        return ap2_volume_state(&m->volume, t->generation, t->revision, t->known,
+            t->milli, ap2_io_monotonic_ms());
     if (!strcmp(action, "SESSION_VOLUME_COMPLETE"))
         return ap2_volume_complete(&m->volume, t->generation, t->ordinal, t->result,
             t->revision, t->known, t->milli, ap2_io_monotonic_ms());

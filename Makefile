@@ -40,11 +40,26 @@ endif
 # Directories
 SRC         = src
 LIBRAOP     = libraop
-BUILDDIR    = build/$(HOST)/$(PLATFORM)
 BINDIR      = bin
 
+# FULL_STATIC is deliberately a distinct Linux-only artifact: the ordinary
+# STATIC=1 builds retain their dynamic libc ABI and artifact names.
+BUILD_SUFFIX :=
+ifneq ($(FULL_STATIC),)
+ifeq ($(HOST),linux)
+else
+$(error FULL_STATIC=1 is supported only for Linux)
+endif
+ifeq ($(STATIC),)
+$(error FULL_STATIC=1 requires STATIC=1)
+endif
+BUILD_SUFFIX := -static
+LDFLAGS += -static -static-libgcc -static-libstdc++
+endif
+BUILDDIR    = build/$(HOST)/$(PLATFORM)$(BUILD_SUFFIX)
+
 # Output binary
-EXECUTABLE  = $(BINDIR)/cliairplay-$(HOST)-$(PLATFORM)
+EXECUTABLE  = $(BINDIR)/cliairplay-$(HOST)-$(PLATFORM)$(BUILD_SUFFIX)
 IO_TEST       = build/tests/test_ap2_io
 TIMELINE_TEST = build/tests/test_ap2_timeline
 EVENT_TEST    = build/tests/test_ap2_event
@@ -128,7 +143,7 @@ AP2_SOURCES = ap2_client.c ap2_hap.c ap2_io.c ap2_ptp.c ap2_ptp_shm.c ap2_plist.
 
 # Common/CLI sources
 CLI_SOURCES = cross_log.c cross_ssl.c cross_util.c cross_net.c platform.c host_clock.c \
-	cliairplay.c net_address.c raop_response.c raop_session.c artwork.c announce.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
+	attestation.c cliairplay.c net_address.c raop_response.c raop_session.c artwork.c announce.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
 
 # Pre-built static libraries
 # We use a patched copy of libcodecs.a with the buggy alac_create_encoder removed,
@@ -183,6 +198,7 @@ RAOP_LIFECYCLE_TEST_DEFINES = \
 RAOP_SESSION_TEST = build/tests/test_raop_session
 ANNOUNCE_TEST = build/tests/test_announce
 RAOP_EARLY_FAILURE_TEST = build/tests/test_raop_early_failure
+ATTESTATION_TEST = build/tests/test_attestation
 
 # libraop 81c2182 joins RTP threads that were never created when raopcl_connect
 # fails early (a zeroed pthread_t can crash Linux). The submodule stays pristine:
@@ -279,7 +295,7 @@ no_sanitizer_report = case "$(1)" in *Sanitizer*|*"runtime error:"*) \
 
 test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT_TEST) \
 		$(SESSION_TEST) $(PTP_TEST) $(TEST_EXECUTABLE) $(RAOP_LIFECYCLE_TEST_EXECUTABLE) \
-		$(RAOP_SESSION_TEST) $(ANNOUNCE_TEST) $(RAOP_EARLY_FAILURE_TEST)
+		$(RAOP_SESSION_TEST) $(ANNOUNCE_TEST) $(RAOP_EARLY_FAILURE_TEST) $(ATTESTATION_TEST)
 	$(TIMELINE_TEST)
 	$(EVENT_TEST)
 	$(IO_TEST)
@@ -291,6 +307,8 @@ test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT
 	$(RAOP_SESSION_TEST)
 	$(ANNOUNCE_TEST)
 	$(RAOP_EARLY_FAILURE_TEST) $(EXECUTABLE)
+	$(ATTESTATION_TEST)
+	python3 tests/attestation_cli.py $(EXECUTABLE)
 	python3 tests/mrp_artwork_matrix.py --help >/dev/null
 	@missing_pipe="$$($(EXECUTABLE) --protocol raop \
 		127.0.0.1 2>&1 || true)"; \
@@ -333,6 +351,11 @@ test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT
 		$(call no_sanitizer_report,$$appletv_pk) && \
 		printf '%s\n' "$$appletv_pk" | grep -q 'detail="RAOP connect failed"' && \
 		printf '%s\n' "$$appletv_pk" | grep -q '^exit=1$$'
+
+$(ATTESTATION_TEST): tests/test_attestation.c src/attestation.c src/attestation.h Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_attestation.c \
+		$(OPENSSL)/libopenssl.a $(EXTRA_LDFLAGS) -o $@
 
 $(RAOP_SESSION_TEST): tests/test_raop_session.c src/raop_session.c \
 		src/raop_session.h Makefile

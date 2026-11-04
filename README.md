@@ -60,6 +60,24 @@ process lifetime. The format is selected with
 `--bitdepth 24` the input must be **s32le**; the binary truncates it to the
 24-bit samples the ALAC encoder consumes.
 
+### Private current-image attestation contract
+
+The private trial launcher may invoke `--attest-fd <inherited-readonly-asset-fd>`
+and `--attest-nonce <32-lowercase-hex>` with `--attest-only`. The CLI requires
+that pair, hashes the inherited regular file and its Linux `/proc/self/exe` image
+through positional reads, and exits successfully only when both stable SHA-256
+values match. Its only stdout is one JSON acknowledgement:
+
+```text
+[ATTEST] {"version":1,"kind":"current-image-match-at-ack","nonce":"...","exec_fd_sha256":"...","self_sha256":"..."}
+```
+
+The mode fails closed if the descriptor is unsafe, the image is unstable or a
+platform cannot read the current executable. It performs no receiver, PTP,
+pairing, or audio I/O. Launchers must compare the nonce and both digests with
+their pinned asset before treating the child as ready. All ordinary CLI behavior
+is unchanged without the three attestation flags.
+
 ### The start contract
 
 `START_UNIX_MS=<ms>` followed by `ACTION=START` means: **the first sample is
@@ -347,6 +365,10 @@ make STATIC=1
 # Linux cross-compile (example)
 make HOST=linux PLATFORM=aarch64 CC=aarch64-linux-gnu-gcc STATIC=1
 
+# Linux/aarch64 artifact with no ELF interpreter or dynamic dependencies
+make HOST=linux PLATFORM=aarch64 CC=aarch64-linux-gnu-gcc \
+  CXX=aarch64-linux-gnu-g++ STATIC=1 FULL_STATIC=1
+
 # Focused native regression tests
 make test STATIC=1
 ```
@@ -407,7 +429,11 @@ The same suite runs under ASan/UBSan on Linux with
 CI (`.github/workflows/build.yml`) cross-builds four targets on every push —
 `linux-x86_64`, `linux-aarch64`, `macos-arm64`, `macos-x86_64` — validates
 `--check` on the natively runnable ones, and uploads the binaries as
-artifacts. Pushing a `v*` tag additionally runs a release job. The release is
+artifacts. It separately builds `linux-aarch64-static` with `FULL_STATIC=1`.
+That optional trial artifact preserves the ordinary dynamic artifact names and
+ABI, rejects `PT_INTERP` and `DT_NEEDED`, and exercises the real attestation
+and localhost-resolution paths under emulated ARM64 Alpine and Debian. It is
+not included in release assets until explicitly adopted. Pushing a `v*` tag additionally runs a release job. The release is
 published only after the four binaries and `SHA256SUMS` are ready, at which
 point GitHub locks its tag and assets. The manually dispatched **Auto Release**
 workflow calculates the next patch version, creates its tag, and runs the same

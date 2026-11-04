@@ -21,6 +21,8 @@ CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE=1
 CLIAIRPLAY_SESSION_VOLUME=mrp130
 ```
 
+Disabling the publisher always clears its state, even while either mutually exclusive mode is armed, so clearing that mode later cannot revive DataStream writes.
+
 An explicit `CLIAIRPLAY_MRP_TYPE130=0|false|off` still prevents the rail attachment, so it also prevents this experiment.
 
 ## Wire scope

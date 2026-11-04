@@ -15,8 +15,8 @@ static void test_volume_driver(void)
     unsigned milli = 999;
     assert(ap2_volume_bind(&v, 7, uid, sizeof(uid), NULL, 0));
     assert(!ap2_volume_get(&v, uid, sizeof(uid), &milli) && milli == 999);
-    assert(!ap2_volume_state(&v, 6, 1, true, 0));
-    assert(ap2_volume_state(&v, 7, 1, true, 0));
+    assert(!ap2_volume_state(&v, 6, 1, true, 0, 0));
+    assert(ap2_volume_state(&v, 7, 1, true, 0, 0));
     assert(ap2_volume_get(&v, uid, sizeof(uid), &milli) && milli == 0);
     assert(!ap2_volume_set(&v, uid, 1, 630, 100));
     assert(ap2_volume_set(&v, uid, sizeof(uid), 630, 100));
@@ -35,8 +35,30 @@ static void test_volume_driver(void)
     ap2_volume_tick(&v, 3220);
     assert(!ap2_volume_complete(&v, 7, 3, "committed", 4, true, 100, 3221));
     assert(!ap2_volume_set(&v, uid, sizeof(uid), 200, 3221));
-    assert(ap2_volume_state(&v, 7, 4, true, 150));
+    assert(ap2_volume_state(&v, 7, 4, true, 150, 3221));
+
+    /* Reconciliation must expire an overdue request under the same lock before
+     * accepting the newer authoritative state. A later tick cannot revoke it. */
     assert(ap2_volume_set(&v, uid, sizeof(uid), 200, 3230));
+    assert(volume_ordinal == 4);
+    assert(ap2_volume_state(&v, 7, 5, true, 175, 6230));
+    assert(!v.executing && !v.uncertain);
+    assert(ap2_volume_get(&v, uid, sizeof(uid), &milli) && milli == 175);
+    ap2_volume_tick(&v, 6230);
+    assert(ap2_volume_get(&v, uid, sizeof(uid), &milli) && milli == 175);
+    assert(!ap2_volume_complete(&v, 7, 4, "committed", 6, true, 200, 6230));
+
+    /* The opposite ordering has the same result: expiry before reconciliation
+     * accepts the newer state without resurrecting the timed-out request. */
+    assert(ap2_volume_set(&v, uid, sizeof(uid), 200, 7000));
+    assert(volume_ordinal == 5);
+    ap2_volume_tick(&v, 10000);
+    assert(v.uncertain && !v.executing);
+    assert(ap2_volume_state(&v, 7, 6, true, 225, 10000));
+    assert(!v.executing && !v.uncertain);
+    assert(ap2_volume_get(&v, uid, sizeof(uid), &milli) && milli == 225);
+    assert(!ap2_volume_complete(&v, 7, 5, "committed", 7, true, 200, 10000));
+
     assert(ap2_volume_bind(&v, 8, uid, sizeof(uid), NULL, 0));
     assert(!ap2_volume_complete(&v, 7, 4, "committed", 5, true, 200, 3240));
     assert(!ap2_volume_bind(&v, 8, uid, sizeof(uid), NULL, 0));

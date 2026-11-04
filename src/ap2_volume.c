@@ -31,11 +31,21 @@ bool ap2_volume_bind(struct ap2_volume *v, uint64_t generation,
     pthread_mutex_unlock(&v->lock);
     return ok;
 }
+/* Caller holds `v->lock`; expiry cannot race authoritative reconciliation. */
+static void expire_locked(struct ap2_volume *v, uint64_t now)
+{
+    if (v->executing && now >= v->deadline) {
+        v->executing = v->have_trailing = v->known = false;
+        v->uncertain = true; /* timeout is NOT cancellation */
+    }
+}
+
 bool ap2_volume_state(struct ap2_volume *v, uint64_t generation, uint64_t revision,
-    bool known, unsigned milli)
+    bool known, unsigned milli, uint64_t now)
 {
     if (milli > 1000) return false;
     pthread_mutex_lock(&v->lock);
+    expire_locked(v, now);
     bool ok = v->output_len && generation == v->generation && revision > v->revision;
     if (ok) {
         v->revision = revision; v->known = known; v->milli = milli;
@@ -92,10 +102,7 @@ bool ap2_volume_set(struct ap2_volume *v, const uint8_t *uid, size_t len,
 void ap2_volume_tick(struct ap2_volume *v, uint64_t now)
 {
     pthread_mutex_lock(&v->lock);
-    if (v->executing && now >= v->deadline) {
-        v->executing = v->have_trailing = v->known = false;
-        v->uncertain = true; /* timeout is NOT cancellation */
-    }
+    expire_locked(v, now);
     pthread_mutex_unlock(&v->lock);
 }
 bool ap2_volume_complete(struct ap2_volume *v, uint64_t generation, uint64_t ordinal,

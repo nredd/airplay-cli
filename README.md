@@ -230,7 +230,9 @@ EVERY attempted ACTION, including malformed attempts. No leftovers or mixed
 namespaces are accepted. The driver holds one executing Set plus one coalesced
 trailing Set, a 3-second backend deadline and a 16-identifier replay window.
 Timeout clears known state and blocks more work until newer reconciliation;
-it is not cancellation, and late completions cannot become success.
+it is not cancellation, and late completions cannot become success. Reconciliation
+expires overdue pending work before accepting its newer authoritative state, so a
+later tick cannot revoke that state.
 
 Public Get49/ext53 serves only the authoritative cache, with exact field-2
 correlation and eight bounded replies per drain. There are no outgoing Gets or

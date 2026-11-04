@@ -60,6 +60,24 @@ process lifetime. The format is selected with
 `--bitdepth 24` the input must be **s32le**; the binary truncates it to the
 24-bit samples the ALAC encoder consumes.
 
+### Private current-image attestation contract
+
+The private trial launcher may invoke `--attest-fd <inherited-readonly-asset-fd>`
+and `--attest-nonce <32-lowercase-hex>` with `--attest-only`. The CLI requires
+that pair, hashes the inherited regular file and its Linux `/proc/self/exe` image
+through positional reads, and exits successfully only when both stable SHA-256
+values match. Its only stdout is one JSON acknowledgement:
+
+```text
+[ATTEST] {"version":1,"kind":"current-image-match-at-ack","nonce":"...","exec_fd_sha256":"...","self_sha256":"..."}
+```
+
+The mode fails closed if the descriptor is unsafe, the image is unstable or a
+platform cannot read the current executable. It performs no receiver, PTP,
+pairing, or audio I/O. Launchers must compare the nonce and both digests with
+their pinned asset before treating the child as ready. All ordinary CLI behavior
+is unchanged without the three attestation flags.
+
 ### The start contract
 
 `START_UNIX_MS=<ms>` followed by `ACTION=START` means: **the first sample is

@@ -2716,9 +2716,66 @@ static void test_libraop_ntp_follows_host_clock(void)
     puts("ap2_client libraop host clock test passed");
 }
 
-/* Full byte comparison against the original writers catches extra fields,
- * wrong scalar types, reordered defaults, and accidental writer replacement. */
-int ap2cl_test_probe_setup(bool ptp, uint8_t **out);
+/* Full byte comparison against the actual production session builders catches
+ * extra fields, wrong scalar types, reordered defaults, and removed declaration
+ * injection in either PTP/NTP builder. */
+int ap2cl_test_session_setup(bool ptp, uint8_t **out);
+
+static int expected_session_setup(bool ptp, bool relay, bool multi, uint8_t **out)
+{
+    if (ptp) {
+        ap2_pl_node *root = ap2_pl_dict();
+        ap2_pl_dict_set(root, "timingProtocol", ap2_pl_string("PTP"));
+        ap2_pl_dict_set(root, "deviceID", ap2_pl_string("00:11:22:33:44:55:66:77"));
+        ap2_pl_dict_set(root, "sessionUUID",
+                        ap2_pl_string("11111111-1111-1111-1111-111111111111"));
+        ap2_pl_dict_set(root, "name", ap2_pl_string("setup test"));
+        ap2_pl_dict_set(root, "macAddress", ap2_pl_string("00:11:22:33:44:55"));
+        ap2_pl_dict_set(root, "groupUUID",
+                        ap2_pl_string("22222222-2222-2222-2222-222222222222"));
+        ap2_pl_dict_set(root, "groupContainsGroupLeader", ap2_pl_bool(false));
+        ap2_pl_node *peer = ap2_pl_dict();
+        ap2_pl_dict_set(peer, "ID",
+                        ap2_pl_string("33333333-3333-3333-3333-333333333333"));
+        ap2_pl_dict_set(peer, "DeviceType", ap2_pl_int(0));
+        ap2_pl_dict_set(peer, "ClockID", ap2_pl_int(0x1122334455667788ULL));
+        ap2_pl_dict_set(peer, "SupportsClockPortMatchingOverride", ap2_pl_bool(false));
+        ap2_pl_node *addresses = ap2_pl_array();
+        ap2_pl_array_append(addresses, ap2_pl_string("192.0.2.1"));
+        ap2_pl_dict_set(peer, "Addresses", addresses);
+        ap2_pl_dict_set(root, "timingPeerInfo", peer);
+        ap2_pl_node *peer_list = ap2_pl_array();
+        ap2_pl_node *list_peer = ap2_pl_dict();
+        ap2_pl_dict_set(list_peer, "ID",
+                        ap2_pl_string("33333333-3333-3333-3333-333333333333"));
+        ap2_pl_dict_set(list_peer, "DeviceType", ap2_pl_int(0));
+        ap2_pl_dict_set(list_peer, "ClockID", ap2_pl_int(0x1122334455667788ULL));
+        ap2_pl_dict_set(list_peer, "SupportsClockPortMatchingOverride", ap2_pl_bool(false));
+        addresses = ap2_pl_array();
+        ap2_pl_array_append(addresses, ap2_pl_string("192.0.2.1"));
+        ap2_pl_dict_set(list_peer, "Addresses", addresses);
+        ap2_pl_array_append(peer_list, list_peer);
+        ap2_pl_dict_set(root, "timingPeerList", peer_list);
+        if (relay)
+            ap2_pl_dict_set(root, "senderSupportsRelay", ap2_pl_bool(true));
+        if (multi)
+            ap2_pl_dict_set(root, "isMultiSelectAirPlay", ap2_pl_bool(true));
+        int len = ap2_pl_serialize(root, out);
+        ap2_pl_free(root);
+        return len;
+    }
+    struct ap2_plist *root = ap2_plist_create();
+    ap2_plist_add_string(root, "deviceID", "00:11:22:33:44:55:66:77");
+    ap2_plist_add_string(root, "sessionUUID",
+                        "11111111-1111-1111-1111-111111111111");
+    ap2_plist_add_int(root, "timingPort", 12345);
+    ap2_plist_add_string(root, "timingProtocol", "NTP");
+    if (relay) ap2_plist_add_bool(root, "senderSupportsRelay", true);
+    if (multi) ap2_plist_add_bool(root, "isMultiSelectAirPlay", true);
+    int len = ap2_plist_serialize(root, out);
+    ap2_plist_free(root);
+    return len;
+}
 
 static void test_probe_setup_declarations(void)
 {
@@ -2736,27 +2793,9 @@ static void test_probe_setup_declarations(void)
                 bool want_relay = relay && strcmp(relay, "1") == 0;
                 bool want_multi = multi && strcmp(multi, "1") == 0;
                 uint8_t *expected = NULL, *actual = NULL;
-                int expected_len;
-                if (ptp) {
-                    ap2_pl_node *root = ap2_pl_dict();
-                    ap2_pl_dict_set(root, "timingProtocol", ap2_pl_string("PTP"));
-                    if (want_relay)
-                        ap2_pl_dict_set(root, "senderSupportsRelay", ap2_pl_bool(true));
-                    if (want_multi)
-                        ap2_pl_dict_set(root, "isMultiSelectAirPlay", ap2_pl_bool(true));
-                    expected_len = ap2_pl_serialize(root, &expected);
-                    ap2_pl_free(root);
-                } else {
-                    struct ap2_plist *root = ap2_plist_create();
-                    ap2_plist_add_string(root, "timingProtocol", "NTP");
-                    if (want_relay)
-                        ap2_plist_add_bool(root, "senderSupportsRelay", true);
-                    if (want_multi)
-                        ap2_plist_add_bool(root, "isMultiSelectAirPlay", true);
-                    expected_len = ap2_plist_serialize(root, &expected);
-                    ap2_plist_free(root);
-                }
-                int actual_len = ap2cl_test_probe_setup(ptp, &actual);
+                int expected_len = expected_session_setup(
+                    ptp, want_relay, want_multi, &expected);
+                int actual_len = ap2cl_test_session_setup(ptp, &actual);
                 assert(expected_len > 0 && actual_len == expected_len);
                 assert(memcmp(actual, expected, (size_t)expected_len) == 0);
                 free(actual);

@@ -318,6 +318,23 @@ def binary_path(value: str) -> Path:
     return path.resolve()
 
 
+def probe_toggle(value: str) -> int:
+    """Require one canonical disabled/enabled token.
+
+    Parameters:
+        value (str): Command-line token to validate.
+
+    Returns:
+        int: The validated toggle value.
+
+    Raises:
+        argparse.ArgumentTypeError: The token is not exactly `0` or `1`.
+    """
+    if value not in {"0", "1"}:
+        raise argparse.ArgumentTypeError("Expected exactly 0 or 1")
+    return int(value)
+
+
 def parser() -> argparse.ArgumentParser:
     """Build the deliberately small, credential-free CLI."""
     result = argparse.ArgumentParser(description=__doc__)
@@ -328,8 +345,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--duration", type=int, choices=range(1, 121), default=45)
     result.add_argument("--debug", type=int, choices=(0, 1), default=0)
     result.add_argument("--timing", choices=("ntp", "ptp"), default="ntp")
-    result.add_argument("--sender-relay", type=int, choices=(0, 1), default=0)
-    result.add_argument("--multiselect", type=int, choices=(0, 1), default=0)
+    result.add_argument("--sender-relay", type=probe_toggle, default=0)
+    result.add_argument("--multiselect", type=probe_toggle, default=0)
     result.add_argument("--ptp-follow", choices=("auto", "0", "1"), default="auto")
     return result
 

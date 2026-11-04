@@ -277,9 +277,8 @@ static bool run_cli_mute_start(const char *binary, const char *protocol)
         write(fd, start_command, sizeof(start_command) - 1) !=
             (ssize_t)(sizeof(start_command) - 1))
         goto cleanup;
-    if (close(fd) != 0)
-        goto cleanup;
-    fd = -1;
+    /* Keep the FIFO open until the command thread attaches: otherwise the
+     * kernel discards queued bytes when this is its only endpoint. */
     for (int i = 0; i < 500 && !start_seen; i++) {
         ssize_t received = read(output_pipe[0], output + output_len,
                                 sizeof(output) - 1 - output_len);
@@ -297,6 +296,9 @@ static bool run_cli_mute_start(const char *binary, const char *protocol)
     }
     if (!start_seen)
         goto cleanup;
+    if (close(fd) != 0)
+        goto cleanup;
+    fd = -1;
     fd = open(cmdpipe, O_RDWR | O_NONBLOCK);
     if (fd < 0 ||
         write(fd, stop_command, sizeof(stop_command) - 1) !=
@@ -319,6 +321,10 @@ static bool run_cli_mute_start(const char *binary, const char *protocol)
              atomic_load(&peer.mute_commands) == 1 && start_seen_after_mute &&
              access(cmdpipe, F_OK) == -1 && errno == ENOENT;
 cleanup:
+    if (!passed)
+        fprintf(stderr, "CLI %s mute/start failed: reaped=%d status=%d mute=%d start=%d after_mute=%d output=%s\n",
+                protocol, reaped, status, atomic_load(&peer.mute_commands), start_seen,
+                start_seen_after_mute, output);
     if (fd >= 0) close(fd);
     if (!reaped) {
         (void)kill(pid, SIGTERM);

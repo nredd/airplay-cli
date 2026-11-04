@@ -1661,10 +1661,11 @@ static int run_airplay2(cli_config_t *cfg)
         fflush(stdout);
     }
 
-    /* An explicitly requested zero is a protocol mute. Leaving --volume
-     * unspecified preserves the receiver's existing level. This happens before
+    /* An explicitly requested zero is a protocol mute. RAOP-compatible flow
+     * applies it during connect; native flow applies it here. Leaving --volume
+     * unspecified preserves the receiver's existing level. Both happen before
      * a queued command-pipe START is processed, so no audio starts before the mute. */
-    if (cfg->volume >= 0)
+    if (cfg->volume >= 0 && cfg->route.native)
         ap2cl_set_volume(g_ap2cl, cfg->volume);
 
     /* The reader begins draining stdin into the ring immediately; the command

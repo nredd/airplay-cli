@@ -3130,7 +3130,7 @@ static bool ap2_raop_compat_connect(struct ap2cl_s *p)
         p->secret ? p->secret : "", p->password,
         p->et ? p->et : "0,4", p->md ? p->md : "0,1,2",
         p->format.sample_rate, p->format.bit_depth, p->format.channels,
-        p->volume > 0 ? raopcl_float_volume(p->volume) : -144.0f);
+        p->volume >= 0 ? raopcl_float_volume(p->volume) : -144.0f);
 
     if (!p->raopcl) {
         ap2_set_connect_error(p, AP2_CONNECT_ERROR_GENERIC, 0,
@@ -3138,7 +3138,7 @@ static bool ap2_raop_compat_connect(struct ap2cl_s *p)
         return false;
     }
 
-    if (!raopcl_connect(p->raopcl, player_addr, p->device.port, p->volume > 0)) {
+    if (!raopcl_connect(p->raopcl, player_addr, p->device.port, p->volume >= 0)) {
         /* libraop does not expose the RTSP status of the failure, so a rejected
          * password is not distinguishable from an unreachable device here. */
         ap2_set_connect_error(p, AP2_CONNECT_ERROR_GENERIC, 0,

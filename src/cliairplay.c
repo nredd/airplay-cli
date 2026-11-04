@@ -1318,7 +1318,7 @@ static int run_raop(cli_config_t *cfg)
         cfg->et ? cfg->et : "0,4",
         cfg->md ? cfg->md : "0,1,2",
         cfg->sample_rate, cfg->bit_depth, cfg->channels,
-        cfg->volume > 0 ? raopcl_float_volume(cfg->volume) : -144.0f
+        cfg->volume >= 0 ? raopcl_float_volume(cfg->volume) : -144.0f
     );
     if (!client) {
         status_error_ex(ERROR_CODE_CONNECT_FAILED, 0,
@@ -1329,7 +1329,7 @@ static int run_raop(cli_config_t *cfg)
 
     /* Connect */
     LOG_INFO("Connecting to %s:%d via RAOP", inet_ntoa(player_addr), cfg->port);
-    if (!raopcl_connect(client, player_addr, cfg->port, cfg->volume > 0)) {
+    if (!raopcl_connect(client, player_addr, cfg->port, cfg->volume >= 0)) {
         /* libraop does not expose the RTSP status of the failure, so a rejected
          * password is not distinguishable from an unreachable device here. */
         status_error_ex(ERROR_CODE_CONNECT_FAILED, 0, "RAOP connect failed",
@@ -1661,10 +1661,11 @@ static int run_airplay2(cli_config_t *cfg)
         fflush(stdout);
     }
 
-    /* Set volume */
-    if (cfg->volume > 0) {
+    /* An explicitly requested zero is a protocol mute. Leaving --volume
+     * unspecified preserves the receiver's existing level. This happens before
+     * a queued command-pipe START is processed, so no audio starts before the mute. */
+    if (cfg->volume >= 0)
         ap2cl_set_volume(g_ap2cl, cfg->volume);
-    }
 
     /* The reader begins draining stdin into the ring immediately; the command
      * pipe thread anchors playback on the first START after connection setup. */
@@ -2213,7 +2214,7 @@ int main(int argc, char *argv[])
         .protocol = PROTO_AUTO,
         .proto_pref = AP2_PROTO_AUTO,
         .port = 5000,
-        .volume = 0,
+        .volume = -1,
         .lead_ms = 2000,
         .debug_level = 3,
         .dacp_id = "1A2B3D4EA1B2C3D4",

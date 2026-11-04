@@ -7,6 +7,7 @@
  */
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
@@ -23,6 +24,8 @@
 
 #include "cross_log.h"
 #include "raop_client.h"
+
+extern char **environ;
 
 static log_level test_log_level = lSILENCE;
 log_level *loglevel = &test_log_level;
@@ -100,6 +103,7 @@ typedef struct {
     atomic_bool stop;
     pthread_t thread;
     atomic_int target_requests;
+    atomic_int mute_commands;
 } peer_t;
 
 static void reply(int fd, const char *status, int cseq)
@@ -134,11 +138,17 @@ static void serve_connection(peer_t *peer, int fd)
         } while (!strstr(buf, "\r\n\r\n"));
         const char *length = strstr(buf, "Content-Length:");
         int body = length ? atoi(length + strlen("Content-Length:")) : 0;
+        char body_text[128] = {0};
         for (int i = 0; i < body; i++) {
             char byte;
             if (read(fd, &byte, 1) != 1)
                 goto done;
+            if (i < (int)sizeof(body_text) - 1)
+                body_text[i] = byte;
         }
+        if (!strncmp(buf, "SET_PARAMETER", 13) &&
+            strstr(body_text, "volume: -144.000000"))
+            atomic_fetch_add(&peer->mute_commands, 1);
         if (peer->mode == PEER_CLOSE) {
             atomic_fetch_add(&peer->target_requests, 1);
             break;
@@ -184,6 +194,7 @@ static bool peer_start(peer_t *peer, peer_mode_t mode, uint16_t *port)
 
     peer->mode = mode;
     atomic_init(&peer->target_requests, 0);
+    atomic_init(&peer->mute_commands, 0);
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     peer->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     CHECK(peer->listen_fd >= 0);
@@ -216,6 +227,111 @@ static void peer_stop(peer_t *peer)
     }
     pthread_join(peer->thread, NULL);
     close(peer->listen_fd);
+}
+
+static bool run_cli_mute_start(const char *binary, const char *protocol)
+{
+    peer_t peer = { .listen_fd = -1, .stop = false };
+    uint16_t port;
+    char directory[] = "/tmp/cliairplay-mute-XXXXXX";
+    char cmdpipe[128], port_text[16], output[8192] = {0};
+    pid_t pid;
+    int status;
+    int output_pipe[2] = {-1, -1};
+    size_t output_len = 0;
+    posix_spawn_file_actions_t actions;
+
+    CHECK(pipe(output_pipe) == 0);
+    CHECK(mkdtemp(directory) != NULL);
+    snprintf(cmdpipe, sizeof(cmdpipe), "%s/pipe", directory);
+    CHECK(peer_start(&peer, PEER_OK, &port));
+    snprintf(port_text, sizeof(port_text), "%u", port);
+    char *args[] = { (char *)binary, "--protocol", (char *)protocol,
+                     "--port", port_text, "--volume", "0", "--cmdpipe",
+                     cmdpipe, "--et", "0", "127.0.0.1", NULL };
+    CHECK(posix_spawn_file_actions_init(&actions) == 0);
+    CHECK(posix_spawn_file_actions_adddup2(&actions, output_pipe[1], 1) == 0);
+    CHECK(posix_spawn_file_actions_adddup2(&actions, output_pipe[1], 2) == 0);
+    CHECK(posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", 0, 0) == 0);
+    CHECK(posix_spawn(&pid, binary, &actions, NULL, args, environ) == 0);
+    posix_spawn_file_actions_destroy(&actions);
+    CHECK(close(output_pipe[1]) == 0);
+    output_pipe[1] = -1;
+    CHECK(fcntl(output_pipe[0], F_SETFL, O_NONBLOCK) == 0);
+
+    bool reaped = false;
+    bool passed = false;
+    bool start_seen = false;
+    bool start_seen_after_mute = false;
+    int fd = -1;
+    for (int i = 0; i < 500; i++) {
+        if (access(cmdpipe, F_OK) == 0) {
+            fd = open(cmdpipe, O_RDWR | O_NONBLOCK);
+            break;
+        }
+        usleep(10000);
+    }
+    static const char start_command[] = "ACTION=START\n";
+    static const char stop_command[] = "ACTION=STOP\n";
+    if (fd < 0 ||
+        write(fd, start_command, sizeof(start_command) - 1) !=
+            (ssize_t)(sizeof(start_command) - 1))
+        goto cleanup;
+    if (close(fd) != 0)
+        goto cleanup;
+    fd = -1;
+    for (int i = 0; i < 500 && !start_seen; i++) {
+        ssize_t received = read(output_pipe[0], output + output_len,
+                                sizeof(output) - 1 - output_len);
+        if (received > 0) {
+            output_len += (size_t)received;
+            output[output_len] = '\0';
+            if (strstr(output, "[STATUS] started") != NULL) {
+                start_seen = true;
+                start_seen_after_mute = atomic_load(&peer.mute_commands) == 1;
+            }
+        } else if (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            goto cleanup;
+        }
+        if (!start_seen) usleep(10000);
+    }
+    if (!start_seen)
+        goto cleanup;
+    fd = open(cmdpipe, O_RDWR | O_NONBLOCK);
+    if (fd < 0 ||
+        write(fd, stop_command, sizeof(stop_command) - 1) !=
+            (ssize_t)(sizeof(stop_command) - 1))
+        goto cleanup;
+    if (close(fd) != 0)
+        goto cleanup;
+    fd = -1;
+    if (waitpid(pid, &status, 0) != pid)
+        goto cleanup;
+    reaped = true;
+    while (output_len < sizeof(output) - 1) {
+        ssize_t received = read(output_pipe[0], output + output_len,
+                                sizeof(output) - 1 - output_len);
+        if (received <= 0) break;
+        output_len += (size_t)received;
+        output[output_len] = '\0';
+    }
+    passed = reaped && WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+             atomic_load(&peer.mute_commands) == 1 && start_seen_after_mute &&
+             access(cmdpipe, F_OK) == -1 && errno == ENOENT;
+cleanup:
+    if (fd >= 0) close(fd);
+    if (!reaped) {
+        (void)kill(pid, SIGTERM);
+        (void)waitpid(pid, NULL, 0);
+    }
+    if (output_pipe[0] >= 0) close(output_pipe[0]);
+    if (output_pipe[1] >= 0) close(output_pipe[1]);
+    peer_stop(&peer);
+    unlink(cmdpipe);
+    CHECK(rmdir(directory) == 0);
+    CHECK(passed);
+    fprintf(stderr, "ok: CLI %s mutes on wire before cmdpipe START\n", protocol);
+    return true;
 }
 
 static bool run_scenario(peer_mode_t mode, const char *name, int fail_at,
@@ -262,8 +378,6 @@ static bool run_scenario(peer_mode_t mode, const char *name, int fail_at,
             hook.created, hook.joins);
     return true;
 }
-
-extern char **environ;
 
 /* Spawn the actual CLI safely while the loopback peer thread is active. */
 static bool run_cli(const char *binary, peer_mode_t mode, const char *protocol)
@@ -340,6 +454,9 @@ int main(int argc, char **argv)
         !run_scenario(PEER_OK, "reap already-exited threads", 0, true))
         return 1;
     if (argc == 2) {
+        if (!run_cli_mute_start(argv[1], "raop") ||
+            !run_cli_mute_start(argv[1], "airplay2-compat"))
+            return 1;
         for (peer_mode_t mode = PEER_REFUSE; mode <= PEER_CLOSE; mode++) {
             if (!run_cli(argv[1], mode, "raop") ||
                 !run_cli(argv[1], mode, "airplay2-compat"))

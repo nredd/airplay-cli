@@ -612,13 +612,15 @@ for NTP sessions.
 field lacks ALAC or `--raw` is given. Optional RSA-AES payload encryption
 (`--encrypt`, when `et` contains 1).
 
-**Volume** (all paths): `--volume 0-100` maps linear-in-dB onto -30..0 dB via
-libraop's `raopcl_float_volume` — the AirPlay ecosystem convention (iOS,
-shairport-sync, libraop all use this range), so a given slider position is
-equally loud on every protocol path and matches other senders. 0 mutes
-(-144 dB). The native flow sends it as `SET_PARAMETER volume:`; loudness
-alignment against non-AirPlay ecosystems belongs in the caller's per-player
-normalization, not in the protocol curve.
+**Volume** (all paths): an explicit `--volume 0-100` maps linear-in-dB onto
+-30..0 dB via libraop's `raopcl_float_volume` — the AirPlay ecosystem
+convention (iOS, shairport-sync, libraop all use this range), so a given slider
+position has identical wire-volume mapping on every protocol path. 0 is an
+explicit mute (-144 dB), sent before a queued command-pipe `START` is processed.
+Omitting `--volume` sends no initial volume command and preserves the receiver's
+level. The native flow sends an explicit value as `SET_PARAMETER volume:`;
+loudness alignment against non-AirPlay ecosystems belongs in the caller's
+per-player normalization, not in the protocol curve.
 
 ## 8. MediaRemote (Apple TV now-playing)
 

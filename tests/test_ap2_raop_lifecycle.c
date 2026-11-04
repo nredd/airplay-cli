@@ -56,6 +56,9 @@ static struct {
     int stops;
     int flushes;
     int starts;
+    bool create_volume_set;
+    float create_volume;
+    bool connect_volume_set;
     struct raopcl_s *last_transport_client;
 } mock;
 
@@ -98,7 +101,8 @@ struct raopcl_s *ap2_test_raopcl_create(
     (void)sample_rate;
     (void)sample_size;
     (void)channels;
-    (void)volume;
+    mock.create_volume_set = true;
+    mock.create_volume = volume;
 
     int id = ++mock.creates;
     if (id >= MAX_CLIENTS) return NULL;
@@ -116,7 +120,7 @@ bool ap2_test_raopcl_connect(
 {
     (void)host;
     (void)port;
-    (void)set_volume;
+    mock.connect_volume_set = set_volume;
 
     record_event(EVENT_CONNECT, client->id);
     int call = mock.connect_calls++;
@@ -186,7 +190,7 @@ uint32_t ap2_test_raopcl_sample_rate(struct raopcl_s *client)
     return client->sample_rate;
 }
 
-static struct ap2cl_s *create_test_client(void)
+static struct ap2cl_s *create_test_client_with_volume(int volume)
 {
     ap2_device_info_t device = {
         .name = "RAOP lifecycle test",
@@ -201,7 +205,12 @@ static struct ap2cl_s *create_test_client(void)
         .channels = 2,
     };
     return ap2cl_create(
-        &device, &format, NULL, NULL, "0011223344556677", "1", 2000, 50);
+        &device, &format, NULL, NULL, "0011223344556677", "1", 2000, volume);
+}
+
+static struct ap2cl_s *create_test_client(void)
+{
+    return create_test_client_with_volume(50);
 }
 
 static bool check_events(const event_t *expected, size_t count)
@@ -278,6 +287,31 @@ static bool test_final_cleanup_order(void)
     return true;
 }
 
+static bool test_explicit_zero_volume_reaches_raop_compat(void)
+{
+    reset_mock();
+    mock.connect_results[0] = true;
+    mock.connect_result_count = 1;
+
+    struct ap2cl_s *client = create_test_client_with_volume(0);
+    CHECK(client != NULL);
+    CHECK(ap2cl_connect(client));
+    CHECK(mock.create_volume_set);
+    CHECK(mock.create_volume == -144.0f);
+    CHECK(mock.connect_volume_set);
+    CHECK(ap2cl_destroy(client));
+
+    reset_mock();
+    mock.connect_results[0] = true;
+    mock.connect_result_count = 1;
+    client = create_test_client_with_volume(-1);
+    CHECK(client != NULL);
+    CHECK(ap2cl_connect(client));
+    CHECK(!mock.connect_volume_set);
+    CHECK(ap2cl_destroy(client));
+    return true;
+}
+
 static bool test_standby_reuses_raop_compatible_connection(void)
 {
     reset_mock();
@@ -323,6 +357,7 @@ int main(void)
 {
     if (!test_disconnect_reconnect_and_failure_cleanup() ||
         !test_final_cleanup_order() ||
+        !test_explicit_zero_volume_reaches_raop_compat() ||
         !test_standby_reuses_raop_compatible_connection())
         return 1;
     puts("AP2 RAOP reconnect lifecycle tests passed");

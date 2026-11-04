@@ -104,6 +104,8 @@ typedef struct {
     pthread_t thread;
     atomic_int target_requests;
     atomic_int mute_commands;
+    atomic_bool block_mute_reply;
+    atomic_bool release_mute_reply;
 } peer_t;
 
 static void reply(int fd, const char *status, int cseq)
@@ -147,8 +149,12 @@ static void serve_connection(peer_t *peer, int fd)
                 body_text[i] = byte;
         }
         if (!strncmp(buf, "SET_PARAMETER", 13) &&
-            strstr(body_text, "volume: -144.000000"))
+            strstr(body_text, "volume: -144.000000")) {
             atomic_fetch_add(&peer->mute_commands, 1);
+            while (atomic_load(&peer->block_mute_reply) &&
+                   !atomic_load(&peer->release_mute_reply))
+                usleep(1000);
+        }
         if (peer->mode == PEER_CLOSE) {
             atomic_fetch_add(&peer->target_requests, 1);
             break;
@@ -195,6 +201,8 @@ static bool peer_start(peer_t *peer, peer_mode_t mode, uint16_t *port)
     peer->mode = mode;
     atomic_init(&peer->target_requests, 0);
     atomic_init(&peer->mute_commands, 0);
+    atomic_init(&peer->block_mute_reply, false);
+    atomic_init(&peer->release_mute_reply, false);
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     peer->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     CHECK(peer->listen_fd >= 0);
@@ -245,6 +253,7 @@ static bool run_cli_mute_start(const char *binary, const char *protocol)
     CHECK(mkdtemp(directory) != NULL);
     snprintf(cmdpipe, sizeof(cmdpipe), "%s/pipe", directory);
     CHECK(peer_start(&peer, PEER_OK, &port));
+    atomic_store(&peer.block_mute_reply, true);
     snprintf(port_text, sizeof(port_text), "%u", port);
     char *args[] = { (char *)binary, "--protocol", (char *)protocol,
                      "--port", port_text, "--volume", "0", "--cmdpipe",
@@ -262,7 +271,6 @@ static bool run_cli_mute_start(const char *binary, const char *protocol)
     bool reaped = false;
     bool passed = false;
     bool start_seen = false;
-    bool start_seen_after_mute = false;
     int fd = -1;
     for (int i = 0; i < 500; i++) {
         if (access(cmdpipe, F_OK) == 0) {
@@ -278,17 +286,18 @@ static bool run_cli_mute_start(const char *binary, const char *protocol)
             (ssize_t)(sizeof(start_command) - 1))
         goto cleanup;
     /* Keep the FIFO open until the command thread attaches: otherwise the
-     * kernel discards queued bytes when this is its only endpoint. */
+     * kernel discards queued bytes when this is its only endpoint. The peer
+     * holds the mute reply until this write completes, proving this START was
+     * queued before the client can finish connecting and process it. */
+    atomic_store(&peer.release_mute_reply, true);
     for (int i = 0; i < 500 && !start_seen; i++) {
         ssize_t received = read(output_pipe[0], output + output_len,
                                 sizeof(output) - 1 - output_len);
         if (received > 0) {
             output_len += (size_t)received;
             output[output_len] = '\0';
-            if (strstr(output, "[STATUS] started") != NULL) {
+            if (strstr(output, "[STATUS] started") != NULL)
                 start_seen = true;
-                start_seen_after_mute = atomic_load(&peer.mute_commands) == 1;
-            }
         } else if (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
             goto cleanup;
         }
@@ -318,13 +327,13 @@ static bool run_cli_mute_start(const char *binary, const char *protocol)
         output[output_len] = '\0';
     }
     passed = reaped && WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
-             atomic_load(&peer.mute_commands) == 1 && start_seen_after_mute &&
+             atomic_load(&peer.mute_commands) == 1 && start_seen &&
              access(cmdpipe, F_OK) == -1 && errno == ENOENT;
 cleanup:
+    atomic_store(&peer.release_mute_reply, true);
     if (!passed)
-        fprintf(stderr, "CLI %s mute/start failed: reaped=%d status=%d mute=%d start=%d after_mute=%d output=%s\n",
-                protocol, reaped, status, atomic_load(&peer.mute_commands), start_seen,
-                start_seen_after_mute, output);
+        fprintf(stderr, "CLI %s mute/start failed: reaped=%d status=%d mute=%d start=%d output=%s\n",
+                protocol, reaped, status, atomic_load(&peer.mute_commands), start_seen, output);
     if (fd >= 0) close(fd);
     if (!reaped) {
         (void)kill(pid, SIGTERM);

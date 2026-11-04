@@ -2009,10 +2009,17 @@ void ap2_mrp_set_native_volume_rail(struct ap2_mrp_ctx *m, bool enabled)
 
 void ap2_mrp_set_private_now_playing_datastream(struct ap2_mrp_ctx *m, bool enabled)
 {
-    if (!m || !m->experimental_homepod_remote || !m->native_volume_rail ||
+    if (!m) return;
+    /* Disabling must take effect even when a mutually exclusive mode is
+     * currently armed, otherwise a later clear could revive stale writes. */
+    if (!enabled) {
+        m->private_now_playing_datastream = false;
+        return;
+    }
+    if (!m->experimental_homepod_remote || !m->native_volume_rail ||
         m->private_native_volume_capture || m->volume_mode)
         return;
-    m->private_now_playing_datastream = enabled;
+    m->private_now_playing_datastream = true;
 }
 
 bool ap2_mrp_attach_events(struct ap2_mrp_ctx *m, int event_sock)

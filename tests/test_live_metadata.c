@@ -518,14 +518,47 @@ static void test_private_now_playing_datastream_handshake(void)
         assert(count == cases[i].expected_count);
         assert(!memcmp(types, cases[i].expected, count * sizeof(*types)));
         m->connected = true;
+        if (cases[i].periodic) ap2_mrp_set_playing(m, true);
         assert(ap2_mrp_set_metadata(m, "Track", "Artist", "Album", 1, "item"));
         uint8_t *state = NULL;
         int state_len = 0;
         uint64_t generation = 0;
         assert(ap2_mrp_prepare_state_push(m, &state, &state_len, &generation) ==
             cases[i].periodic);
+        if (cases[i].periodic) {
+            ap2_mrp_complete_state_push(m, generation, true);
+            free(state);
+            state = NULL;
+            assert(!ap2_mrp_prepare_state_push(m, &state, &state_len, &generation));
+            m->last_state_push = time(NULL) - MRP_STATE_REPUSH_S;
+            assert(ap2_mrp_prepare_state_push(m, &state, &state_len, &generation));
+        }
         free(state);
         m->connected = false;
+        ap2_mrp_destroy(m);
+    }
+}
+
+static void test_private_now_playing_datastream_disable_order(void)
+{
+    static const int baseline[] = {15, 38, 16};
+    uint8_t secret[32] = {4};
+    for (unsigned volume = 0; volume < 2; volume++) {
+        struct ap2_mrp_ctx *m = ap2_mrp_create("127.0.0.1", 7000, NULL, "1",
+            "Disable test", NULL, NULL, secret, sizeof(secret));
+        assert(m);
+        ap2_mrp_set_experimental_homepod_remote(m, true);
+        ap2_mrp_set_native_volume_rail(m, true);
+        ap2_mrp_set_private_now_playing_datastream(m, true);
+        if (volume) ap2_mrp_set_volume_mode(m, true);
+        else ap2_mrp_set_private_native_volume_capture(m, true);
+        ap2_mrp_set_private_now_playing_datastream(m, false);
+        if (volume) ap2_mrp_set_volume_mode(m, false);
+        else ap2_mrp_set_private_native_volume_capture(m, false);
+        int types[5] = {0};
+        unsigned count = test_data_handshake_types(m, types);
+        assert(count == 3);
+        assert(!memcmp(types, baseline, sizeof(baseline)));
         ap2_mrp_destroy(m);
     }
 }
@@ -547,6 +580,7 @@ int main(int argc, char **argv)
     test_diagnostic_classifier();
     test_encrypted_diagnostics_and_cap();
     test_private_now_playing_datastream_handshake();
+    test_private_now_playing_datastream_disable_order();
     test_live_bundle(false);
     test_live_bundle(true);
     test_live_remote_mapping();

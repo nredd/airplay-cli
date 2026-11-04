@@ -281,14 +281,19 @@ static bool run_cli_mute_start(const char *binary, const char *protocol)
     }
     static const char start_command[] = "ACTION=START\n";
     static const char stop_command[] = "ACTION=STOP\n";
-    if (fd < 0 ||
-        write(fd, start_command, sizeof(start_command) - 1) !=
-            (ssize_t)(sizeof(start_command) - 1))
+    if (fd < 0)
         goto cleanup;
     /* Keep the FIFO open until the command thread attaches: otherwise the
      * kernel discards queued bytes when this is its only endpoint. The peer
-     * holds the mute reply until this write completes, proving this START was
-     * queued before the client can finish connecting and process it. */
+     * holds the mute reply, so the server must first observe the wire mute;
+     * only then do we queue START. The command thread cannot acknowledge it
+     * until the peer releases that volume transaction. */
+    for (int i = 0; i < 500 && atomic_load(&peer.mute_commands) == 0; i++)
+        usleep(10000);
+    if (atomic_load(&peer.mute_commands) != 1 ||
+        write(fd, start_command, sizeof(start_command) - 1) !=
+            (ssize_t)(sizeof(start_command) - 1))
+        goto cleanup;
     atomic_store(&peer.release_mute_reply, true);
     for (int i = 0; i < 500 && !start_seen; i++) {
         ssize_t received = read(output_pipe[0], output + output_len,
@@ -316,9 +321,14 @@ static bool run_cli_mute_start(const char *binary, const char *protocol)
     if (close(fd) != 0)
         goto cleanup;
     fd = -1;
-    if (waitpid(pid, &status, 0) != pid)
+    for (int i = 0; i < 500 && !reaped; i++) {
+        pid_t waited = waitpid(pid, &status, WNOHANG);
+        if (waited == pid) reaped = true;
+        else if (waited < 0) goto cleanup;
+        if (!reaped) usleep(10000);
+    }
+    if (!reaped)
         goto cleanup;
-    reaped = true;
     while (output_len < sizeof(output) - 1) {
         ssize_t received = read(output_pipe[0], output + output_len,
                                 sizeof(output) - 1 - output_len);
@@ -337,7 +347,17 @@ cleanup:
     if (fd >= 0) close(fd);
     if (!reaped) {
         (void)kill(pid, SIGTERM);
-        (void)waitpid(pid, NULL, 0);
+        for (int i = 0; i < 500; i++) {
+            if (waitpid(pid, NULL, WNOHANG) == pid) {
+                reaped = true;
+                break;
+            }
+            usleep(10000);
+        }
+        if (!reaped) {
+            (void)kill(pid, SIGKILL);
+            (void)waitpid(pid, NULL, 0);
+        }
     }
     if (output_pipe[0] >= 0) close(output_pipe[0]);
     if (output_pipe[1] >= 0) close(output_pipe[1]);

@@ -40,7 +40,16 @@ def require_rejection(binary: Path, args: list[str]) -> None:
 
 
 def require_hostname_cleanup(binary: Path, cmdpipe: Path) -> None:
-    """Require a hostname-resolved loopback connection and bounded FIFO cleanup."""
+    """Require a hostname-resolved loopback connection and bounded FIFO cleanup.
+
+    Parameters:
+        binary (Path): Absolute path to the CLI executable under test.
+        cmdpipe (Path): Temporary FIFO path owned by this invocation.
+
+    Raises:
+        AssertionError: Connection, error reporting, or cleanup violates the contract.
+        OSError: Listener setup or process creation fails.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))
         listener.listen(1)

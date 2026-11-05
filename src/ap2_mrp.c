@@ -221,6 +221,7 @@ struct ap2_mrp_ctx {
      * command dispatch, ACKs, publication, or backend bindings. */
     bool private_native_volume_capture;
     bool native_volume_rail;
+    bool private_now_playing_datastream;
     bool capture_emitted, capture_frozen, data_attached;
     pthread_mutex_t capture_lock;
     uint64_t capture_records;
@@ -2007,6 +2008,21 @@ void ap2_mrp_set_native_volume_rail(struct ap2_mrp_ctx *m, bool enabled)
     m->native_volume_rail = enabled;
 }
 
+void ap2_mrp_set_private_now_playing_datastream(struct ap2_mrp_ctx *m, bool enabled)
+{
+    if (!m) return;
+    /* Disabling must take effect even when a mutually exclusive mode is
+     * currently armed, otherwise a later clear could revive stale writes. */
+    if (!enabled) {
+        m->private_now_playing_datastream = false;
+        return;
+    }
+    if (!m->experimental_homepod_remote || !m->native_volume_rail ||
+        m->private_native_volume_capture || m->volume_mode)
+        return;
+    m->private_now_playing_datastream = true;
+}
+
 bool ap2_mrp_attach_events(struct ap2_mrp_ctx *m, int event_sock)
 {
     if (!m || event_sock < 0) return false;
@@ -2037,12 +2053,12 @@ bool ap2_mrp_attach_events(struct ap2_mrp_ctx *m, int event_sock)
     return true;
 }
 
-/* Now-playing rides the datastream only on a plain type-130 attach. Volume mode keeps
- * it on POST /command, and private capture attaches the datastream receive-only: the
- * session under observation must not gain a second now-playing publisher. */
+/* The rail is receive-only unless the private publisher experiment is armed.
+ * Capture and session-volume modes never add a second now-playing publisher. */
 static bool mrp_now_playing_on_datastream(const struct ap2_mrp_ctx *m)
 {
-    return !m->volume_mode && !m->private_native_volume_capture && !m->native_volume_rail;
+    return !m->volume_mode && !m->private_native_volume_capture &&
+        (!m->native_volume_rail || m->private_now_playing_datastream);
 }
 
 /* Separated only to exercise actual opening/failure behavior with socketpairs. */

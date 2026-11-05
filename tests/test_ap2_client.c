@@ -2902,10 +2902,13 @@ static void test_checked_volume(void)
 bool ap2cl_test_session_volume_enabled(bool admitted);
 bool ap2cl_test_mrp_datastream_requested(bool admitted);
 bool ap2cl_test_datastream_admission_first(bool admitted);
+bool ap2cl_test_private_now_playing_datastream_enabled(bool admitted);
 static void test_capture_datastream_policy(void)
 {
     unsetenv("CLIAIRPLAY_SESSION_VOLUME"); unsetenv("CLIAIRPLAY_MRP_TYPE130");
     unsetenv("CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE");
+    unsetenv("CLIAIRPLAY_PRIVATE_NOW_PLAYING_DATASTREAM");
+    unsetenv("CLIAIRPLAY_NATIVE_VOLUME_RAIL");
     assert(!ap2cl_test_mrp_datastream_requested(true));
     setenv("CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE", "1", 1);
     assert(ap2cl_test_mrp_datastream_requested(true));
@@ -2922,6 +2925,29 @@ static void test_capture_datastream_policy(void)
     setenv("CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE", "0", 1);
     assert(!ap2cl_test_mrp_datastream_requested(true));
     unsetenv("CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE");
+    unsetenv("CLIAIRPLAY_PRIVATE_NOW_PLAYING_DATASTREAM");
+    assert(!ap2cl_test_private_now_playing_datastream_enabled(true));
+    setenv("CLIAIRPLAY_PRIVATE_NOW_PLAYING_DATASTREAM", "1", 1);
+    assert(!ap2cl_test_private_now_playing_datastream_enabled(true)); /* rail required */
+    setenv("CLIAIRPLAY_NATIVE_VOLUME_RAIL", "1", 1);
+    assert(ap2cl_test_private_now_playing_datastream_enabled(true));
+    assert(!ap2cl_test_private_now_playing_datastream_enabled(false)); /* admission */
+    setenv("CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE", "1", 1);
+    assert(!ap2cl_test_private_now_playing_datastream_enabled(true)); /* capture wins */
+    unsetenv("CLIAIRPLAY_PRIVATE_NATIVE_VOLUME_CAPTURE");
+    setenv("CLIAIRPLAY_SESSION_VOLUME", "mrp130", 1);
+    assert(!ap2cl_test_private_now_playing_datastream_enabled(true)); /* volume wins */
+    setenv("CLIAIRPLAY_MRP_TYPE130", "off", 1);
+    assert(!ap2cl_test_private_now_playing_datastream_enabled(true)); /* request still wins */
+    unsetenv("CLIAIRPLAY_MRP_TYPE130");
+    unsetenv("CLIAIRPLAY_SESSION_VOLUME");
+    static const char *private_invalid[] = {"", "0", "true", "01", "1 "};
+    for (unsigned i = 0; i < sizeof(private_invalid) / sizeof(private_invalid[0]); i++) {
+        setenv("CLIAIRPLAY_PRIVATE_NOW_PLAYING_DATASTREAM", private_invalid[i], 1);
+        assert(!ap2cl_test_private_now_playing_datastream_enabled(true));
+    }
+    unsetenv("CLIAIRPLAY_PRIVATE_NOW_PLAYING_DATASTREAM");
+    unsetenv("CLIAIRPLAY_NATIVE_VOLUME_RAIL");
     /* The native rail is a second receive-only requester with the same gates,
      * and like capture and volume mode it runs admission before the attach. */
     assert(!ap2cl_test_datastream_admission_first(true));

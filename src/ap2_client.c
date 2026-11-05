@@ -475,11 +475,16 @@ static bool ap2_mrp_type130_enabled(void)
 {
     return ap2_env_enabled("CLIAIRPLAY_MRP_TYPE130", false);
 }
+static bool ap2_session_volume_requested(struct ap2cl_s *p)
+{
+    const char *mode = getenv("CLIAIRPLAY_SESSION_VOLUME");
+    return mode && !strcmp(mode, "mrp130") && p->experimental_homepod_remote;
+}
+
 /* Explicit diagnostic kill wins. This never broadens admission eligibility. */
 static bool ap2_session_volume_enabled(struct ap2cl_s *p)
 {
-    const char *mode = getenv("CLIAIRPLAY_SESSION_VOLUME");
-    return mode && !strcmp(mode, "mrp130") && p->experimental_homepod_remote &&
+    return ap2_session_volume_requested(p) &&
         (!getenv("CLIAIRPLAY_MRP_TYPE130") || ap2_mrp_type130_enabled());
 }
 
@@ -500,6 +505,18 @@ static bool ap2_native_volume_rail_enabled(struct ap2cl_s *p)
 {
     const char *setting = getenv("CLIAIRPLAY_NATIVE_VOLUME_RAIL");
     return p->experimental_homepod_remote && setting && !strcmp(setting, "1");
+}
+
+/* Private publisher experiment. The rail remains the only DataStream requester;
+ * this opt-in merely permits the two extra now-playing messages after its
+ * receive-only registration has attached. */
+static bool ap2_private_now_playing_datastream_enabled(struct ap2cl_s *p)
+{
+    const char *setting = getenv("CLIAIRPLAY_PRIVATE_NOW_PLAYING_DATASTREAM");
+    return p->experimental_homepod_remote && setting && !strcmp(setting, "1") &&
+        ap2_native_volume_rail_enabled(p) &&
+        !ap2_private_native_volume_capture_enabled(p) &&
+        !ap2_session_volume_requested(p);
 }
 
 /* Receive-only datastream requesters: private capture and the native rail. */
@@ -1744,6 +1761,10 @@ static void ap2_native_setup_mrp(struct ap2cl_s *p)
         p->mrp = mrp;
     }
     if (!p->mrp) return;
+    bool volume_mode = ap2_session_volume_enabled(p);
+    ap2_mrp_set_volume_mode(p->mrp, volume_mode);
+    ap2_mrp_set_private_now_playing_datastream(p->mrp,
+        ap2_private_now_playing_datastream_enabled(p));
     ap2_mrp_set_remote_command_callback(
         p->mrp, ap2_remote_command_received, p);
     if (p->events_sock >= 0 && !ap2_mrp_attach_events(p->mrp, p->events_sock)) {
@@ -1754,13 +1775,18 @@ static void ap2_native_setup_mrp(struct ap2cl_s *p)
     }
     p->events_sock = -1;
 
-    bool volume_mode = ap2_session_volume_enabled(p);
-    ap2_mrp_set_volume_mode(p->mrp, volume_mode);
     if (!ap2_mrp_attach(p->mrp, data_port, seed)) {
         LOG_WARN("[MRP] data-channel attach failed; reverse event channel retained");
         return;
     }
-    LOG_INFO("[MRP] remote-control data channel established (now-playing active)");
+    const char *datastream_mode = "receive-only";
+    if (ap2_private_now_playing_datastream_enabled(p))
+        datastream_mode = "private now-playing experiment";
+    else if (ap2_mrp_type130_enabled() && !volume_mode &&
+             !ap2_private_native_volume_capture_enabled(p) &&
+             !ap2_native_volume_rail_enabled(p))
+        datastream_mode = "now-playing publisher";
+    LOG_INFO("[MRP] remote-control data channel established (%s)", datastream_mode);
 }
 
 /* Actual session writers, shared with offline byte-preservation tests. Keep
@@ -6059,6 +6085,12 @@ bool ap2cl_test_mrp_datastream_requested(bool admitted)
 {
     struct ap2cl_s p = {.experimental_homepod_remote = admitted};
     return ap2_mrp_datastream_requested(&p, ap2_session_volume_enabled(&p));
+}
+
+bool ap2cl_test_private_now_playing_datastream_enabled(bool admitted)
+{
+    struct ap2cl_s p = {.experimental_homepod_remote = admitted};
+    return ap2_private_now_playing_datastream_enabled(&p);
 }
 
 bool ap2cl_test_mrp_session_eligible(bool encrypted, bool stored_credentials,

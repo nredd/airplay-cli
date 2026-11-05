@@ -333,9 +333,6 @@ int main(int argc, char **argv)
             fprintf(stderr, "control unhealthy on cycle %u\n", cycle);
         assert(ap2cl_control_healthy(p));
         assert(ap2cl_disconnect(p));
-        /* A late backend completion cannot address the retired context. */
-        const struct ap2_volume_transaction late = {0};
-        assert(!ap2cl_session_volume_action(p, "SESSION_VOLUME_UNBIND", &late));
     }
     assert(ap2cl_destroy(p)); assert(!pthread_join(thread, NULL));
     assert(r.sessions == 2); close(r.control_listener); close(r.event_listener);

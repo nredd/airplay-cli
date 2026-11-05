@@ -11,6 +11,7 @@
 #include "../src/ap2_hap.c"
 #include "ap2_client.h"
 #include "ap2_plist.h"
+#include "ap2_bplist.h"
 
 static log_level level = lSILENCE;
 log_level *loglevel = &level;
@@ -205,6 +206,8 @@ typedef struct {
     unsigned sessions;
     bool missing_first_event;
     bool send_commands;
+    bool publication;
+    unsigned registrations[2];
 } receiver_t;
 
 static int listener(int *port)
@@ -237,7 +240,18 @@ static void *receiver(void *arg)
         unsigned setups = 0; int event = -1;
         bool omit_event = r->missing_first_event && session == 0;
         for (;;) {
-            request(fd, &hap, buf, &offset);
+            size_t request_len = request(fd, &hap, buf, &offset);
+            if (r->publication && !strncmp((char *)buf, "POST /command ", 14)) {
+                const uint8_t *data = NULL; size_t data_len = 0;
+                char type[64] = {0};
+                if (ap2_bplist_get_params_data(buf + offset, request_len - offset, &data, &data_len))
+                    r->registrations[session] |= 1;
+                if (ap2_bplist_get_root_string(buf + offset, request_len - offset, "type", type, sizeof(type))) {
+                    if (!strcmp(type, "updateMRNowPlayingInfo")) r->registrations[session] |= 2;
+                    if (!strcmp(type, "updateMRSupportedCommands")) r->registrations[session] |= 4;
+                    if (!strcmp(type, "updateMRNowPlayingClient")) r->registrations[session] |= 8;
+                }
+            }
             cs = strstr((char *)buf, "\r\nCSeq: "); assert(cs);
             assert(sscanf(cs, "\r\nCSeq: %d", &cseq) == 1);
             bool teardown = !strncmp((char *)buf, "TEARDOWN ", 9);
@@ -277,10 +291,12 @@ static void remote(ap2_remote_command_t command, void *arg)
 int main(int argc, char **argv)
 {
     assert(argc == 1 || (argc == 2 && (!strcmp(argv[1], "--missing-first-event") ||
-        !strcmp(argv[1], "--mrp-disabled") || !strcmp(argv[1], "--non-apple"))));
+        !strcmp(argv[1], "--mrp-disabled") || !strcmp(argv[1], "--non-apple") ||
+        !strcmp(argv[1], "--publication"))));
     bool missing_event = argc == 2 && !strcmp(argv[1], "--missing-first-event");
     bool mrp_disabled = argc == 2 && !strcmp(argv[1], "--mrp-disabled");
-    bool non_apple = argc == 2 && !strcmp(argv[1], "--non-apple");
+    bool publication = argc == 2 && !strcmp(argv[1], "--publication");
+    bool non_apple = publication || (argc == 2 && !strcmp(argv[1], "--non-apple"));
     bool admitted = !mrp_disabled && !non_apple;
     alarm(20); /* Bound failures even if a protocol peer regresses. */
     signal(SIGPIPE, SIG_IGN);
@@ -300,7 +316,7 @@ int main(int argc, char **argv)
     for (size_t i = 0; i < sizeof(raw); i++) snprintf(credentials + 2 * i, 3, "%02x", raw[i]);
     int port;
     receiver_t r = {.identity = identity, .missing_first_event = missing_event,
-                    .send_commands = admitted};
+                    .send_commands = admitted, .publication = publication};
     r.control_listener = listener(&port); r.event_listener = listener(&r.event_port);
     pthread_t thread; assert(!pthread_create(&thread, NULL, receiver, &r));
     ap2_device_info_t device = {.name = "offline reconnect", .address = "127.0.0.1", .port = port,
@@ -332,12 +348,21 @@ int main(int argc, char **argv)
         if (!ap2cl_control_healthy(p))
             fprintf(stderr, "control unhealthy on cycle %u\n", cycle);
         assert(ap2cl_control_healthy(p));
+        if (publication)
+            assert(ap2cl_set_metadata(p, "fixture title", "fixture artist", "fixture album", 120, "fixture-id"));
         assert(ap2cl_disconnect(p));
     }
     assert(ap2cl_destroy(p)); assert(!pthread_join(thread, NULL));
-    assert(r.sessions == 2); close(r.control_listener); close(r.event_listener);
+    assert(r.sessions == 2);
+    if (publication) {
+        fprintf(stderr, "registration masks: first=%u second=%u (expected 15 each)\n",
+                r.registrations[0], r.registrations[1]);
+        assert(r.registrations[0] == 15 && r.registrations[1] == 15);
+    }
+    close(r.control_listener); close(r.event_listener);
     EVP_PKEY_free(identity);
-    puts(missing_event ? "test_ap2_reconnect: PASS (failed event admission -> fresh successful session)" :
+    puts(publication ? "test_ap2_reconnect: PASS (fresh publication registrations)" :
+         missing_event ? "test_ap2_reconnect: PASS (failed event admission -> fresh successful session)" :
          mrp_disabled ? "test_ap2_reconnect: PASS (MRP disabled reconnect)" :
          non_apple ? "test_ap2_reconnect: PASS (non-Apple reconnect)" :
          "test_ap2_reconnect: PASS (two encrypted native sessions, fresh event keys, type130 off)");

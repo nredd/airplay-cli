@@ -3560,6 +3560,12 @@ bool ap2cl_disconnect(struct ap2cl_s *p)
         /* Feedback is joined and publication excluded. Drop all session keys,
          * identifiers and pending volume work, not just the old sockets. */
         if (mrp) ap2_mrp_destroy(mrp);
+        /* Publication receipts and receiver-specific fallback belong to the
+         * retired session, not the desired metadata intent. */
+        p->mrp_device_registered = false;
+        p->mrp_extended_registered = false;
+        p->mrp_progress_push_full = false;
+        p->mrp_last_playback_state = 0;
         atomic_store(&p->mrp_event_health, 0);
         pthread_mutex_unlock(&p->mrp_lock);
         pthread_mutex_unlock(&p->mrp_publish_lock);

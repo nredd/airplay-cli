@@ -251,6 +251,7 @@ test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT
 	$(RECONNECT_TEST) --missing-first-event
 	$(RECONNECT_TEST) --mrp-disabled
 	$(RECONNECT_TEST) --non-apple
+	$(RECONNECT_TEST) --publication
 	$(TEST_EXECUTABLE)
 	$(RAOP_LIFECYCLE_TEST_EXECUTABLE)
 	$(RAOP_SESSION_TEST)

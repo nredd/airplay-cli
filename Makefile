@@ -252,6 +252,7 @@ test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT
 	$(RECONNECT_TEST) --mrp-disabled
 	$(RECONNECT_TEST) --non-apple
 	$(RECONNECT_TEST) --publication
+	$(RECONNECT_TEST) --retained-metadata
 	$(TEST_EXECUTABLE)
 	$(RAOP_LIFECYCLE_TEST_EXECUTABLE)
 	$(RAOP_SESSION_TEST)
@@ -338,7 +339,7 @@ build/tests/ap2_ptp_reconnect.o: src/ap2_ptp.c Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -Dbind=ap2_ptp_test_bind \
 		-Dsendto=ap2_ptp_test_sendto -c $< -o $@
 
-build/tests/test_ap2_reconnect.o: tests/test_ap2_reconnect.c src/ap2_hap.c Makefile
+build/tests/test_ap2_reconnect.o: tests/test_ap2_reconnect.c tests/mrp_jpeg_fixture.h src/ap2_hap.c Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(TEST_CFLAGS) -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED $(INCLUDE) -c $< -o $@
 

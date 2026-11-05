@@ -1787,6 +1787,50 @@ struct ap2_mrp_ctx *ap2_mrp_create(const char *host, int port,
     return m;
 }
 
+void ap2_mrp_intent_clear(struct ap2_mrp_intent *intent)
+{
+    if (!intent) return;
+    free(intent->title); free(intent->artist); free(intent->album);
+    free(intent->item_id); free(intent->artwork_mime); free(intent->artwork);
+    memset(intent, 0, sizeof(*intent));
+}
+
+void ap2_mrp_intent_take(struct ap2_mrp_ctx *m, struct ap2_mrp_intent *intent)
+{
+    if (!m || !intent) return;
+    ap2_mrp_intent_clear(intent);
+    intent->title = m->title; m->title = NULL;
+    intent->artist = m->artist; m->artist = NULL;
+    intent->album = m->album; m->album = NULL;
+    intent->item_id = m->item_id; m->item_id = NULL;
+    intent->artwork_mime = m->artwork_mime; m->artwork_mime = NULL;
+    intent->artwork = m->artwork; m->artwork = NULL;
+    intent->artwork_len = m->artwork_len; m->artwork_len = 0;
+    intent->duration_ms = m->duration_ms; intent->elapsed_ms = m->elapsed_ms;
+    intent->is_live = m->is_live; intent->playback_state = m->playback_state;
+    intent->elapsed_set_at = m->elapsed_set_at; intent->np_uid = m->np_uid;
+    memcpy(intent->artwork_id, m->artwork_id, sizeof(intent->artwork_id));
+    intent->valid = true;
+}
+
+bool ap2_mrp_intent_restore(struct ap2_mrp_ctx *m, struct ap2_mrp_intent *intent)
+{
+    if (!m || !intent || !intent->valid) return false;
+    free(m->title); free(m->artist); free(m->album); free(m->item_id);
+    free(m->artwork_mime); free(m->artwork);
+    m->title = intent->title; m->artist = intent->artist; m->album = intent->album;
+    m->item_id = intent->item_id; m->artwork_mime = intent->artwork_mime;
+    m->artwork = intent->artwork; m->artwork_len = intent->artwork_len;
+    m->duration_ms = intent->duration_ms; m->elapsed_ms = intent->elapsed_ms;
+    m->is_live = intent->is_live; m->playback_state = intent->playback_state;
+    m->elapsed_set_at = intent->elapsed_set_at; m->np_uid = intent->np_uid;
+    memcpy(m->artwork_id, intent->artwork_id, sizeof(m->artwork_id));
+    memset(intent, 0, sizeof(*intent));
+    m->state_dirty = true;
+    m->state_include_artwork = m->artwork != NULL;
+    return true;
+}
+
 void ap2_mrp_destroy(struct ap2_mrp_ctx *m)
 {
     if (!m) return;

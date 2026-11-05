@@ -50,6 +50,22 @@ typedef enum {
     AP2_MRP_PLAYBACK_STOPPED = 3,
 } ap2_mrp_playback_state_t;
 
+/* Client-owned desired state, detached from session crypto and transport.
+ * Zero-initialize; take/restore transfer ownership without allocating. */
+struct ap2_mrp_intent {
+    char *title, *artist, *album, *item_id, *artwork_mime;
+    uint8_t *artwork;
+    int artwork_len, duration_ms, elapsed_ms;
+    bool is_live, valid;
+    ap2_mrp_playback_state_t playback_state;
+    double elapsed_set_at;
+    char artwork_id[17];
+    uint64_t np_uid;
+};
+void ap2_mrp_intent_clear(struct ap2_mrp_intent *intent);
+void ap2_mrp_intent_take(struct ap2_mrp_ctx *m, struct ap2_mrp_intent *intent);
+bool ap2_mrp_intent_restore(struct ap2_mrp_ctx *m, struct ap2_mrp_intent *intent);
+
 /*
  * Internal staging-allocation guard, not an Apple TV receiver limit.
  *

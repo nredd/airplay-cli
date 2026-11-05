@@ -12,6 +12,8 @@
 #include "ap2_client.h"
 #include "ap2_plist.h"
 #include "ap2_bplist.h"
+#include "ap2_mrp.h"
+#include "mrp_jpeg_fixture.h"
 
 static log_level level = lSILENCE;
 log_level *loglevel = &level;
@@ -208,6 +210,8 @@ typedef struct {
     bool send_commands;
     bool publication;
     unsigned registrations[2];
+    uint8_t *nowplaying[2];
+    size_t nowplaying_len[2];
 } receiver_t;
 
 static int listener(int *port)
@@ -247,9 +251,21 @@ static void *receiver(void *arg)
                 if (ap2_bplist_get_params_data(buf + offset, request_len - offset, &data, &data_len))
                     r->registrations[session] |= 1;
                 if (ap2_bplist_get_root_string(buf + offset, request_len - offset, "type", type, sizeof(type))) {
-                    if (!strcmp(type, "updateMRNowPlayingInfo")) r->registrations[session] |= 2;
+                    if (!strcmp(type, "updateMRNowPlayingInfo")) {
+                        r->registrations[session] |= 2;
+                        free(r->nowplaying[session]);
+                        r->nowplaying_len[session] = request_len - offset;
+                        r->nowplaying[session] = malloc(r->nowplaying_len[session]);
+                        assert(r->nowplaying[session]);
+                        memcpy(r->nowplaying[session], buf + offset, r->nowplaying_len[session]);
+                        const char title[] = "fixture title";
+                        for (size_t i = offset; i + sizeof(title) - 1 <= request_len; i++)
+                            if (!memcmp(buf + i, title, sizeof(title) - 1))
+                                r->registrations[session] |= 32;
+                    }
                     if (!strcmp(type, "updateMRSupportedCommands")) r->registrations[session] |= 4;
                     if (!strcmp(type, "updateMRNowPlayingClient")) r->registrations[session] |= 8;
+                    if (!strcmp(type, "updateMRPlaybackState")) r->registrations[session] |= 16;
                 }
             }
             cs = strstr((char *)buf, "\r\nCSeq: "); assert(cs);
@@ -281,6 +297,38 @@ static void *receiver(void *arg)
     return NULL;
 }
 
+/* Ownership survives failed attachment and can be discarded without restore. */
+static void intent_lifecycle(void)
+{
+    struct ap2_mrp_intent intent = {0};
+    struct ap2_mrp_ctx *first = ap2_mrp_create("127.0.0.1", 1, NULL, NULL, NULL,
+                                                NULL, NULL, NULL, 0);
+    assert(first);
+    assert(ap2_mrp_set_metadata(first, "a", "b", "c", 120000, "id"));
+    assert(ap2_mrp_set_progress(first, 37000, 120000, false));
+    ap2_mrp_artwork_info_t info;
+    assert(ap2_mrp_set_artwork(first, "image/jpeg", k_baseline_jpeg,
+                               sizeof(k_baseline_jpeg), &info));
+    uint8_t *before = NULL, *after = NULL; int before_len = 0, after_len = 0;
+    assert(ap2_mrp_build_nowplaying_command(first, &before, &before_len));
+    ap2_mrp_intent_take(first, &intent);
+    ap2_mrp_destroy(first);
+    assert(!ap2_mrp_intent_restore(NULL, &intent) && intent.valid);
+    struct ap2_mrp_ctx *second = ap2_mrp_create("127.0.0.1", 1, NULL, NULL, NULL,
+                                                 NULL, NULL, NULL, 0);
+    assert(second && ap2_mrp_intent_restore(second, &intent) && !intent.valid);
+    assert(ap2_mrp_build_nowplaying_command(second, &after, &after_len));
+    assert(before_len == after_len && !memcmp(before, after, (size_t)before_len));
+    free(before); free(after);
+    ap2_mrp_clear_artwork(second);
+    ap2_mrp_intent_take(second, &intent);
+    assert(!intent.artwork && !intent.artwork_mime);
+    ap2_mrp_destroy(second);
+    ap2_mrp_intent_clear(&intent);
+    ap2_mrp_intent_clear(&intent);
+    assert(!intent.valid);
+}
+
 static void remote(ap2_remote_command_t command, void *arg)
 {
     atomic_uint *count = arg;
@@ -292,13 +340,15 @@ int main(int argc, char **argv)
 {
     assert(argc == 1 || (argc == 2 && (!strcmp(argv[1], "--missing-first-event") ||
         !strcmp(argv[1], "--mrp-disabled") || !strcmp(argv[1], "--non-apple") ||
-        !strcmp(argv[1], "--publication"))));
+        !strcmp(argv[1], "--publication") || !strcmp(argv[1], "--retained-metadata"))));
     bool missing_event = argc == 2 && !strcmp(argv[1], "--missing-first-event");
     bool mrp_disabled = argc == 2 && !strcmp(argv[1], "--mrp-disabled");
-    bool publication = argc == 2 && !strcmp(argv[1], "--publication");
+    bool retained_metadata = argc == 2 && !strcmp(argv[1], "--retained-metadata");
+    bool publication = retained_metadata || (argc == 2 && !strcmp(argv[1], "--publication"));
     bool non_apple = publication || (argc == 2 && !strcmp(argv[1], "--non-apple"));
     bool admitted = !mrp_disabled && !non_apple;
     alarm(20); /* Bound failures even if a protocol peer regresses. */
+    if (retained_metadata) intent_lifecycle();
     signal(SIGPIPE, SIG_IGN);
     assert(!setenv("CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE", admitted ? "1" : "0", 1));
     assert(!setenv("CLIAIRPLAY_MRP_TYPE130", "0", 1));
@@ -348,16 +398,31 @@ int main(int argc, char **argv)
         if (!ap2cl_control_healthy(p))
             fprintf(stderr, "control unhealthy on cycle %u\n", cycle);
         assert(ap2cl_control_healthy(p));
-        if (publication)
-            assert(ap2cl_set_metadata(p, "fixture title", "fixture artist", "fixture album", 120, "fixture-id"));
+        if (publication) {
+            if (retained_metadata && cycle == 2)
+                assert(ap2cl_mrp_push(p) == 200);
+            else if (retained_metadata) {
+                assert(ap2cl_set_metadata_ex(p, "fixture title", "fixture artist", "fixture album",
+                    120, "fixture-id", "image/jpeg", k_baseline_jpeg, sizeof(k_baseline_jpeg),
+                    NULL, NULL, NULL));
+                assert(ap2cl_set_progress(p, 37, 120));
+                assert(ap2cl_mrp_push(p) == 200);
+            } else
+                assert(ap2cl_set_metadata(p, "fixture title", "fixture artist", "fixture album", 120, "fixture-id"));
+        }
         assert(ap2cl_disconnect(p));
     }
     assert(ap2cl_destroy(p)); assert(!pthread_join(thread, NULL));
     assert(r.sessions == 2);
     if (publication) {
-        fprintf(stderr, "registration masks: first=%u second=%u (expected 15 each)\n",
+        fprintf(stderr, "registration masks: first=%u second=%u (expected 63 each)\n",
                 r.registrations[0], r.registrations[1]);
-        assert(r.registrations[0] == 15 && r.registrations[1] == 15);
+        assert(r.registrations[0] == 63 && r.registrations[1] == 63);
+        if (retained_metadata) {
+            assert(r.nowplaying_len[0] == r.nowplaying_len[1]);
+            assert(!memcmp(r.nowplaying[0], r.nowplaying[1], r.nowplaying_len[0]));
+        }
+        free(r.nowplaying[0]); free(r.nowplaying[1]);
     }
     close(r.control_listener); close(r.event_listener);
     EVP_PKEY_free(identity);

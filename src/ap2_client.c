@@ -255,6 +255,7 @@ struct ap2cl_s {
      * mrp_lock protects mutable state/snapshots only. mrp_publish_lock orders
      * mutations with network publication without affecting health reads. */
     struct ap2_mrp_ctx *mrp;
+    struct ap2_mrp_intent mrp_intent;
     pthread_mutex_t mrp_lock;
     pthread_mutex_t mrp_publish_lock;
     atomic_int mrp_event_health;
@@ -434,6 +435,9 @@ static int ap2_mrp_send_playback_state(struct ap2cl_s *p,
 static void ap2_mrp_publish_playback(struct ap2cl_s *p,
                                      ap2_mrp_playback_state_t state,
                                      bool force);
+static void ap2_mrp_publish_playback_locked(struct ap2cl_s *p,
+                                            ap2_mrp_playback_state_t state,
+                                            bool force);
 static ap2_mrp_push_result_t ap2cl_mrp_push_progress_serialized(
     struct ap2cl_s *p);
 static bool ap2_set_nonblocking(int fd, const char *name);
@@ -1706,6 +1710,7 @@ static void ap2_native_setup_mrp(struct ap2cl_s *p)
         return;
     }
     p->events_sock = -1;
+    ap2_mrp_intent_restore(p->mrp, &p->mrp_intent);
 
     bool volume_mode = ap2_session_volume_enabled(p);
     ap2_mrp_set_volume_mode(p->mrp, volume_mode);
@@ -3357,6 +3362,7 @@ bool ap2cl_destroy(struct ap2cl_s *p)
     if (p->hap) ap2_hap_destroy(p->hap);
     if (p->ptp) ap2_ptp_destroy(p->ptp);
     if (p->mrp) ap2_mrp_destroy(p->mrp);
+    ap2_mrp_intent_clear(&p->mrp_intent);
     if (p->alac) alac_delete_encoder(p->alac);
     /* Close the RTSP socket under the lock so an in-flight request/response
      * cycle on another thread finishes first and a later cycle sees -1
@@ -3550,10 +3556,12 @@ bool ap2cl_disconnect(struct ap2cl_s *p)
         ap2_clock_verify_disarm(p);
         ap2_clock_verify_reap_poller(p);
         ap2_rtx_stop(p);
-        /* Publish the final stopped state before disconnecting MediaRemote,
-         * while the encrypted RTSP session is still live. */
-        ap2_mrp_publish_playback(p, AP2_MRP_PLAYBACK_STOPPED, true);
         pthread_mutex_lock(&p->mrp_publish_lock);
+        pthread_mutex_lock(&p->mrp_lock);
+        if (p->mrp) ap2_mrp_intent_take(p->mrp, &p->mrp_intent);
+        pthread_mutex_unlock(&p->mrp_lock);
+        /* The stopped publication is session-only; keep desired playback. */
+        ap2_mrp_publish_playback_locked(p, AP2_MRP_PLAYBACK_STOPPED, true);
         pthread_mutex_lock(&p->mrp_lock);
         struct ap2_mrp_ctx *mrp = p->mrp;
         p->mrp = NULL;
@@ -5115,11 +5123,13 @@ static void ap2_mrp_ready(struct ap2cl_s *p)
         return;
     }
     p->events_sock = -1;
-    ap2_mrp_playback_state_t state = ap2_mrp_current_playback_state(p);
-    if (state == AP2_MRP_PLAYBACK_STOPPED)
-        ap2_mrp_set_stopped(p->mrp);
-    else
-        ap2_mrp_set_playing(p->mrp, state == AP2_MRP_PLAYBACK_PLAYING);
+    if (!ap2_mrp_intent_restore(p->mrp, &p->mrp_intent)) {
+        ap2_mrp_playback_state_t state = ap2_mrp_current_playback_state(p);
+        if (state == AP2_MRP_PLAYBACK_STOPPED)
+            ap2_mrp_set_stopped(p->mrp);
+        else
+            ap2_mrp_set_playing(p->mrp, state == AP2_MRP_PLAYBACK_PLAYING);
+    }
     atomic_store(&p->mrp_event_health, ap2_mrp_event_status(p->mrp));
 }
 
@@ -5207,12 +5217,10 @@ static int ap2_mrp_send_playback_state(struct ap2cl_s *p,
     return status;
 }
 
-static void ap2_mrp_publish_playback(struct ap2cl_s *p,
-                                     ap2_mrp_playback_state_t state,
-                                     bool force)
+static void ap2_mrp_publish_playback_locked(struct ap2cl_s *p,
+                                            ap2_mrp_playback_state_t state,
+                                            bool force)
 {
-    if (!p || p->flow != FLOW_NATIVE_AP2) return;
-    pthread_mutex_lock(&p->mrp_publish_lock);
     pthread_mutex_lock(&p->mrp_lock);
     if (p->mrp) {
         if (state == AP2_MRP_PLAYBACK_STOPPED)
@@ -5244,6 +5252,15 @@ static void ap2_mrp_publish_playback(struct ap2cl_s *p,
             force = false;
     }
     ap2_mrp_send_playback_state(p, state, force);
+}
+
+static void ap2_mrp_publish_playback(struct ap2cl_s *p,
+                                     ap2_mrp_playback_state_t state,
+                                     bool force)
+{
+    if (!p || p->flow != FLOW_NATIVE_AP2) return;
+    pthread_mutex_lock(&p->mrp_publish_lock);
+    ap2_mrp_publish_playback_locked(p, state, force);
     pthread_mutex_unlock(&p->mrp_publish_lock);
 }
 

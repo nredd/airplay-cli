@@ -8,11 +8,13 @@
 #include <stdatomic.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include "../src/ap2_hap.c"
 #include "ap2_client.h"
 #include "ap2_plist.h"
 #include "ap2_bplist.h"
 #include "ap2_mrp.h"
+#include "ap2_io.h"
 #include "mrp_jpeg_fixture.h"
 
 static log_level level = lSILENCE;
@@ -181,11 +183,12 @@ static void pair_receiver(int fd, EVP_PKEY *identity, struct ap2_hap_ctx *hap)
 
 /* Prove the reattached channel decrypts with this session's fresh keys and
  * counter zero, not just that the context reports an open descriptor. */
-static void send_pause(int fd, const uint8_t secret[32])
+static void send_pause(int fd, const uint8_t secret[32], uint64_t counter)
 {
     struct ap2_hap_ctx events = {0};
     assert(hkdf_sha512(secret, 32, "Events-Salt", "Events-Write-Encryption-Key", events.write_key, 32));
     events.verified = true;
+    events.write_nonce_counter = counter;
     ap2_pl_node *root = ap2_pl_dict();
     ap2_pl_dict_set(root, "type", ap2_pl_string("sendMediaRemoteCommand"));
     ap2_pl_dict_set(root, "value", ap2_pl_string("paus"));
@@ -216,7 +219,9 @@ typedef struct {
     bool send_commands;
     bool publication;
     bool retry_with_intent;
+    bool reentrant;
     unsigned registrations[3];
+    uint64_t playback_state[3];
     uint8_t *nowplaying[3];
     size_t nowplaying_len[3];
 } receiver_t;
@@ -237,7 +242,7 @@ static void *receiver(void *arg)
     receiver_t *r = arg;
     for (unsigned session = 0; session < (r->retry_with_intent ? 3u : 2u); session++) {
         int fd = accept(r->control_listener, NULL, NULL); assert(fd >= 0);
-        struct timeval tv = {.tv_sec = 5};
+        struct timeval tv = {.tv_sec = r->reentrant ? 10 : 5};
         assert(!setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)));
         uint8_t buf[16384]; size_t offset;
         request(fd, NULL, buf, &offset);
@@ -273,7 +278,14 @@ static void *receiver(void *arg)
                     }
                     if (!strcmp(type, "updateMRSupportedCommands")) r->registrations[session] |= SUPPORTED_COMMANDS;
                     if (!strcmp(type, "updateMRNowPlayingClient")) r->registrations[session] |= NOW_PLAYING_CLIENT;
-                    if (!strcmp(type, "updateMRPlaybackState")) r->registrations[session] |= PLAYBACK_STATE;
+                    if (!strcmp(type, "updateMRPlaybackState")) {
+                        uint64_t state = 0;
+                        assert(ap2_bplist_find_uint(buf + offset, request_len - offset,
+                                                   "mrPlaybackState", &state));
+                        if (state != AP2_MRP_PLAYBACK_STOPPED)
+                            r->playback_state[session] = state;
+                        r->registrations[session] |= PLAYBACK_STATE;
+                    }
                 }
             }
             cs = strstr((char *)buf, "\r\nCSeq: "); assert(cs);
@@ -288,10 +300,12 @@ static void *receiver(void *arg)
                        ap2_plist_stream_add_int(p, "controlPort", 65001); ap2_plist_stream_end(p); }
                 body_len = ap2_plist_serialize(p, &body); ap2_plist_free(p);
             }
+            if (r->reentrant && session == 0 && !strncmp((char *)buf, "POST /feedback ", 15))
+                send_pause(event, hap.shared_secret, 1);
             reply(fd, &hap, cseq, body, (size_t)body_len); free(body);
             if (r->send_commands && !omit_event && !strncmp((char *)buf, "SETPEERS ", 9)) {
                 assert(event >= 0);
-                send_pause(event, hap.shared_secret);
+                send_pause(event, hap.shared_secret, 0);
             }
             if (!omit_event && setups == 1 && event < 0) {
                 event = accept(r->event_listener, NULL, NULL); assert(event >= 0);
@@ -338,11 +352,105 @@ static void intent_lifecycle(void)
     assert(!intent.valid);
 }
 
+/* Park the automatic reader at its next normal sleep after the first event.
+ * The scheduling shim changes no client state or protocol path: the second
+ * encrypted event must be consumed by the explicit public feedback call. */
+static pthread_mutex_t callback_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t callback_cond = PTHREAD_COND_INITIALIZER;
+static bool callback_entered, callback_release;
+static bool retire_during_callback, callback_pending, callback_finish;
+static struct ap2cl_s *callback_client;
+static atomic_uint reentrant_commands;
+static pthread_t callback_thread;
+static bool callback_thread_known;
+static bool delayed_callback;
+static unsigned command_count, command_limit;
+
+int ap2_reconnect_usleep(useconds_t delay)
+{
+    pthread_mutex_lock(&callback_lock);
+    if (callback_thread_known && pthread_equal(pthread_self(), callback_thread)) {
+        callback_entered = true;
+        pthread_cond_broadcast(&callback_cond);
+        while (!callback_release)
+            pthread_cond_wait(&callback_cond, &callback_lock);
+    }
+    pthread_mutex_unlock(&callback_lock);
+    return usleep(delay);
+}
+
+static void reentrant_remote(ap2_remote_command_t command, void *arg)
+{
+    (void)arg;
+    assert(command == AP2_REMOTE_COMMAND_PAUSE);
+    unsigned ordinal = atomic_fetch_add(&reentrant_commands, 1);
+    if (ordinal == 0) {
+        pthread_mutex_lock(&callback_lock);
+        callback_thread = pthread_self();
+        callback_thread_known = true;
+        pthread_mutex_unlock(&callback_lock);
+    } else {
+        assert(ap2cl_mrp_push(callback_client) == 200);
+        fprintf(stderr, "reentrant publication completed\n");
+        if (retire_during_callback && ordinal == 1) {
+            pthread_mutex_lock(&callback_lock);
+            callback_pending = true;
+            pthread_cond_broadcast(&callback_cond);
+            while (!callback_finish)
+                pthread_cond_wait(&callback_cond, &callback_lock);
+            pthread_mutex_unlock(&callback_lock);
+        }
+    }
+}
+
+static void *public_feedback(void *arg)
+{
+    assert(ap2cl_feedback(arg));
+    return NULL;
+}
+
+/* A failed lock regression must not strand a thread in the gate. Own the whole
+ * child, kill it on deadline and reap it, including all its receiver/workers. */
+static int bounded_reentrant(int argc, char **argv);
+
 static void remote(ap2_remote_command_t command, void *arg)
 {
-    atomic_uint *count = arg;
+    (void)arg;
     assert(command == AP2_REMOTE_COMMAND_PAUSE);
-    atomic_fetch_add(count, 1);
+    pthread_mutex_lock(&callback_lock);
+    if (delayed_callback) {
+        callback_pending = true;
+        pthread_cond_broadcast(&callback_cond);
+        while (!callback_finish)
+            pthread_cond_wait(&callback_cond, &callback_lock);
+    }
+    assert(command_count < command_limit && "duplicate or unexpected callback");
+    command_count++;
+    pthread_cond_broadcast(&callback_cond);
+    pthread_mutex_unlock(&callback_lock);
+}
+
+/* Feedback is not a callback-completion fence: the background reader may own
+ * input while the public tick skips it. Await the actual callback condition,
+ * not elapsed time, and reject duplicate counts both here and at dispatch. */
+static void await_commands(void)
+{
+    struct timespec deadline;
+    assert(!clock_gettime(CLOCK_REALTIME, &deadline));
+    deadline.tv_sec += 2;
+    pthread_mutex_lock(&callback_lock);
+    if (delayed_callback) {
+        callback_finish = true;
+        pthread_cond_broadcast(&callback_cond);
+    }
+    while (command_count < command_limit) {
+        int err = pthread_cond_timedwait(&callback_cond, &callback_lock, &deadline);
+        assert(!err || err == ETIMEDOUT);
+        if (err == ETIMEDOUT) break;
+    }
+    fprintf(stderr, "callback count: actual=%u expected=%u\n", command_count, command_limit);
+    assert(command_count == command_limit && "callback completion deadline");
+    pthread_mutex_unlock(&callback_lock);
 }
 
 int main(int argc, char **argv)
@@ -350,11 +458,18 @@ int main(int argc, char **argv)
     assert(argc == 1 || (argc == 2 && (!strcmp(argv[1], "--missing-first-event") ||
         !strcmp(argv[1], "--mrp-disabled") || !strcmp(argv[1], "--non-apple") ||
         !strcmp(argv[1], "--publication") || !strcmp(argv[1], "--retained-metadata") ||
-        !strcmp(argv[1], "--retained-retry"))));
+        !strcmp(argv[1], "--retained-retry") || !strcmp(argv[1], "--reentrant-publication") ||
+        !strcmp(argv[1], "--retired-feedback") || !strcmp(argv[1], "--retained-playing") ||
+        !strcmp(argv[1], "--callback-barrier"))));
+    delayed_callback = argc == 2 && !strcmp(argv[1], "--callback-barrier");
+    retire_during_callback = argc == 2 && !strcmp(argv[1], "--retired-feedback");
+    bool reentrant = retire_during_callback || (argc == 2 && !strcmp(argv[1], "--reentrant-publication"));
+    if ((reentrant || delayed_callback) && !getenv("AP2_REENTRANT_CHILD")) return bounded_reentrant(argc, argv);
     bool missing_event = argc == 2 && !strcmp(argv[1], "--missing-first-event");
     bool mrp_disabled = argc == 2 && !strcmp(argv[1], "--mrp-disabled");
     bool retained_retry = argc == 2 && !strcmp(argv[1], "--retained-retry");
-    bool retained_metadata = retained_retry || (argc == 2 && !strcmp(argv[1], "--retained-metadata"));
+    bool retained_playing = argc == 2 && !strcmp(argv[1], "--retained-playing");
+    bool retained_metadata = retained_playing || retained_retry || (argc == 2 && !strcmp(argv[1], "--retained-metadata"));
     bool publication = retained_metadata || (argc == 2 && !strcmp(argv[1], "--publication"));
     bool non_apple = (publication && !retained_retry) || (argc == 2 && !strcmp(argv[1], "--non-apple"));
     bool admitted = !mrp_disabled && !non_apple;
@@ -378,7 +493,7 @@ int main(int argc, char **argv)
     int port;
     receiver_t r = {.identity = identity, .missing_first_event = missing_event,
                     .send_commands = admitted, .publication = publication,
-                    .retry_with_intent = retained_retry};
+                    .retry_with_intent = retained_retry, .reentrant = reentrant};
     r.control_listener = listener(&port); r.event_listener = listener(&r.event_port);
     pthread_t thread; assert(!pthread_create(&thread, NULL, receiver, &r));
     ap2_device_info_t device = {.name = "offline reconnect", .address = "127.0.0.1", .port = port,
@@ -386,9 +501,14 @@ int main(int argc, char **argv)
     ap2_audio_format_t format = {.sample_rate = 44100, .bit_depth = 16, .channels = 2};
     struct ap2cl_s *p = ap2cl_create(&device, &format, credentials, NULL, "0011223344556677", "1", 600, 0);
     assert(p); ap2cl_force_native(p); ap2cl_set_ptp(p, true);
-    atomic_uint commands = 0;
-    ap2cl_set_remote_command_callback(p, remote, &commands);
+    callback_client = p;
+    ap2cl_set_remote_command_callback(p, reentrant ? reentrant_remote : remote, NULL);
     for (unsigned cycle = 1; cycle <= (retained_retry ? 3u : 2u); cycle++) {
+        pthread_mutex_lock(&callback_lock);
+        if (admitted && !reentrant && !((missing_event && cycle == 1) || (retained_retry && cycle == 2)))
+            command_limit++;
+        callback_pending = callback_finish = false;
+        pthread_mutex_unlock(&callback_lock);
         bool ok = ap2cl_connect(p);
         if ((missing_event && cycle == 1) || (retained_retry && cycle == 2)) {
             const char *detail = NULL;
@@ -405,9 +525,48 @@ int main(int argc, char **argv)
         }
         assert(ok && "native reconnect must attach a fresh reverse event channel");
         assert(ap2cl_state(p) == AP2_CONNECTED);
-        assert(ap2cl_feedback(p));
-        assert(atomic_load(&commands) == (admitted ? cycle - ((missing_event || retained_retry) ? 1u : 0u) : 0) ||
-               (retained_retry && cycle == 1 && atomic_load(&commands) == 1));
+        if (delayed_callback) {
+            pthread_mutex_lock(&callback_lock);
+            while (!callback_pending)
+                pthread_cond_wait(&callback_cond, &callback_lock);
+            pthread_mutex_unlock(&callback_lock);
+        }
+        if (reentrant && cycle == 1) {
+            pthread_mutex_lock(&callback_lock);
+            while (!callback_entered)
+                pthread_cond_wait(&callback_cond, &callback_lock);
+            pthread_mutex_unlock(&callback_lock);
+        }
+        if (retire_during_callback && cycle == 1) {
+            pthread_t feedback;
+            assert(!pthread_create(&feedback, NULL, public_feedback, p));
+            pthread_mutex_lock(&callback_lock);
+            while (!callback_pending)
+                pthread_cond_wait(&callback_cond, &callback_lock);
+            callback_release = true;
+            pthread_cond_broadcast(&callback_cond);
+            pthread_mutex_unlock(&callback_lock);
+            assert(ap2cl_disconnect(p));
+            assert(ap2cl_connect(p));
+            assert(ap2cl_control_healthy(p));
+            pthread_mutex_lock(&callback_lock);
+            callback_finish = true;
+            pthread_cond_broadcast(&callback_cond);
+            pthread_mutex_unlock(&callback_lock);
+            assert(!pthread_join(feedback, NULL));
+            assert(ap2cl_control_healthy(p)); /* Old EOF cannot poison new health. */
+            cycle++;
+        } else {
+            assert(ap2cl_feedback(p));
+        }
+        if (reentrant) {
+            assert(atomic_load(&reentrant_commands) >= 2);
+            pthread_mutex_lock(&callback_lock);
+            callback_release = true;
+            pthread_cond_broadcast(&callback_cond);
+            pthread_mutex_unlock(&callback_lock);
+        }
+        if (!reentrant) await_commands();
         if (!ap2cl_control_healthy(p))
             fprintf(stderr, "control unhealthy on cycle %u\n", cycle);
         assert(ap2cl_control_healthy(p));
@@ -415,24 +574,41 @@ int main(int argc, char **argv)
             if (retained_metadata && cycle > 1)
                 assert(ap2cl_mrp_push(p) == 200);
             else if (retained_metadata) {
+                if (retained_playing) {
+                    uint64_t at;
+                    ap2cl_start(p, 0, &at);
+                    assert(ap2cl_is_playing(p));
+                } else {
+                    ap2cl_pause(p);
+                }
                 assert(ap2cl_set_metadata_ex(p, "fixture title", "fixture artist", "fixture album",
                     120, "fixture-id", "image/jpeg", k_baseline_jpeg, sizeof(k_baseline_jpeg),
                     NULL, NULL, NULL));
                 assert(ap2cl_set_progress(p, 37, 120));
+                ap2cl_mrp_publish_playback_state(p);
                 assert(ap2cl_mrp_push(p) == 200);
             } else
                 assert(ap2cl_set_metadata(p, "fixture title", "fixture artist", "fixture album", 120, "fixture-id"));
         }
         assert(ap2cl_disconnect(p));
+        pthread_mutex_lock(&callback_lock);
+        assert(command_count == command_limit); /* Joined worker: no late duplicates. */
+        pthread_mutex_unlock(&callback_lock);
     }
     assert(ap2cl_destroy(p)); assert(!pthread_join(thread, NULL));
     assert(r.sessions == (retained_retry ? 3u : 2u));
+    if (reentrant) assert(atomic_load(&reentrant_commands) == 3);
     if (publication) {
         unsigned last = retained_retry ? 2 : 1;
         fprintf(stderr, "registration masks: first=%u last=%u (expected 63 each)\n",
                 r.registrations[0], r.registrations[last]);
         assert(r.registrations[0] == ALL_REGISTRATIONS && r.registrations[last] == ALL_REGISTRATIONS);
         if (retained_metadata) {
+            uint64_t expected = retained_playing ? AP2_MRP_PLAYBACK_PLAYING : AP2_MRP_PLAYBACK_PAUSED;
+            fprintf(stderr, "decrypted playback state: first=%llu last=%llu expected=%llu\n",
+                    (unsigned long long)r.playback_state[0],
+                    (unsigned long long)r.playback_state[last], (unsigned long long)expected);
+            assert(r.playback_state[0] == expected && r.playback_state[last] == expected);
             assert(r.nowplaying_len[0] == r.nowplaying_len[last]);
             assert(!memcmp(r.nowplaying[0], r.nowplaying[last], r.nowplaying_len[0]));
         }
@@ -440,10 +616,36 @@ int main(int argc, char **argv)
     }
     close(r.control_listener); close(r.event_listener);
     EVP_PKEY_free(identity);
-    puts(publication ? "test_ap2_reconnect: PASS (fresh publication registrations)" :
+    puts(retire_during_callback ? "test_ap2_reconnect: PASS (old feedback survives retirement; new health preserved)" :
+         reentrant ? "test_ap2_reconnect: PASS (synchronous feedback callback publication)" :
+         delayed_callback ? "test_ap2_reconnect: PASS (awaited delayed callback; exact counts)" :
+         publication ? "test_ap2_reconnect: PASS (fresh publication registrations)" :
          missing_event ? "test_ap2_reconnect: PASS (failed event admission -> fresh successful session)" :
          mrp_disabled ? "test_ap2_reconnect: PASS (MRP disabled reconnect)" :
          non_apple ? "test_ap2_reconnect: PASS (non-Apple reconnect)" :
          "test_ap2_reconnect: PASS (two encrypted native sessions, fresh event keys, type130 off)");
     return 0;
+}
+
+static int bounded_reentrant(int argc, char **argv)
+{
+    pid_t child = fork();
+    assert(child >= 0);
+    if (!child) {
+        assert(!setenv("AP2_REENTRANT_CHILD", "1", 1));
+        exit(main(argc, argv));
+    }
+    uint64_t deadline = ap2_io_monotonic_ms() + 4000;
+    while (ap2_io_monotonic_ms() < deadline) {
+        int status;
+        pid_t result = waitpid(child, &status, WNOHANG);
+        assert(result >= 0);
+        if (result == child)
+            return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+        usleep(10000);
+    }
+    assert(!kill(child, SIGKILL));
+    assert(waitpid(child, NULL, 0) == child);
+    fprintf(stderr, "FAIL: synchronous feedback callback publication deadlocked (child reaped)\n");
+    return 1;
 }

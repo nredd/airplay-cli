@@ -146,7 +146,13 @@ struct ap2_mrp_ctx *ap2_mrp_create(const char *host, int port,
                                     const char *group_uuid,
                                     const uint8_t *secret, size_t secret_len);
 
-/* Destroy the context and release all resources. */
+/* Retain while holding an existing reference (or the owner's pointer lock).
+ * Each reference keeps channel keys, sockets and callback state alive. Release
+ * with release; the final reference closes channels and frees the context.
+ * Destroy retires the owner's context: no new input/volume work, but in-flight
+ * callbacks may finish using their references. It is not a cancellation fence. */
+struct ap2_mrp_ctx *ap2_mrp_retain(struct ap2_mrp_ctx *m);
+void ap2_mrp_release(struct ap2_mrp_ctx *m);
 void ap2_mrp_destroy(struct ap2_mrp_ctx *m);
 
 /*

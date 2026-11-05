@@ -254,6 +254,10 @@ test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT
 	$(RECONNECT_TEST) --publication
 	$(RECONNECT_TEST) --retained-metadata
 	$(RECONNECT_TEST) --retained-retry
+	$(RECONNECT_TEST) --retained-playing
+	$(RECONNECT_TEST) --reentrant-publication
+	$(RECONNECT_TEST) --retired-feedback
+	$(RECONNECT_TEST) --callback-barrier
 	$(TEST_EXECUTABLE)
 	$(RAOP_LIFECYCLE_TEST_EXECUTABLE)
 	$(RAOP_SESSION_TEST)
@@ -344,10 +348,16 @@ build/tests/test_ap2_reconnect.o: tests/test_ap2_reconnect.c tests/mrp_jpeg_fixt
 	@mkdir -p $(dir $@)
 	$(CC) $(TEST_CFLAGS) -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED $(INCLUDE) -c $< -o $@
 
-$(RECONNECT_TEST): build/tests/test_ap2_reconnect.o $(BUILDDIR)/ap2_client.o \
+# Control only the automatic worker's sleep for deterministic public feedback
+# reentry tests; the production client state and protocol code are unchanged.
+build/tests/ap2_client_reconnect.o: src/ap2_client.c src/ap2_mrp.h Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -Dusleep=ap2_reconnect_usleep -c $< -o $@
+
+$(RECONNECT_TEST): build/tests/test_ap2_reconnect.o build/tests/ap2_client_reconnect.o \
 		build/tests/cross_ssl.o build/tests/ap2_ptp_reconnect.o \
 		$(CLIENT_TEST_OBJECTS) $(LIBCODECS_PATCHED) Makefile
-	$(CXX) build/tests/test_ap2_reconnect.o $(BUILDDIR)/ap2_client.o \
+	$(CXX) build/tests/test_ap2_reconnect.o build/tests/ap2_client_reconnect.o \
 		build/tests/cross_ssl.o build/tests/ap2_ptp_reconnect.o \
 		$(filter-out $(BUILDDIR)/ap2_hap.o $(BUILDDIR)/ap2_ptp.o,$(CLIENT_TEST_OBJECTS)) \
 		$(LIBCODECS_PATCHED) $(MDNS)/$(HOST)/$(PLATFORM)/libmdns.a \

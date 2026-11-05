@@ -296,6 +296,7 @@ struct ap2cl_s {
     uint64_t sync_packets_sent;
     uint64_t sync_packets_dropped;
     atomic_uint feedback_failures;
+    uint64_t feedback_session; /* mrp_lock: RTSP feedback receipt identity */
     uint64_t timeline_reanchors;
     bool splice_timeline;         /* discard-free warm path on one immutable
                                      anchor line — the native default; false
@@ -1123,19 +1124,23 @@ static void ap2_rtx_stop(struct ap2cl_s *p)
     p->rtx_ring = NULL;
 }
 
-static void ap2_service_mrp_input(struct ap2cl_s *p)
+/* Return an owned session reference, not an unlocked borrowed pointer. Tick
+ * invokes synchronous user callbacks, so neither client mutex may span it.
+ * Retention also prevents pointer ABA when disconnect/reconnect replaces MRP. */
+static struct ap2_mrp_ctx *ap2_service_mrp_input(struct ap2cl_s *p)
 {
-    if (!p || atomic_load(&p->rtsp_dead)) return;
+    if (!p || atomic_load(&p->rtsp_dead)) return NULL;
     pthread_mutex_lock(&p->mrp_lock);
-    struct ap2_mrp_ctx *mrp = p->mrp;
+    struct ap2_mrp_ctx *mrp = ap2_mrp_retain(p->mrp);
     pthread_mutex_unlock(&p->mrp_lock);
-    if (!mrp) return;
+    if (!mrp) return NULL;
 
     ap2_mrp_tick(mrp);
     pthread_mutex_lock(&p->mrp_lock);
     if (p->mrp == mrp)
         atomic_store(&p->mrp_event_health, ap2_mrp_event_status(mrp));
     pthread_mutex_unlock(&p->mrp_lock);
+    return mrp;
 }
 
 static void *ap2_feedback_thread_main(void *arg)
@@ -1148,7 +1153,7 @@ static void *ap2_feedback_thread_main(void *arg)
               AP2_FEEDBACK_INTERVAL_MS);
     while (!atomic_load(&p->feedback_stop) &&
            !atomic_load(&p->rtsp_dead)) {
-        ap2_service_mrp_input(p);
+        ap2_mrp_release(ap2_service_mrp_input(p));
         uint64_t now_ms = ap2_io_monotonic_ms();
         if (now_ms < next_tick_ms) {
             uint64_t sleep_ms = next_tick_ms - now_ms;
@@ -3553,6 +3558,10 @@ bool ap2cl_disconnect(struct ap2cl_s *p)
     if (!p) return false;
     if (p->flow == FLOW_NATIVE_AP2) {
         ap2_feedback_stop(p);
+        pthread_mutex_lock(&p->mrp_lock);
+        p->feedback_session++;
+        atomic_store(&p->feedback_failures, 0);
+        pthread_mutex_unlock(&p->mrp_lock);
         ap2_clock_verify_disarm(p);
         ap2_clock_verify_reap_poller(p);
         ap2_rtx_stop(p);
@@ -3565,8 +3574,9 @@ bool ap2cl_disconnect(struct ap2cl_s *p)
         pthread_mutex_lock(&p->mrp_lock);
         struct ap2_mrp_ctx *mrp = p->mrp;
         p->mrp = NULL;
-        /* Feedback is joined and publication excluded. Drop all session keys,
-         * identifiers and pending volume work, not just the old sockets. */
+        /* The worker is joined and publication excluded. Retire volume work
+         * now; an external feedback reference may still own the old channels
+         * until its synchronous callback finishes. Never reuse their keys. */
         if (mrp) ap2_mrp_destroy(mrp);
         /* Publication receipts and receiver-specific fallback belong to the
          * retired session, not the desired metadata intent. */
@@ -4885,6 +4895,9 @@ bool ap2cl_feedback(struct ap2cl_s *p)
      * is raopcl_keepalive(). The POST itself is what resets the receiver's
      * idle timer; its body carries the receiver's active-stream list. */
     if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return false;
+    pthread_mutex_lock(&p->mrp_lock);
+    uint64_t feedback_session = p->feedback_session;
+    pthread_mutex_unlock(&p->mrp_lock);
     uint8_t *resp = NULL; int resp_len = 0;
     bool request_started = false;
     int status = ap2_rtsp_send_tracked(
@@ -4900,47 +4913,33 @@ bool ap2cl_feedback(struct ap2cl_s *p)
     } else {
         LOG_DEBUG("[AP2] /feedback keepalive -> %d", status);
     }
-    /* Service event/DataStream input after the receiver keepalive itself.
-     * State output takes the publication lock only when immediately available,
-     * so metadata work can never delay the next feedback cadence. */
-    if (!atomic_load(&p->rtsp_dead) &&
-        pthread_mutex_trylock(&p->mrp_publish_lock) == 0) {
+    /* Input dispatch owns a reference, never the publication mutex. State
+     * output alone tries that mutex; a retired tick cannot publish or complete
+     * a new session's generation, even if reconnect occurred in a callback. */
+    struct ap2_mrp_ctx *mrp = ap2_service_mrp_input(p);
+    if (mrp && pthread_mutex_trylock(&p->mrp_publish_lock) == 0) {
+        uint8_t *state = NULL;
+        int state_len = 0;
+        uint64_t state_generation = 0;
         pthread_mutex_lock(&p->mrp_lock);
-        struct ap2_mrp_ctx *mrp = p->mrp;
+        bool prepared = p->mrp == mrp && ap2_mrp_prepare_state_push(
+            mrp, &state, &state_len, &state_generation);
         pthread_mutex_unlock(&p->mrp_lock);
-
-        if (mrp) {
-            ap2_mrp_tick(mrp);
+        if (prepared) {
+            bool state_ok = ap2_mrp_send_state_push(mrp, state, state_len);
             pthread_mutex_lock(&p->mrp_lock);
-            if (p->mrp == mrp) {
-                atomic_store(&p->mrp_event_health,
-                             ap2_mrp_event_status(mrp));
-            }
+            if (p->mrp == mrp)
+                ap2_mrp_complete_state_push(mrp, state_generation, state_ok);
             pthread_mutex_unlock(&p->mrp_lock);
-
-            {
-                uint8_t *state = NULL;
-                int state_len = 0;
-                uint64_t state_generation = 0;
-                pthread_mutex_lock(&p->mrp_lock);
-                bool prepared =
-                    p->mrp == mrp &&
-                    ap2_mrp_prepare_state_push(
-                        mrp, &state, &state_len, &state_generation);
-                pthread_mutex_unlock(&p->mrp_lock);
-                if (prepared) {
-                    bool state_ok =
-                        ap2_mrp_send_state_push(mrp, state, state_len);
-                    pthread_mutex_lock(&p->mrp_lock);
-                    if (p->mrp == mrp)
-                        ap2_mrp_complete_state_push(
-                            mrp, state_generation, state_ok);
-                    pthread_mutex_unlock(&p->mrp_lock);
-                }
-                free(state);
-            }
         }
+        free(state);
         pthread_mutex_unlock(&p->mrp_publish_lock);
+    }
+    ap2_mrp_release(mrp);
+    pthread_mutex_lock(&p->mrp_lock);
+    if (p->feedback_session != feedback_session) {
+        pthread_mutex_unlock(&p->mrp_lock);
+        return result == AP2_FEEDBACK_SUCCEEDED;
     }
     if (result == AP2_FEEDBACK_SUCCEEDED) {
         unsigned prior_misses = atomic_exchange(&p->feedback_failures, 0);
@@ -4950,6 +4949,7 @@ bool ap2cl_feedback(struct ap2cl_s *p)
     } else if (result == AP2_FEEDBACK_FAILED) {
         atomic_fetch_add(&p->feedback_failures, 1);
     }
+    pthread_mutex_unlock(&p->mrp_lock);
     return result == AP2_FEEDBACK_SUCCEEDED;
 }
 
@@ -4967,11 +4967,13 @@ bool ap2cl_session_volume_action(struct ap2cl_s *p, const char *action,
     const struct ap2_volume_transaction *t)
 {
     if (!p) return false;
-    /* Disconnect can retire the session while the command thread is live.
-     * Serialize these short driver actions with context destruction. */
+    /* Completion can synchronously dispatch trailing work. Keep the context
+     * alive without holding the owner lock across a backend callback. */
     pthread_mutex_lock(&p->mrp_lock);
-    bool result = ap2_mrp_volume_action(p->mrp, action, t);
+    struct ap2_mrp_ctx *mrp = ap2_mrp_retain(p->mrp);
     pthread_mutex_unlock(&p->mrp_lock);
+    bool result = ap2_mrp_volume_action(mrp, action, t);
+    ap2_mrp_release(mrp);
     return result;
 }
 /* Shared existing curve/send path; checked and legacy callers differ only in

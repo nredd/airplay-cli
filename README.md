@@ -109,7 +109,17 @@ receipts; a subsequent connect cannot reuse their keys or pending volume work.
 Desired MRP metadata, artwork, progress and playback intent survive disconnect
 and a failed event admission, and are released on destroy. The next MRP
 attachment restores them without reusing channel state or implying receiver-side
-now-playing acceptance.
+now-playing acceptance. The loopback suite asserts decrypted playing and paused
+playback-state payloads as well as complete now-playing bytes across reconnect.
+Feedback input retains its MRP session while invoking synchronous callbacks
+outside the client publication/owner locks; callbacks can publish immediately.
+Retired sessions cannot update a replacement session's health or publication
+receipts. Concurrent input readers skip an already active reader rather than
+reentering its buffers. Deterministic callback/reconnect fixtures control only
+worker sleep scheduling, and own/reap a deadline-bounded child on failure.
+Callback count checks await an explicit completion condition with a bounded
+deadline, reject unexpected/duplicate dispatches, and recheck after worker join;
+returning from feedback alone is not a callback-completion fence.
 
 ### Experimental HomePod remote admission
 

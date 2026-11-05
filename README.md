@@ -101,7 +101,8 @@ contract runs in unittest discovery and CI, not in that Make target.
 The native reconnect fixture performs real HAP pair-verify and encrypted RTSP
 against loopback receivers, with PTP transport intercepted to avoid device
 traffic and privileged ports. It covers connect/disconnect/connect with type 130
-off, fresh reverse-event keys, and recovery after missing-event admission.
+off, fresh reverse-event keys, recovery after missing-event admission, and
+control health after reconnect with MRP disabled or an ineligible receiver.
 Native disconnect retires connection-owned HAP/MRP, timing, encoder and media
 sockets; a subsequent connect cannot reuse their keys or pending volume work.
 

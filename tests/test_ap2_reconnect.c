@@ -204,6 +204,7 @@ typedef struct {
     EVP_PKEY *identity;
     unsigned sessions;
     bool missing_first_event;
+    bool send_commands;
 } receiver_t;
 
 static int listener(int *port)
@@ -250,7 +251,7 @@ static void *receiver(void *arg)
                 body_len = ap2_plist_serialize(p, &body); ap2_plist_free(p);
             }
             reply(fd, &hap, cseq, body, (size_t)body_len); free(body);
-            if (!omit_event && !strncmp((char *)buf, "SETPEERS ", 9)) {
+            if (r->send_commands && !omit_event && !strncmp((char *)buf, "SETPEERS ", 9)) {
                 assert(event >= 0);
                 send_pause(event, hap.shared_secret);
             }
@@ -275,13 +276,17 @@ static void remote(ap2_remote_command_t command, void *arg)
 
 int main(int argc, char **argv)
 {
-    assert(argc == 1 || (argc == 2 && !strcmp(argv[1], "--missing-first-event")));
-    bool missing_event = argc == 2;
+    assert(argc == 1 || (argc == 2 && (!strcmp(argv[1], "--missing-first-event") ||
+        !strcmp(argv[1], "--mrp-disabled") || !strcmp(argv[1], "--non-apple"))));
+    bool missing_event = argc == 2 && !strcmp(argv[1], "--missing-first-event");
+    bool mrp_disabled = argc == 2 && !strcmp(argv[1], "--mrp-disabled");
+    bool non_apple = argc == 2 && !strcmp(argv[1], "--non-apple");
+    bool admitted = !mrp_disabled && !non_apple;
     alarm(20); /* Bound failures even if a protocol peer regresses. */
     signal(SIGPIPE, SIG_IGN);
-    assert(!setenv("CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE", "1", 1));
+    assert(!setenv("CLIAIRPLAY_EXPERIMENTAL_HOMEPOD_REMOTE", admitted ? "1" : "0", 1));
     assert(!setenv("CLIAIRPLAY_MRP_TYPE130", "0", 1));
-    assert(!setenv("CLIAIRPLAY_MRP", "1", 1));
+    assert(!setenv("CLIAIRPLAY_MRP", mrp_disabled ? "0" : "1", 1));
     assert(!setenv("CLIAIRPLAY_SESSION_VOLUME", "0", 1));
     uint8_t seed[32] = {1}, client_seed[32] = {2}, pub[32]; size_t n = 32;
     EVP_PKEY *identity = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, seed, 32);
@@ -294,11 +299,12 @@ int main(int argc, char **argv)
     char credentials[193];
     for (size_t i = 0; i < sizeof(raw); i++) snprintf(credentials + 2 * i, 3, "%02x", raw[i]);
     int port;
-    receiver_t r = {.identity = identity, .missing_first_event = missing_event};
+    receiver_t r = {.identity = identity, .missing_first_event = missing_event,
+                    .send_commands = admitted};
     r.control_listener = listener(&port); r.event_listener = listener(&r.event_port);
     pthread_t thread; assert(!pthread_create(&thread, NULL, receiver, &r));
     ap2_device_info_t device = {.name = "offline reconnect", .address = "127.0.0.1", .port = port,
-        .txt_records = "model=AudioAccessory5,1 osvers=27.0"};
+        .txt_records = non_apple ? "model=OtherReceiver osvers=27.0" : "model=AudioAccessory5,1 osvers=27.0"};
     ap2_audio_format_t format = {.sample_rate = 44100, .bit_depth = 16, .channels = 2};
     struct ap2cl_s *p = ap2cl_create(&device, &format, credentials, NULL, "0011223344556677", "1", 600, 0);
     assert(p); ap2cl_force_native(p); ap2cl_set_ptp(p, true);
@@ -322,7 +328,9 @@ int main(int argc, char **argv)
         assert(ok && "native reconnect must attach a fresh reverse event channel");
         assert(ap2cl_state(p) == AP2_CONNECTED);
         assert(ap2cl_feedback(p));
-        assert(atomic_load(&commands) == cycle - (missing_event ? 1u : 0u));
+        assert(atomic_load(&commands) == (admitted ? cycle - (missing_event ? 1u : 0u) : 0));
+        if (!ap2cl_control_healthy(p))
+            fprintf(stderr, "control unhealthy on cycle %u\n", cycle);
         assert(ap2cl_control_healthy(p));
         assert(ap2cl_disconnect(p));
         /* A late backend completion cannot address the retired context. */
@@ -333,6 +341,8 @@ int main(int argc, char **argv)
     assert(r.sessions == 2); close(r.control_listener); close(r.event_listener);
     EVP_PKEY_free(identity);
     puts(missing_event ? "test_ap2_reconnect: PASS (failed event admission -> fresh successful session)" :
+         mrp_disabled ? "test_ap2_reconnect: PASS (MRP disabled reconnect)" :
+         non_apple ? "test_ap2_reconnect: PASS (non-Apple reconnect)" :
          "test_ap2_reconnect: PASS (two encrypted native sessions, fresh event keys, type130 off)");
     return 0;
 }

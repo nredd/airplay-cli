@@ -1991,6 +1991,8 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     ap2_set_connect_error(p, AP2_CONNECT_ERROR_GENERIC, 0,
                           "native AirPlay 2 connect failed");
     p->last_error_response_len = 0;
+    /* This session has no event channel until one is attached. */
+    atomic_store(&p->mrp_event_health, -1);
 
     /* Resolve the local bind address once (multi-homed hosts): used for the
      * RTSP TCP socket and the RTP data/control UDP sockets below. */

@@ -6,6 +6,7 @@ References:
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import io
 import json
@@ -127,6 +128,9 @@ class NativeSenderProbeTest(unittest.TestCase):
         records = [json.loads(line) for line in output.splitlines()]
         self.assertEqual(sum(record["kind"] == "ready" for record in records), 1)
         self.assertTrue(records[-1]["success"])
+        self.assertEqual(records[0]["sender_relay"], 0)
+        self.assertEqual(records[0]["multiselect"], 0)
+        self.assertEqual(records[0]["ptp_follow"], "auto")
         self.assertNotIn("do-not-emit", output)
         data = self.assert_cleaned()
         self.assertEqual(data["before_connected"], "")
@@ -152,6 +156,98 @@ class NativeSenderProbeTest(unittest.TestCase):
         self.assertNotIn("private", str(data["env"]))
         self.assertIn("'CLIAIRPLAY_MRP_TYPE130': '1'", str(data["env"]))
         self.assertIn("'CLIAIRPLAY_BUFFERED': '0'", str(data["env"]))
+
+    def test_probe_enums_and_environment_isolation(self) -> None:
+        """Only explicit enums enter the child, never inherited probe settings."""
+        keys = (
+            "CLIAIRPLAY_PROBE_SENDER_RELAY",
+            "CLIAIRPLAY_PROBE_MULTISELECT",
+            "CLIAIRPLAY_PTP_FOLLOW",
+        )
+        with patch.dict(os.environ, dict.fromkeys(keys, "private")):
+            for relay in (0, 1):
+                for multi in (0, 1):
+                    for follow in ("auto", "0", "1"):
+                        with self.subTest(relay=relay, multi=multi, follow=follow):
+                            env = probe.child_env(1, relay, multi, follow)
+                            expected = {}
+                            if relay:
+                                expected[keys[0]] = "1"
+                            if multi:
+                                expected[keys[1]] = "1"
+                            if follow != "auto":
+                                expected[keys[2]] = follow
+                            self.assertEqual(
+                                {key: env[key] for key in keys if key in env}, expected
+                            )
+                            self.assertNotIn("private", str(env))
+            self.assertTrue(set(keys).isdisjoint(probe.child_env(0)))
+        for follow in probe.PtpFollow:
+            self.assertEqual(
+                probe.child_env(0, ptp_follow=follow),
+                probe.child_env(0, ptp_follow=follow.value),
+            )
+        for args in (
+            (2, 0, 0, "auto"),
+            (0, 2, 0, "auto"),
+            (0, 0, 2, "auto"),
+            (0, 0, 0, "yes"),
+        ):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                probe.child_env(*args)
+
+    def test_explicit_probe_options_and_safe_configuration(self) -> None:
+        """Record fixed configuration enums and propagate options to the child."""
+        code, output = self.run_probe(
+            "--sender-relay", "1", "--multiselect", "1", "--ptp-follow", "0"
+        )
+        self.assertEqual(code, 0, output)
+        cfg = json.loads(output.splitlines()[0])
+        self.assertEqual(
+            cfg,
+            {
+                "kind": "configuration",
+                "type130": 1,
+                "timing": "ntp",
+                "debug": 0,
+                "duration": 1,
+                "sender_relay": 1,
+                "multiselect": 1,
+                "ptp_follow": "0",
+            },
+        )
+        self.assertNotIn(str(self.binary), output)
+        self.assertNotIn("127.0.0.1", output)
+        env = self.assert_cleaned()["env"]
+        assert isinstance(env, dict)
+        self.assertEqual(env["CLIAIRPLAY_PROBE_SENDER_RELAY"], "1")
+        self.assertEqual(env["CLIAIRPLAY_PROBE_MULTISELECT"], "1")
+        self.assertEqual(env["CLIAIRPLAY_PTP_FOLLOW"], "0")
+
+    def test_probe_option_defaults_and_rejection(self) -> None:
+        """Defaults leave all probes off; malformed values fail before launch."""
+        opts = probe.parser().parse_args(self.args())
+        self.assertEqual(
+            (opts.sender_relay, opts.multiselect, opts.ptp_follow), (0, 0, "auto")
+        )
+        self.assertIs(opts.ptp_follow, probe.PtpFollow.AUTO)
+        for follow in probe.PtpFollow:
+            opts = probe.parser().parse_args(self.args("--ptp-follow", follow.value))
+            self.assertIs(opts.ptp_follow, follow)
+        with self.assertRaises(ValueError) as error:
+            probe.child_env(0, ptp_follow="private")
+        self.assertNotIn("private", str(error.exception))
+        with self.assertRaises(argparse.ArgumentTypeError) as error:
+            probe.ptp_follow_option("private")
+        self.assertNotIn("private", str(error.exception))
+        for flag in ("--sender-relay", "--multiselect", "--ptp-follow"):
+            for value in ("2", "yes", "private", "01", "+1"):
+                with (
+                    self.subTest(flag=flag, value=value),
+                    contextlib.redirect_stderr(io.StringIO()),
+                    self.assertRaises(SystemExit),
+                ):
+                    probe.parser().parse_args(self.args(flag, value))
 
     def test_failures_and_cleanup(self) -> None:
         """Reject malformed checks, unreachable targets, missing starts and errors."""
@@ -245,6 +341,15 @@ class NativeSenderProbeTest(unittest.TestCase):
         )
         self.assertEqual(
             probe.safe_fields(b"[EVENT] remote command=hidden", "remote"), {}
+        )
+        self.assertEqual(
+            probe.safe_fields(
+                b'[STATUS] error code=auth_required http=403 detail="hidden"', "error"
+            ),
+            {"code": "auth_required", "http": "403"},
+        )
+        self.assertEqual(
+            probe.safe_fields(b"[STATUS] error code=hidden http=hidden", "error"), {}
         )
 
     def test_reader_bounds_and_terminal_latches(self) -> None:

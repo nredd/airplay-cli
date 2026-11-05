@@ -1900,6 +1900,68 @@ static bool ap2_native_pair(struct ap2cl_s *p)
     return false;
 }
 
+/* Experimental declarations only, not relay-message support. Exactly one
+ * writer is supplied: keep both existing session writers byte-identical when
+ * disabled. Unlike general toggles, ONLY the literal "1" opts into this probe. */
+static void ap2_probe_setup_declarations(ap2_pl_node *ptp, struct ap2_plist *ntp)
+{
+    if (!ptp && !ntp) return;
+    static const struct { const char *env; const char *key; } fields[] = {
+        { "CLIAIRPLAY_PROBE_SENDER_RELAY", "senderSupportsRelay" },
+        { "CLIAIRPLAY_PROBE_MULTISELECT", "isMultiSelectAirPlay" },
+    };
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+        const char *value = getenv(fields[i].env);
+        if (!value || strcmp(value, "1") != 0) continue;
+        if (ptp) ap2_pl_dict_set(ptp, fields[i].key, ap2_pl_bool(true));
+        else ap2_plist_add_bool(ntp, fields[i].key, true);
+    }
+}
+
+/* Build session SETUP bodies through the same production paths that native
+ * connect uses. Keeping declaration injection here makes every caller, and the
+ * AP2_TESTING regression hook below, exercise the real PTP/NTP writers. */
+static int ap2_build_ptp_session_setup(const char *device_id, const char *session_uuid,
+                                       const char *name, const char *mac_address,
+                                       const char *group_uuid, const char *peer_id,
+                                       uint64_t timeline_id, const char *our_addr,
+                                       uint8_t **plist_data)
+{
+    ap2_pl_node *root = ap2_pl_dict();
+    ap2_pl_dict_set(root, "timingProtocol", ap2_pl_string("PTP"));
+    ap2_pl_dict_set(root, "deviceID", ap2_pl_string(device_id));
+    ap2_pl_dict_set(root, "sessionUUID", ap2_pl_string(session_uuid));
+    ap2_pl_dict_set(root, "name", ap2_pl_string(name));
+    ap2_pl_dict_set(root, "macAddress", ap2_pl_string(mac_address));
+    ap2_pl_dict_set(root, "groupUUID", ap2_pl_string(group_uuid));
+    ap2_pl_dict_set(root, "groupContainsGroupLeader", ap2_pl_bool(false));
+    ap2_pl_dict_set(root, "timingPeerInfo",
+                    ap2_make_timing_peer(peer_id, timeline_id, our_addr));
+    ap2_pl_node *peer_list = ap2_pl_array();
+    ap2_pl_array_append(peer_list,
+                        ap2_make_timing_peer(peer_id, timeline_id, our_addr));
+    ap2_pl_dict_set(root, "timingPeerList", peer_list);
+    ap2_probe_setup_declarations(root, NULL);
+    int plist_len = ap2_pl_serialize(root, plist_data);
+    ap2_pl_free(root);
+    return plist_len;
+}
+
+static int ap2_build_ntp_session_setup(const char *device_id, bool id_valid,
+                                       const char *session_uuid, int timing_port,
+                                       uint8_t **plist_data)
+{
+    struct ap2_plist *root = ap2_plist_create();
+    if (id_valid) ap2_plist_add_string(root, "deviceID", device_id);
+    ap2_plist_add_string(root, "sessionUUID", session_uuid);
+    ap2_plist_add_int(root, "timingPort", timing_port);
+    ap2_plist_add_string(root, "timingProtocol", "NTP");
+    ap2_probe_setup_declarations(NULL, root);
+    int plist_len = ap2_plist_serialize(root, plist_data);
+    ap2_plist_free(root);
+    return plist_len;
+}
+
 static bool ap2_native_connect(struct ap2cl_s *p)
 {
     /* Default outcome for every failure path below; the auth-aware sites
@@ -2045,7 +2107,8 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     if (p->use_ptp) {
         char peer_id[37];
         ap2_gen_uuid(peer_id);
-        const char *name = (p->device.name && *p->device.name) ? p->device.name : "cliairplay";
+        const char *name = (p->device.name && *p->device.name)
+                               ? p->device.name : "cliairplay";
 
         /* Advertise OUR clock as the session timeline (the engine holds
          * grandmaster): receivers only follow masters from the timing-peer
@@ -2053,33 +2116,15 @@ static bool ap2_native_connect(struct ap2cl_s *p)
          * below is expressed against this same clock domain. */
         uint64_t timeline_id = ap2_ptp_master_clock_id(p->ptp);
 
-        ap2_pl_node *root = ap2_pl_dict();
-        ap2_pl_dict_set(root, "timingProtocol", ap2_pl_string("PTP"));
-        ap2_pl_dict_set(root, "deviceID", ap2_pl_string(dev_colon));
-        ap2_pl_dict_set(root, "sessionUUID", ap2_pl_string(p->session_uuid));
-        ap2_pl_dict_set(root, "name", ap2_pl_string(name));
-        ap2_pl_dict_set(root, "macAddress", ap2_pl_string(mac_colon));
-        ap2_pl_dict_set(root, "groupUUID", ap2_pl_string(p->group_uuid));
-        ap2_pl_dict_set(root, "groupContainsGroupLeader", ap2_pl_bool(false));
-        ap2_pl_dict_set(root, "timingPeerInfo",
-                        ap2_make_timing_peer(peer_id, timeline_id, our_addr));
-        ap2_pl_node *peer_list = ap2_pl_array();
-        ap2_pl_array_append(peer_list, ap2_make_timing_peer(peer_id, timeline_id, our_addr));
-        ap2_pl_dict_set(root, "timingPeerList", peer_list);
-
-        plist_len = ap2_pl_serialize(root, &plist_data);
-        ap2_pl_free(root);
+        plist_len = ap2_build_ptp_session_setup(
+            dev_colon, p->session_uuid, name, mac_colon, p->group_uuid,
+            peer_id, timeline_id, our_addr, &plist_data);
         LOG_INFO("[AP2] PTP session SETUP (%d bytes, timelineID=%016llx%s, addr=%s)",
                  plist_len, (unsigned long long)timeline_id,
                  timeline_id == clock_id ? " [we are GM]" : " [slaving to peer]", our_addr);
     } else {
-        struct ap2_plist *sp = ap2_plist_create();
-        if (id_valid) ap2_plist_add_string(sp, "deviceID", dev_colon);
-        ap2_plist_add_string(sp, "sessionUUID", p->session_uuid);
-        ap2_plist_add_int(sp, "timingPort", timing_port);
-        ap2_plist_add_string(sp, "timingProtocol", "NTP");
-        plist_len = ap2_plist_serialize(sp, &plist_data);
-        ap2_plist_free(sp);
+        plist_len = ap2_build_ntp_session_setup(
+            dev_colon, id_valid, p->session_uuid, timing_port, &plist_data);
     }
 
     uint8_t *resp = NULL; int resp_len = 0;
@@ -5655,6 +5700,23 @@ bool ap2cl_is_playing(struct ap2cl_s *p)
 }
 
 #ifdef AP2_TESTING
+/* Serialize fixed production session bodies through the PTP/NTP builders.
+ * This omits only pairing, clocks, sockets, and random identifiers. */
+int ap2cl_test_session_setup(bool ptp, uint8_t **out)
+{
+    if (ptp) {
+        return ap2_build_ptp_session_setup(
+            "00:11:22:33:44:55:66:77", "11111111-1111-1111-1111-111111111111",
+            "setup test", "00:11:22:33:44:55",
+            "22222222-2222-2222-2222-222222222222",
+            "33333333-3333-3333-3333-333333333333", 0x1122334455667788ULL,
+            "192.0.2.1", out);
+    }
+    return ap2_build_ntp_session_setup(
+        "00:11:22:33:44:55:66:77", true,
+        "11111111-1111-1111-1111-111111111111", 12345, out);
+}
+
 /* Hand the client a ready MRP context without a paired session, so a test can
  * drive the /command now-playing path against a scripted RTSP peer. The
  * client takes ownership (ap2cl_destroy frees it). */

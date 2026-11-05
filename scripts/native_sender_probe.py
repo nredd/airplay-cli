@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+from enum import StrEnum
 from pathlib import Path
 from typing import IO
 
@@ -25,8 +26,23 @@ VERSION = re.compile(rb"cliairplay v[0-9A-Za-z][0-9A-Za-z.+_-]{0,127} check\r?\n
 MACHINE = re.compile(rb"\[(STATUS|EVENT)\] ([A-Za-z][A-Za-z0-9_]{0,63})(?: |\r?$)")
 AUDIO = re.compile(rb"buffered_ms=[1-9][0-9]{0,19}$")
 MRP_STATUS = re.compile(rb"(?:-1|0|1|[1-5][0-9]{2})$")
+HTTP_STATUS = re.compile(rb"(?:0|[1-5][0-9]{2})$")
 SAFE_FIELDS: dict[str, dict[bytes, set[bytes]]] = {
     "mrp": {b"path": {b"channel", b"command"}},
+    "error": {
+        b"code": {
+            b"auth_required",
+            b"auth_failed",
+            b"connect_failed",
+            b"start_failed",
+            b"flush_failed",
+            b"standby_failed",
+            b"play_failed",
+            b"pause_failed",
+            b"stop_failed",
+            b"announce_failed",
+        },
+    },
     "clock_ready": {
         b"mode": {b"ptp", b"ntp"},
         b"state": {b"cold", b"probing", b"ready", b"stalled"},
@@ -55,8 +71,10 @@ def safe_fields(chunk: bytes, name: str) -> dict[str, str]:
     allowed = SAFE_FIELDS.get(name, {})
     for field in chunk.split()[2:]:
         key, _, value = field.partition(b"=")
-        if value in allowed.get(key, set()) or (
-            name == "mrp" and key == b"status" and MRP_STATUS.fullmatch(value)
+        if (
+            value in allowed.get(key, set())
+            or (name == "mrp" and key == b"status" and MRP_STATUS.fullmatch(value))
+            or (name == "error" and key == b"http" and HTTP_STATUS.fullmatch(value))
         ):
             result[key.decode("ascii")] = value.decode("ascii")
     return result
@@ -127,9 +145,38 @@ def stop(child: subprocess.Popen[bytes]) -> None:
     child.wait()
 
 
-def child_env(type130: int) -> dict[str, str]:
-    """Pass only platform runtime variables, never inherited auth or tokens."""
-    return {
+class PtpFollow(StrEnum):
+    """Pre-SETUP clock role selection."""
+
+    AUTO = "auto"
+    DISABLED = "0"
+    ENABLED = "1"
+
+
+def child_env(
+    type130: int, sender_relay: int = 0, multiselect: int = 0, ptp_follow: str = "auto"
+) -> dict[str, str]:
+    """Allowlist runtime variables; opt into declarations and clock role explicitly.
+
+    Parameters:
+        type130 (int): Fixed channel toggle, 0 or 1.
+        sender_relay (int): Experimental relay declaration, 0 or 1.
+        multiselect (int): Experimental multiselect declaration, 0 or 1.
+        ptp_follow (str): Pre-SETUP clock role, auto, 0 or 1.
+
+    Returns:
+        dict[str, str]: Child environment without inherited probe overrides.
+
+    Raises:
+        ValueError: A toggle or clock role is outside its fixed domain.
+    """
+    try:
+        follow = PtpFollow(ptp_follow)
+    except ValueError:
+        raise ValueError("Expected fixed probe enums") from None
+    if type130 not in (0, 1) or sender_relay not in (0, 1) or multiselect not in (0, 1):
+        raise ValueError("Expected fixed probe enums")
+    env = {
         key: os.environ[key]
         for key in ("PATH", "SYSTEMROOT", "TMPDIR")
         if key in os.environ
@@ -138,6 +185,13 @@ def child_env(type130: int) -> dict[str, str]:
         "CLIAIRPLAY_MRP_TYPE130": str(type130),
         "CLIAIRPLAY_BUFFERED": "0",
     }
+    if sender_relay == 1:
+        env["CLIAIRPLAY_PROBE_SENDER_RELAY"] = "1"
+    if multiselect == 1:
+        env["CLIAIRPLAY_PROBE_MULTISELECT"] = "1"
+    if follow != PtpFollow.AUTO:
+        env["CLIAIRPLAY_PTP_FOLLOW"] = follow.value
+    return env
 
 
 def check_binary(binary: str, env: dict[str, str], deadline: float) -> None:
@@ -159,7 +213,7 @@ def check_binary(binary: str, env: dict[str, str], deadline: float) -> None:
 def probe(opts: argparse.Namespace) -> bool:
     """Run one sender within one absolute TTL; always clean up the FIFO and child."""
     deadline = time.monotonic() + opts.duration
-    env = child_env(opts.type130)
+    env = child_env(opts.type130, opts.sender_relay, opts.multiselect, opts.ptp_follow)
     check_binary(str(opts.binary), env, deadline)
     if time.monotonic() >= deadline:
         return False
@@ -275,6 +329,41 @@ def binary_path(value: str) -> Path:
     return path.resolve()
 
 
+def probe_toggle(value: str) -> int:
+    """Require one canonical disabled/enabled token.
+
+    Parameters:
+        value (str): Command-line token to validate.
+
+    Returns:
+        int: The validated toggle value.
+
+    Raises:
+        argparse.ArgumentTypeError: The token is not exactly `0` or `1`.
+    """
+    if value not in {"0", "1"}:
+        raise argparse.ArgumentTypeError("Expected exactly 0 or 1")
+    return int(value)
+
+
+def ptp_follow_option(value: str) -> PtpFollow:
+    """Convert a literal clock role at the CLI boundary.
+
+    Parameters:
+        value (str): Command-line token to validate.
+
+    Returns:
+        PtpFollow: The validated clock role.
+
+    Raises:
+        argparse.ArgumentTypeError: The token is not a supported clock role.
+    """
+    try:
+        return PtpFollow(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("Expected auto, 0 or 1") from None
+
+
 def parser() -> argparse.ArgumentParser:
     """Build the deliberately small, credential-free CLI."""
     result = argparse.ArgumentParser(description=__doc__)
@@ -285,6 +374,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--duration", type=int, choices=range(1, 121), default=45)
     result.add_argument("--debug", type=int, choices=(0, 1), default=0)
     result.add_argument("--timing", choices=("ntp", "ptp"), default="ntp")
+    result.add_argument("--sender-relay", type=probe_toggle, default=0)
+    result.add_argument("--multiselect", type=probe_toggle, default=0)
+    result.add_argument("--ptp-follow", type=ptp_follow_option, default=PtpFollow.AUTO)
     return result
 
 
@@ -296,6 +388,16 @@ def interrupted(signum: int, frame: object) -> None:
 def main(argv: list[str] | None = None) -> int:
     """Emit a sanitized final result even for runtime failure or interruption."""
     opts = parser().parse_args(argv)
+    emit(
+        "configuration",
+        type130=opts.type130,
+        timing=opts.timing,
+        debug=opts.debug,
+        duration=opts.duration,
+        sender_relay=opts.sender_relay,
+        multiselect=opts.multiselect,
+        ptp_follow=opts.ptp_follow,
+    )
     previous = signal.signal(signal.SIGTERM, interrupted)
     success = False
     reason = "not_started"

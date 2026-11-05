@@ -51,6 +51,7 @@ EVENT_TEST    = build/tests/test_ap2_event
 CLIENT_TEST   = build/tests/test_ap2_client
 SESSION_TEST  = build/tests/test_ap2_session
 PTP_TEST      = build/tests/test_ap2_ptp
+RECONNECT_TEST = build/tests/test_ap2_reconnect
 TEST_CFLAGS   = -Wall -Wextra -Werror -O2 $(CPPFLAGS) $(EXTRA_CFLAGS)
 
 # Compiler flags
@@ -238,7 +239,7 @@ no_sanitizer_report = case "$(1)" in *Sanitizer*|*"runtime error:"*) \
 	printf '%s\n' "$(1)" >&2; false;; esac
 
 test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT_TEST) \
-		$(SESSION_TEST) $(PTP_TEST) $(TEST_EXECUTABLE) $(RAOP_LIFECYCLE_TEST_EXECUTABLE) \
+		$(SESSION_TEST) $(PTP_TEST) $(RECONNECT_TEST) $(TEST_EXECUTABLE) $(RAOP_LIFECYCLE_TEST_EXECUTABLE) \
 		$(RAOP_SESSION_TEST) $(ANNOUNCE_TEST) $(LIVE_METADATA_TEST)
 	$(TIMELINE_TEST)
 	$(EVENT_TEST)
@@ -246,6 +247,17 @@ test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT
 	$(CLIENT_TEST)
 	$(SESSION_TEST)
 	$(PTP_TEST)
+	$(RECONNECT_TEST)
+	$(RECONNECT_TEST) --missing-first-event
+	$(RECONNECT_TEST) --mrp-disabled
+	$(RECONNECT_TEST) --non-apple
+	$(RECONNECT_TEST) --publication
+	$(RECONNECT_TEST) --retained-metadata
+	$(RECONNECT_TEST) --retained-retry
+	$(RECONNECT_TEST) --retained-playing
+	$(RECONNECT_TEST) --reentrant-publication
+	$(RECONNECT_TEST) --retired-feedback
+	$(RECONNECT_TEST) --callback-barrier
 	$(TEST_EXECUTABLE)
 	$(RAOP_LIFECYCLE_TEST_EXECUTABLE)
 	$(RAOP_SESSION_TEST)
@@ -324,6 +336,32 @@ $(PTP_TEST): tests/test_ap2_ptp.c src/ap2_ptp.c src/ap2_ptp.h src/ap2_ptp_shm.c 
 	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_ap2_ptp.c \
 		build/tests/ap2_ptp_test.o src/ap2_ptp_shm.c src/host_clock.c $(TOOLS)/cross_log.c \
 		$(LDFLAGS) -o $@
+
+# Real native lifecycle against a loopback HAP/RTSP receiver. Only PTP socket
+# transport is intercepted, avoiding privileged ports and all device traffic.
+build/tests/ap2_ptp_reconnect.o: src/ap2_ptp.c Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -Dbind=ap2_ptp_test_bind \
+		-Dsendto=ap2_ptp_test_sendto -c $< -o $@
+
+build/tests/test_ap2_reconnect.o: tests/test_ap2_reconnect.c tests/mrp_jpeg_fixture.h src/ap2_hap.c Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(TEST_CFLAGS) -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED $(INCLUDE) -c $< -o $@
+
+# Control only the automatic worker's sleep for deterministic public feedback
+# reentry tests; the production client state and protocol code are unchanged.
+build/tests/ap2_client_reconnect.o: src/ap2_client.c src/ap2_mrp.h Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -Dusleep=ap2_reconnect_usleep -c $< -o $@
+
+$(RECONNECT_TEST): build/tests/test_ap2_reconnect.o build/tests/ap2_client_reconnect.o \
+		build/tests/cross_ssl.o build/tests/ap2_ptp_reconnect.o \
+		$(CLIENT_TEST_OBJECTS) $(LIBCODECS_PATCHED) Makefile
+	$(CXX) build/tests/test_ap2_reconnect.o build/tests/ap2_client_reconnect.o \
+		build/tests/cross_ssl.o build/tests/ap2_ptp_reconnect.o \
+		$(filter-out $(BUILDDIR)/ap2_hap.o $(BUILDDIR)/ap2_ptp.o,$(CLIENT_TEST_OBJECTS)) \
+		$(LIBCODECS_PATCHED) $(MDNS)/$(HOST)/$(PLATFORM)/libmdns.a \
+		$(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
 
 $(TIMELINE_TEST): tests/test_ap2_timeline.c src/ap2_timeline.h Makefile
 	@mkdir -p $(dir $@)

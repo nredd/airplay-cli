@@ -189,6 +189,11 @@ struct ap2_mrp_ctx {
      * the lock keeps frames and the nonce sequence intact (same reasoning as
      * rtsp_lock in ap2_client.c). */
     pthread_mutex_t send_lock;
+    /* Input may be serviced by either feedback entry point. A busy reader is
+     * skipped, including callback reentry, never waited on under client locks. */
+    pthread_mutex_t input_lock;
+    atomic_uint references;
+    atomic_bool retired;
 
     /* Decrypted inbound stream, reassembled across TCP reads */
     uint8_t rx_enc[8192];     /* undecrypted channel bytes */
@@ -1350,7 +1355,7 @@ void ap2_mrp_set_volume_callback(struct ap2_mrp_ctx *m,
 bool ap2_mrp_volume_action(struct ap2_mrp_ctx *m, const char *action,
     const struct ap2_volume_transaction *t)
 {
-    if (!m || !m->volume_mode) return false;
+    if (!m || atomic_load(&m->retired) || !m->volume_mode) return false;
     if (!strcmp(action, "SESSION_VOLUME_BIND"))
         return ap2_volume_bind(&m->volume, t->generation, t->output, t->output_len,
             t->endpoint, t->endpoint_len);
@@ -1366,7 +1371,7 @@ bool ap2_mrp_volume_action(struct ap2_mrp_ctx *m, const char *action,
 }
 static void mrp_volume_receive(struct ap2_mrp_ctx *m, const uint8_t *body, size_t len)
 {
-    if (!m->volume_mode) return;
+    if (atomic_load(&m->retired) || !m->volume_mode) return;
     pthread_mutex_lock(&m->volume.lock);
     uint64_t generation = m->volume.generation;
     pthread_mutex_unlock(&m->volume.lock);
@@ -1472,6 +1477,7 @@ static void mrp_process_frames(struct ap2_mrp_ctx *m)
             LOG_DEBUG("[MRP] inbound frame kind=%s bytes=%u", reply ? "reply" : "unknown", size);
         }
         off += (int)size;
+        if (atomic_load(&m->retired)) break;
     }
     if (off > 0) {
         memmove(m->rx_msg, m->rx_msg + off, m->rx_msg_len - off);
@@ -1663,8 +1669,9 @@ static bool mrp_process_event_requests(struct ap2_mrp_ctx *m)
             response_len > 0 && response_len < (int)sizeof(response) &&
             mrp_event_send_response(
                 m, (const uint8_t *)response, response_len);
-        bool dispatched = have_remote_command && m->remote_command_cb != NULL;
-        if (have_remote_command)
+        bool dispatched = have_remote_command && m->remote_command_cb != NULL &&
+                          !atomic_load(&m->retired);
+        if (dispatched)
             mrp_emit_remote_command(m, remote_command);
         mrp_diagnostic(m, true, is_command ? "command" : "unknown",
             m->event_plain + off + header_len, (size_t)content_len,
@@ -1677,6 +1684,7 @@ static bool mrp_process_event_requests(struct ap2_mrp_ctx *m)
         LOG_DEBUG("[MRP] event kind=%s bytes=%d -> 200",
                   is_command ? "command" : "unknown", content_len);
         off += header_len + content_len;
+        if (atomic_load(&m->retired)) break;
     }
 
     if (off > 0) {
@@ -1734,6 +1742,7 @@ static void mrp_tick_events(struct ap2_mrp_ctx *m)
             mrp_close_event_channel(m);
             return;
         }
+        if (atomic_load(&m->retired)) return;
         pfd.revents = 0;
     }
 }
@@ -1754,6 +1763,17 @@ struct ap2_mrp_ctx *ap2_mrp_create(const char *host, int port,
     struct ap2_mrp_ctx *m = calloc(1, sizeof(*m));
     if (!m) return NULL;
     if (!ap2_volume_init(&m->volume)) { free(m); return NULL; }
+    if (pthread_mutex_init(&m->send_lock, NULL)) {
+        ap2_volume_destroy(&m->volume);
+        free(m);
+        return NULL;
+    }
+    if (pthread_mutex_init(&m->input_lock, NULL)) {
+        pthread_mutex_destroy(&m->send_lock);
+        ap2_volume_destroy(&m->volume);
+        free(m);
+        return NULL;
+    }
 
     m->host = mrp_strdup(host);
     m->port = port;
@@ -1769,7 +1789,8 @@ struct ap2_mrp_ctx *ap2_mrp_create(const char *host, int port,
     m->state_dirty = true;
     m->sock = -1;
     m->event_sock = -1;
-    pthread_mutex_init(&m->send_lock, NULL);
+    atomic_init(&m->references, 1);
+    atomic_init(&m->retired, false);
     atomic_init(&m->event_connected, false);
 
     if (secret) {
@@ -1787,10 +1808,62 @@ struct ap2_mrp_ctx *ap2_mrp_create(const char *host, int port,
     return m;
 }
 
-void ap2_mrp_destroy(struct ap2_mrp_ctx *m)
+void ap2_mrp_intent_clear(struct ap2_mrp_intent *intent)
 {
-    if (!m) return;
+    if (!intent) return;
+    free(intent->title); free(intent->artist); free(intent->album);
+    free(intent->item_id); free(intent->artwork_mime); free(intent->artwork);
+    memset(intent, 0, sizeof(*intent));
+}
+
+void ap2_mrp_intent_take(struct ap2_mrp_ctx *m, struct ap2_mrp_intent *intent)
+{
+    if (!m || !intent) return;
+    ap2_mrp_intent_clear(intent);
+    intent->title = m->title; m->title = NULL;
+    intent->artist = m->artist; m->artist = NULL;
+    intent->album = m->album; m->album = NULL;
+    intent->item_id = m->item_id; m->item_id = NULL;
+    intent->artwork_mime = m->artwork_mime; m->artwork_mime = NULL;
+    intent->artwork = m->artwork; m->artwork = NULL;
+    intent->artwork_len = m->artwork_len; m->artwork_len = 0;
+    intent->duration_ms = m->duration_ms; intent->elapsed_ms = m->elapsed_ms;
+    intent->is_live = m->is_live; intent->playback_state = m->playback_state;
+    intent->elapsed_set_at = m->elapsed_set_at; intent->np_uid = m->np_uid;
+    memcpy(intent->artwork_id, m->artwork_id, sizeof(intent->artwork_id));
+    intent->valid = true;
+}
+
+bool ap2_mrp_intent_restore(struct ap2_mrp_ctx *m, struct ap2_mrp_intent *intent)
+{
+    if (!m || !intent || !intent->valid) return false;
+    free(m->title); free(m->artist); free(m->album); free(m->item_id);
+    free(m->artwork_mime); free(m->artwork);
+    m->title = intent->title; m->artist = intent->artist; m->album = intent->album;
+    m->item_id = intent->item_id; m->artwork_mime = intent->artwork_mime;
+    m->artwork = intent->artwork; m->artwork_len = intent->artwork_len;
+    m->duration_ms = intent->duration_ms; m->elapsed_ms = intent->elapsed_ms;
+    m->is_live = intent->is_live; m->playback_state = intent->playback_state;
+    m->elapsed_set_at = intent->elapsed_set_at; m->np_uid = intent->np_uid;
+    memcpy(m->artwork_id, intent->artwork_id, sizeof(m->artwork_id));
+    memset(intent, 0, sizeof(*intent));
+    m->state_dirty = true;
+    m->state_include_artwork = m->artwork != NULL;
+    return true;
+}
+
+struct ap2_mrp_ctx *ap2_mrp_retain(struct ap2_mrp_ctx *m)
+{
+    if (m) atomic_fetch_add_explicit(&m->references, 1, memory_order_relaxed);
+    return m;
+}
+
+void ap2_mrp_release(struct ap2_mrp_ctx *m)
+{
+    if (!m || atomic_fetch_sub_explicit(&m->references, 1,
+                                       memory_order_acq_rel) != 1) return;
     ap2_mrp_stop(m);
+    pthread_mutex_destroy(&m->input_lock);
     pthread_mutex_destroy(&m->send_lock);
     ap2_volume_destroy(&m->volume);
     OPENSSL_cleanse(m->shared_secret, sizeof(m->shared_secret));
@@ -1811,6 +1884,17 @@ void ap2_mrp_destroy(struct ap2_mrp_ctx *m)
     free(m->artwork_mime);
     free(m->artwork);
     free(m);
+}
+
+void ap2_mrp_destroy(struct ap2_mrp_ctx *m)
+{
+    if (!m) return;
+    atomic_store(&m->retired, true);
+    pthread_mutex_lock(&m->volume.lock);
+    uint64_t generation = m->volume.generation;
+    pthread_mutex_unlock(&m->volume.lock);
+    ap2_volume_unbind(&m->volume, generation);
+    ap2_mrp_release(m);
 }
 
 void ap2_mrp_set_experimental_homepod_remote(struct ap2_mrp_ctx *m, bool enabled)
@@ -2172,12 +2256,12 @@ bool ap2_mrp_set_stopped(struct ap2_mrp_ctx *m)
     return true;
 }
 
-void ap2_mrp_tick(struct ap2_mrp_ctx *m)
+static void mrp_tick_input(struct ap2_mrp_ctx *m)
 {
     if (m) ap2_volume_tick(&m->volume, ap2_io_monotonic_ms());
     if (!m) return;
     mrp_tick_events(m);
-    if (!m->connected || m->sock < 0) return;
+    if (atomic_load(&m->retired) || !m->connected || m->sock < 0) return;
 
     /* Drain inbound bytes without blocking */
     struct pollfd pfd = { .fd = m->sock, .events = POLLIN };
@@ -2193,9 +2277,17 @@ void ap2_mrp_tick(struct ap2_mrp_ctx *m)
         m->rx_enc_len += (int)n;
         mrp_drain_encrypted(m);
         mrp_process_frames(m);
-        if (!m->connected) return;
+        if (atomic_load(&m->retired) || !m->connected) return;
     }
     mrp_volume_flush(m);
+}
+
+void ap2_mrp_tick(struct ap2_mrp_ctx *m)
+{
+    if (!m || atomic_load(&m->retired) ||
+        pthread_mutex_trylock(&m->input_lock) != 0) return;
+    mrp_tick_input(m);
+    pthread_mutex_unlock(&m->input_lock);
 }
 
 bool ap2_mrp_prepare_state_push(struct ap2_mrp_ctx *m, uint8_t **out,

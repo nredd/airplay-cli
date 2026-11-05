@@ -98,6 +98,28 @@ CI runs the same discovery in a uv-managed Python 3.13 environment with
 None of these checks contact speakers. Run `make test STATIC=1` from the
 repository root for native fixtures; the Python half of the captured diagnostic
 contract runs in unittest discovery and CI, not in that Make target.
+The native reconnect fixture performs real HAP pair-verify and encrypted RTSP
+against loopback receivers, with PTP transport intercepted to avoid device
+traffic and privileged ports. It covers connect/disconnect/connect with type 130
+off, fresh reverse-event keys, recovery after missing-event admission, and
+control health after reconnect with MRP disabled or a paired non-Apple receiver,
+and fresh metadata registration on each paired session. Native disconnect retires
+connection-owned HAP/MRP, timing, encoder and media sockets, plus publication
+receipts; a subsequent connect cannot reuse their keys or pending volume work.
+Desired MRP metadata, artwork, progress and playback intent survive disconnect
+and a failed event admission, and are released on destroy. The next MRP
+attachment restores them without reusing channel state or implying receiver-side
+now-playing acceptance. The loopback suite asserts decrypted playing and paused
+playback-state payloads as well as complete now-playing bytes across reconnect.
+Feedback input retains its MRP session while invoking synchronous callbacks
+outside the client publication/owner locks; callbacks can publish immediately.
+Retired sessions cannot update a replacement session's health or publication
+receipts. Concurrent input readers skip an already active reader rather than
+reentering its buffers. Deterministic callback/reconnect fixtures control only
+worker sleep scheduling, and own/reap a deadline-bounded child on failure.
+Callback count checks await an explicit completion condition with a bounded
+deadline, reject unexpected/duplicate dispatches, and recheck after worker join;
+returning from feedback alone is not a callback-completion fence.
 
 ### Experimental HomePod remote admission
 

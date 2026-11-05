@@ -24,8 +24,20 @@
 #include <stdint.h>
 
 #include "ap2_remote.h"
+#include "ap2_volume.h"
 
 struct ap2_mrp_ctx;
+/* Staged backend IPC; no native UI identity or availability claim. */
+bool ap2_mrp_volume_action(struct ap2_mrp_ctx *m, const char *action,
+    const struct ap2_volume_transaction *t);
+void ap2_mrp_set_volume_mode(struct ap2_mrp_ctx *m, bool enabled);
+/* Optional nonblocking backend request callback, configured before attachment.
+ * NULL disables dispatch. No wire identifiers are passed to the backend.
+ * A callback racing unbind may carry the old generation: reject it at the
+ * backend's current-owner guard. Callback/userdata lifetime must extend through
+ * transport-thread shutdown; unbind is not a callback cancellation barrier. */
+void ap2_mrp_set_volume_callback(struct ap2_mrp_ctx *m,
+    ap2_volume_request_cb callback, void *userdata);
 
 /* Receive validated event-channel MediaRemote commands. Set before attaching
  * the event socket; the callback remains fixed for that session. */
@@ -37,6 +49,22 @@ typedef enum {
     AP2_MRP_PLAYBACK_PAUSED = 2,
     AP2_MRP_PLAYBACK_STOPPED = 3,
 } ap2_mrp_playback_state_t;
+
+/* Client-owned desired state, detached from session crypto and transport.
+ * Zero-initialize; take/restore transfer ownership without allocating. */
+struct ap2_mrp_intent {
+    char *title, *artist, *album, *item_id, *artwork_mime;
+    uint8_t *artwork;
+    int artwork_len, duration_ms, elapsed_ms;
+    bool is_live, valid;
+    ap2_mrp_playback_state_t playback_state;
+    double elapsed_set_at;
+    char artwork_id[17];
+    uint64_t np_uid;
+};
+void ap2_mrp_intent_clear(struct ap2_mrp_intent *intent);
+void ap2_mrp_intent_take(struct ap2_mrp_ctx *m, struct ap2_mrp_intent *intent);
+bool ap2_mrp_intent_restore(struct ap2_mrp_ctx *m, struct ap2_mrp_intent *intent);
 
 /*
  * Internal staging-allocation guard, not an Apple TV receiver limit.
@@ -118,7 +146,13 @@ struct ap2_mrp_ctx *ap2_mrp_create(const char *host, int port,
                                     const char *group_uuid,
                                     const uint8_t *secret, size_t secret_len);
 
-/* Destroy the context and release all resources. */
+/* Retain while holding an existing reference (or the owner's pointer lock).
+ * Each reference keeps channel keys, sockets and callback state alive. Release
+ * with release; the final reference closes channels and frees the context.
+ * Destroy retires the owner's context: no new input/volume work, but in-flight
+ * callbacks may finish using their references. It is not a cancellation fence. */
+struct ap2_mrp_ctx *ap2_mrp_retain(struct ap2_mrp_ctx *m);
+void ap2_mrp_release(struct ap2_mrp_ctx *m);
 void ap2_mrp_destroy(struct ap2_mrp_ctx *m);
 
 /*
@@ -140,6 +174,10 @@ bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed);
  * success. This derives the independent Events-Salt keys and services encrypted
  * reverse HTTP requests with 200 responses from ap2_mrp_tick().
  */
+/* Internal session policy. Set once before publishing the context; callers use
+ * the existing MRP state lock/serializer for subsequent command snapshots. */
+void ap2_mrp_set_experimental_homepod_remote(struct ap2_mrp_ctx *m, bool enabled);
+
 bool ap2_mrp_attach_events(struct ap2_mrp_ctx *m, int event_sock);
 
 /*

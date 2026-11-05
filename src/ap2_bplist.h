@@ -87,6 +87,16 @@ int ap2_bplist_find_dict_uint_array_mask(const uint8_t *data, size_t len,
 int ap2_bplist_find_array_count(const uint8_t *data, size_t len,
                                 const char *key, size_t *out);
 
+/* Borrow root.params.data bytes, with checked container/length traversal.
+ * No recursive search: unrelated nested data must not be classified as MRP. */
+int ap2_bplist_get_params_data(const uint8_t *data, size_t len,
+                                const uint8_t **out, size_t *out_len);
+
+/* Strict operational envelope: root and params each have exactly one key.
+ * This never accepts RootJSON telemetry with a params.data decoy. */
+int ap2_bplist_get_volume_data(const uint8_t *data, size_t len,
+                                 const uint8_t **out, size_t *out_len);
+
 /* Find a string value by key in the root dictionary only. */
 int ap2_bplist_get_root_string(const uint8_t *data, size_t len, const char *key,
                                char *out, size_t out_size);

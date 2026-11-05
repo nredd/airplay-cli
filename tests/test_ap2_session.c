@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "ap2_io.h"
@@ -18,11 +19,34 @@
 static log_level test_log_level = lSILENCE;
 log_level *loglevel = &test_log_level;
 
-/* ap2_session.c is compiled with -Dpoll=ap2_session_test_poll; the single-stream
- * model no longer needs poll injection, so just delegate to the real poll. */
+static atomic_bool observe_input_wait;
+static atomic_int input_waits;
+
+/* Record a real empty-input wait, not just a reader that might not have run. */
 int ap2_session_test_poll(struct pollfd *fds, nfds_t nfds, int timeout)
 {
-    return poll(fds, nfds, timeout);
+    int result = poll(fds, nfds, timeout);
+    if (atomic_load(&observe_input_wait) && result == 0) {
+        assert(nfds == 1 && fds[0].events == POLLIN);
+        int flags = fcntl(fds[0].fd, F_GETFL, 0);
+        assert(flags >= 0 && (flags & O_NONBLOCK));
+        atomic_fetch_add(&input_waits, 1);
+    }
+    return result;
+}
+
+/* macOS CLOCK_MONOTONIC includes machine sleep, while poll's timeout does not.
+ * Measure teardown only while the machine can execute it. This still counts
+ * scheduler starvation and retains the same one-second shutdown deadline. */
+static uint64_t shutdown_clock_ms(void)
+{
+#ifdef __APPLE__
+    struct timespec ts;
+    assert(clock_gettime(CLOCK_UPTIME_RAW, &ts) == 0);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+#else
+    return ap2_io_monotonic_ms();
+#endif
 }
 
 typedef struct {
@@ -556,10 +580,24 @@ static void test_destroy_is_prompt_with_open_writer(void)
     assert(ap2_session_start(session, 1700000000000ULL, NULL) == AP2_COMMIT_OK);
     read_exact(session, audio, sizeof(audio));
 
-    uint64_t started = ap2_io_monotonic_ms();
+    atomic_store(&input_waits, 0);
+    atomic_store(&observe_input_wait, true);
+    uint64_t wait_deadline = shutdown_clock_ms() + 1000;
+    while (!atomic_load(&input_waits) && shutdown_clock_ms() < wait_deadline)
+        usleep(5000);
+    assert(atomic_load(&input_waits) >= 1);
+    assert(fcntl(write_fd, F_GETFD) >= 0);
+
+    uint64_t started = shutdown_clock_ms();
     ap2_session_destroy(session);
-    assert(ap2_io_monotonic_ms() - started < 1000);
+    uint64_t elapsed = shutdown_clock_ms() - started;
+    atomic_store(&observe_input_wait, false);
+    if (elapsed >= 1000)
+        fprintf(stderr, "Open-writer shutdown took %llu awake ms\n",
+                (unsigned long long)elapsed);
+    assert(elapsed < 1000);
     status_state = NULL;
+    assert(fcntl(write_fd, F_GETFD) >= 0);
     assert(close(write_fd) == 0);
 }
 

@@ -1,0 +1,2 @@
+[STATUS] homepod_remote ordinal=1 elapsed_ms=0 channel=event frame_kind=command classification=protobuf command=unknown protobuf_type=51 bytes=85 dispatched=0 message=volume_set_candidate target=unresolved value_state=valid value_milli=500
+[STATUS] homepod_remote ordinal=17 elapsed_ms=1 channel=event frame_kind=command classification=protobuf command=unknown protobuf_type=17 bytes=74 dispatched=0 message=volume_capability target=missing value_state=missing available=1 capabilities=3

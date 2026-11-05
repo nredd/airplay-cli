@@ -51,6 +51,7 @@ EVENT_TEST    = build/tests/test_ap2_event
 CLIENT_TEST   = build/tests/test_ap2_client
 SESSION_TEST  = build/tests/test_ap2_session
 PTP_TEST      = build/tests/test_ap2_ptp
+RECONNECT_TEST = build/tests/test_ap2_reconnect
 TEST_CFLAGS   = -Wall -Wextra -Werror -O2 $(CPPFLAGS) $(EXTRA_CFLAGS)
 
 # Compiler flags
@@ -124,7 +125,7 @@ RAOP_SOURCES = raop_client.c rtsp_client.c \
 	alac.c
 
 # AirPlay 2 sources (new)
-AP2_SOURCES = ap2_client.c ap2_hap.c ap2_io.c ap2_ptp.c ap2_ptp_shm.c ap2_plist.c ap2_mrp.c ap2_session.c
+AP2_SOURCES = ap2_client.c ap2_hap.c ap2_io.c ap2_ptp.c ap2_ptp_shm.c ap2_plist.c ap2_mrp.c ap2_volume.c ap2_session.c
 
 # Common/CLI sources
 CLI_SOURCES = cross_log.c cross_ssl.c cross_util.c cross_net.c platform.c host_clock.c \
@@ -158,7 +159,7 @@ CLIENT_TEST_OBJECTS = $(filter-out $(BUILDDIR)/ap2_client.o \
 
 TEST_EXECUTABLE = $(BUILDDIR)/test-mrp-artwork
 TEST_OBJECTS = $(BUILDDIR)/test_mrp_artwork.o \
-	$(BUILDDIR)/ap2_mrp.o $(BUILDDIR)/ap2_io.o $(BUILDDIR)/ap2_plist.o \
+	$(BUILDDIR)/ap2_mrp.o $(BUILDDIR)/ap2_volume.o $(BUILDDIR)/ap2_io.o $(BUILDDIR)/ap2_plist.o \
 	$(BUILDDIR)/ap2_bplist.o $(BUILDDIR)/bplist.o \
 	$(BUILDDIR)/artwork.o $(BUILDDIR)/cross_log.o
 RAOP_LIFECYCLE_TEST_EXECUTABLE = $(BUILDDIR)/test-ap2-raop-lifecycle
@@ -238,7 +239,7 @@ no_sanitizer_report = case "$(1)" in *Sanitizer*|*"runtime error:"*) \
 	printf '%s\n' "$(1)" >&2; false;; esac
 
 test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT_TEST) \
-		$(SESSION_TEST) $(PTP_TEST) $(TEST_EXECUTABLE) $(RAOP_LIFECYCLE_TEST_EXECUTABLE) \
+		$(SESSION_TEST) $(PTP_TEST) $(RECONNECT_TEST) $(TEST_EXECUTABLE) $(RAOP_LIFECYCLE_TEST_EXECUTABLE) \
 		$(RAOP_SESSION_TEST) $(ANNOUNCE_TEST) $(LIVE_METADATA_TEST)
 	$(TIMELINE_TEST)
 	$(EVENT_TEST)
@@ -246,11 +247,23 @@ test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT
 	$(CLIENT_TEST)
 	$(SESSION_TEST)
 	$(PTP_TEST)
+	$(RECONNECT_TEST)
+	$(RECONNECT_TEST) --missing-first-event
+	$(RECONNECT_TEST) --mrp-disabled
+	$(RECONNECT_TEST) --non-apple
+	$(RECONNECT_TEST) --publication
+	$(RECONNECT_TEST) --retained-metadata
+	$(RECONNECT_TEST) --retained-retry
+	$(RECONNECT_TEST) --retained-playing
+	$(RECONNECT_TEST) --reentrant-publication
+	$(RECONNECT_TEST) --retired-feedback
+	$(RECONNECT_TEST) --callback-barrier
 	$(TEST_EXECUTABLE)
 	$(RAOP_LIFECYCLE_TEST_EXECUTABLE)
 	$(RAOP_SESSION_TEST)
 	$(ANNOUNCE_TEST)
 	$(LIVE_METADATA_TEST)
+	python3 tests/session_volume_ipc.py
 	python3 tests/mrp_artwork_matrix.py --help >/dev/null
 	@missing_pipe="$$($(EXECUTABLE) --protocol raop \
 		127.0.0.1 2>&1 || true)"; \
@@ -305,10 +318,10 @@ $(ANNOUNCE_TEST): tests/test_announce.c src/announce.c src/announce.h Makefile
 	$(CC) $(TEST_CFLAGS) -Isrc tests/test_announce.c src/announce.c \
 		$(EXTRA_LDFLAGS) -lm -o $@
 
-$(SESSION_TEST): tests/test_ap2_session.c src/ap2_session.c src/ap2_session.h \
-		src/ap2_io.c src/ap2_io.h Makefile
+$(SESSION_TEST): tests/test_ap2_session.c tests/ap2_session_poll_fixture.h \
+		src/ap2_session.c src/ap2_session.h src/ap2_io.c src/ap2_io.h Makefile
 	@mkdir -p $(dir $@)
-	$(CC) $(TEST_CFLAGS) $(INCLUDE) -Dpoll=ap2_session_test_poll \
+	$(CC) $(TEST_CFLAGS) $(INCLUDE) -include tests/ap2_session_poll_fixture.h \
 		-c src/ap2_session.c -o build/tests/ap2_session_fifo_test.o
 	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_ap2_session.c \
 		build/tests/ap2_session_fifo_test.o src/ap2_io.c $(TOOLS)/cross_log.c \
@@ -324,17 +337,43 @@ $(PTP_TEST): tests/test_ap2_ptp.c src/ap2_ptp.c src/ap2_ptp.h src/ap2_ptp_shm.c 
 		build/tests/ap2_ptp_test.o src/ap2_ptp_shm.c src/host_clock.c $(TOOLS)/cross_log.c \
 		$(LDFLAGS) -o $@
 
+# Real native lifecycle against a loopback HAP/RTSP receiver. Only PTP socket
+# transport is intercepted, avoiding privileged ports and all device traffic.
+build/tests/ap2_ptp_reconnect.o: src/ap2_ptp.c Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -Dbind=ap2_ptp_test_bind \
+		-Dsendto=ap2_ptp_test_sendto -c $< -o $@
+
+build/tests/test_ap2_reconnect.o: tests/test_ap2_reconnect.c tests/mrp_jpeg_fixture.h src/ap2_hap.c Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(TEST_CFLAGS) -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED $(INCLUDE) -c $< -o $@
+
+# Control only the automatic worker's sleep for deterministic public feedback
+# reentry tests; the production client state and protocol code are unchanged.
+build/tests/ap2_client_reconnect.o: src/ap2_client.c src/ap2_mrp.h Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -Dusleep=ap2_reconnect_usleep -c $< -o $@
+
+$(RECONNECT_TEST): build/tests/test_ap2_reconnect.o build/tests/ap2_client_reconnect.o \
+		build/tests/cross_ssl.o build/tests/ap2_ptp_reconnect.o \
+		$(CLIENT_TEST_OBJECTS) $(LIBCODECS_PATCHED) Makefile
+	$(CXX) build/tests/test_ap2_reconnect.o build/tests/ap2_client_reconnect.o \
+		build/tests/cross_ssl.o build/tests/ap2_ptp_reconnect.o \
+		$(filter-out $(BUILDDIR)/ap2_hap.o $(BUILDDIR)/ap2_ptp.o,$(CLIENT_TEST_OBJECTS)) \
+		$(LIBCODECS_PATCHED) $(MDNS)/$(HOST)/$(PLATFORM)/libmdns.a \
+		$(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
+
 $(TIMELINE_TEST): tests/test_ap2_timeline.c src/ap2_timeline.h Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(TEST_CFLAGS) -Isrc $< $(EXTRA_LDFLAGS) -o $@
 
-$(EVENT_TEST): tests/test_ap2_event.c $(BUILDDIR)/ap2_mrp.o \
+$(EVENT_TEST): tests/test_ap2_event.c $(BUILDDIR)/ap2_mrp.o $(BUILDDIR)/ap2_volume.o \
 		$(BUILDDIR)/ap2_io.o $(BUILDDIR)/ap2_plist.o \
 		$(BUILDDIR)/ap2_bplist.o $(BUILDDIR)/bplist.o \
 		$(BUILDDIR)/cross_log.o Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(TEST_CFLAGS) $(INCLUDE) \
-		$< $(BUILDDIR)/ap2_mrp.o $(BUILDDIR)/ap2_io.o \
+		$< $(BUILDDIR)/ap2_mrp.o $(BUILDDIR)/ap2_volume.o $(BUILDDIR)/ap2_io.o \
 		$(BUILDDIR)/ap2_plist.o $(BUILDDIR)/ap2_bplist.o \
 		$(BUILDDIR)/bplist.o $(BUILDDIR)/cross_log.o \
 		$(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
@@ -367,7 +406,8 @@ $(CLIENT_TEST): build/tests/test_ap2_client_main.o build/tests/ap2_client.o \
 		$(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
 
 # Include CLI/MRP implementations to exercise their private parser/serializers.
-build/tests/test_live_metadata.o: tests/test_live_metadata.c src/cliairplay.c \
+build/tests/test_live_metadata.o: tests/test_live_metadata.c tests/mrp_volume_fixture.h tests/session_volume_fixture.h tests/session_volume_harness.h \
+        tests/fixtures/homepod_volume_diagnostics.txt src/cliairplay.c \
 		src/ap2_mrp.c src/ap2_mrp.h src/ap2_client.h Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@

@@ -515,14 +515,10 @@ int main(void)
     size_t logs_len = fread(logs, 1, sizeof(logs) - 1, log_capture);
     logs[logs_len] = '\0';
     fclose(log_capture);
-    assert(strstr(logs, "content_type=application/x-apple-binary-plist"));
-    assert(strstr(logs, "type=sendMediaRemoteCommand value=play"));
-    assert(strstr(logs, "type=sendMediaRemoteCommand value=paus"));
-    assert(strstr(logs, "type=sendMediaRemoteCommand value=plps"));
-    assert(strstr(logs, "type=sendMediaRemoteCommand value=nitm"));
-    assert(strstr(logs, "type=sendMediaRemoteCommand value=pitm"));
-    assert(strstr(logs, "body parse failed"));
-    assert(strstr(logs, "content_length=4 hex=74657374"));
+    assert(strstr(logs, "classification=transport"));
+    assert(strstr(logs, "classification=unknown bytes=4"));
+    assert(!strstr(logs, "content_type=") && !strstr(logs, "type=sendMediaRemoteCommand"));
+    assert(!strstr(logs, "value=") && !strstr(logs, "hex=") && !strstr(logs, "74657374"));
 
     ap2_mrp_destroy(mrp);
     close(sockets[1]);

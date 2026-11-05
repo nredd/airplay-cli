@@ -765,8 +765,40 @@ static void handle_announce(const cli_config_t *cfg)
     free(path);
 }
 
+static struct ap2_volume_stage g_volume_stage;
+static uint64_t g_stream_volume_generation, g_stream_volume_ordinal;
+
 static void handle_command(const char *key, const char *value, cli_config_t *cfg)
 {
+    if (ap2_volume_stage_key(&g_volume_stage, key, value)) return;
+    if (!strcmp(key, "ACTION")) {
+        struct ap2_volume_transaction t;
+        bool valid = ap2_volume_stage_action(&g_volume_stage, value, &t);
+        if (!strncmp(value, "SESSION_VOLUME_", 15)) {
+            if (valid && g_ap2cl) ap2cl_session_volume_action(g_ap2cl, value, &t);
+            return;
+        }
+        if (!strcmp(value, "STREAM_VOLUME_APPLY")) {
+            if (!valid) return;
+            int result = -1;
+            if (t.generation > g_stream_volume_generation ||
+                (t.generation == g_stream_volume_generation && t.ordinal > g_stream_volume_ordinal)) {
+                g_stream_volume_generation = t.generation; g_stream_volume_ordinal = t.ordinal;
+                if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl)
+                    result = ap2cl_apply_volume(g_ap2cl, t.level);
+                else if (cfg->protocol == PROTO_RAOP && g_raopcl && raopcl_state(g_raopcl) >= RAOP_FLUSHED)
+                    result = raopcl_set_volume(g_raopcl, raopcl_float_volume((int)t.level)) ? 1 : -1;
+            }
+            flockfile(stdout);
+            printf("[EVENT] stream_volume_result generation=%llu ordinal=%llu status=%s",
+                (unsigned long long)t.generation, (unsigned long long)t.ordinal,
+                result == 1 ? "committed" : result == 0 ? "failed" : "unknown");
+            if (result == 1) printf(" level=%u", t.level);
+            putchar('\n'); fflush(stdout);
+            funlockfile(stdout);
+            return;
+        }
+    } else if (g_volume_stage.seen) g_volume_stage.invalid = true;
     if (strcmp(key, "TITLE") == 0) {
         metadata_set(&g_metadata.title, value);
     } else if (strcmp(key, "ARTIST") == 0) {
@@ -1159,6 +1191,7 @@ static void *cmdpipe_reader_thread(void *arg)
             LOG_ERROR("Command pipe line exceeds %zu bytes; discarding",
                       sizeof(g_cmdpipe_buf) - 1);
             g_cmdpipe_used = 0;
+            g_volume_stage.invalid = true;
         }
         ssize_t bytes_read = read(g_cmdpipe_fd, g_cmdpipe_buf + g_cmdpipe_used,
                                   sizeof(g_cmdpipe_buf) - 1 - g_cmdpipe_used);
@@ -1172,9 +1205,13 @@ static void *cmdpipe_reader_thread(void *arg)
                 if (!g_running) break;
                 *end = '\0';
                 char *separator = strchr(line, '=');
-                if (separator && separator != line) {
+                if (memchr(line, '\0', (size_t)(end - line))) {
+                    g_volume_stage.invalid = true;
+                } else if (separator && separator != line) {
                     *separator = '\0';
                     handle_command(line, separator + 1, cfg);
+                } else if (g_volume_stage.seen) {
+                    g_volume_stage.invalid = true;
                 }
                 line = end + 1;
             }
@@ -1236,6 +1273,8 @@ static bool start_command_thread(cli_config_t *cfg)
         return false;
     }
     g_cmdpipe_started = true;
+    printf("[STATUS] session_volume version=1\n");
+    fflush(stdout);
     return true;
 }
 

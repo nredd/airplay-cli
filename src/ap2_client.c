@@ -3545,6 +3545,8 @@ bool ap2cl_disconnect(struct ap2cl_s *p)
     if (!p) return false;
     if (p->flow == FLOW_NATIVE_AP2) {
         ap2_feedback_stop(p);
+        ap2_clock_verify_disarm(p);
+        ap2_clock_verify_reap_poller(p);
         ap2_rtx_stop(p);
         /* Publish the final stopped state before disconnecting MediaRemote,
          * while the encrypted RTSP session is still live. */
@@ -3552,11 +3554,12 @@ bool ap2cl_disconnect(struct ap2cl_s *p)
         pthread_mutex_lock(&p->mrp_publish_lock);
         pthread_mutex_lock(&p->mrp_lock);
         struct ap2_mrp_ctx *mrp = p->mrp;
+        p->mrp = NULL;
+        /* Feedback is joined and publication excluded. Drop all session keys,
+         * identifiers and pending volume work, not just the old sockets. */
+        if (mrp) ap2_mrp_destroy(mrp);
+        atomic_store(&p->mrp_event_health, 0);
         pthread_mutex_unlock(&p->mrp_lock);
-        if (mrp) {
-            ap2_mrp_stop(mrp);
-            atomic_store(&p->mrp_event_health, 0);
-        }
         pthread_mutex_unlock(&p->mrp_publish_lock);
         if (p->events_sock >= 0) {
             close(p->events_sock);
@@ -3574,11 +3577,18 @@ bool ap2cl_disconnect(struct ap2cl_s *p)
             uint8_t *resp = NULL; int resp_len = 0;
             ap2_rtsp_send(p, "TEARDOWN", p->session_url, NULL, 0, NULL, &resp, &resp_len);
             free(resp);
-            /* Under the lock: see ap2cl_destroy. */
-            pthread_mutex_lock(&p->rtsp_lock);
-            close(p->sock_fd); p->sock_fd = -1;
-            pthread_mutex_unlock(&p->rtsp_lock);
         }
+        /* Retire the socket and its keys under the request lock: an in-flight
+         * exchange must finish before either is freed. The next pre-pairing
+         * GET /info must not use this connection's HAP framing. */
+        pthread_mutex_lock(&p->rtsp_lock);
+        if (p->sock_fd >= 0) { close(p->sock_fd); p->sock_fd = -1; }
+        if (p->hap) { ap2_hap_destroy(p->hap); p->hap = NULL; }
+        pthread_mutex_unlock(&p->rtsp_lock);
+        if (p->ptp) { ap2_ptp_destroy(p->ptp); p->ptp = NULL; }
+        if (p->alac) { alac_delete_encoder(p->alac); p->alac = NULL; }
+        if (p->data_sock >= 0) { close(p->data_sock); p->data_sock = -1; }
+        if (p->ctrl_sock >= 0) { close(p->ctrl_sock); p->ctrl_sock = -1; }
     } else if (p->raopcl) {
         raopcl_disconnect(p->raopcl);
     }
@@ -4942,9 +4952,12 @@ bool ap2cl_session_volume_action(struct ap2cl_s *p, const char *action,
     const struct ap2_volume_transaction *t)
 {
     if (!p) return false;
-    /* Context lifetime is stable until the command thread is joined. The
-     * volume driver has its own lock; callbacks run outside mrp_lock. */
-    return ap2_mrp_volume_action(p->mrp, action, t);
+    /* Disconnect can retire the session while the command thread is live.
+     * Serialize these short driver actions with context destruction. */
+    pthread_mutex_lock(&p->mrp_lock);
+    bool result = ap2_mrp_volume_action(p->mrp, action, t);
+    pthread_mutex_unlock(&p->mrp_lock);
+    return result;
 }
 /* Shared existing curve/send path; checked and legacy callers differ only in
  * receipt interpretation and when their local volume becomes committed. */

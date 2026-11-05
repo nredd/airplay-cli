@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+from enum import StrEnum
 from pathlib import Path
 from typing import IO
 
@@ -144,6 +145,14 @@ def stop(child: subprocess.Popen[bytes]) -> None:
     child.wait()
 
 
+class PtpFollow(StrEnum):
+    """Pre-SETUP clock role selection."""
+
+    AUTO = "auto"
+    DISABLED = "0"
+    ENABLED = "1"
+
+
 def child_env(
     type130: int, sender_relay: int = 0, multiselect: int = 0, ptp_follow: str = "auto"
 ) -> dict[str, str]:
@@ -157,13 +166,15 @@ def child_env(
 
     Returns:
         dict[str, str]: Child environment without inherited probe overrides.
+
+    Raises:
+        ValueError: A toggle or clock role is outside its fixed domain.
     """
-    if (
-        type130 not in (0, 1)
-        or sender_relay not in (0, 1)
-        or multiselect not in (0, 1)
-        or ptp_follow not in ("auto", "0", "1")
-    ):
+    try:
+        follow = PtpFollow(ptp_follow)
+    except ValueError:
+        raise ValueError("Expected fixed probe enums") from None
+    if type130 not in (0, 1) or sender_relay not in (0, 1) or multiselect not in (0, 1):
         raise ValueError("Expected fixed probe enums")
     env = {
         key: os.environ[key]
@@ -178,8 +189,8 @@ def child_env(
         env["CLIAIRPLAY_PROBE_SENDER_RELAY"] = "1"
     if multiselect == 1:
         env["CLIAIRPLAY_PROBE_MULTISELECT"] = "1"
-    if ptp_follow != "auto":
-        env["CLIAIRPLAY_PTP_FOLLOW"] = ptp_follow
+    if follow != PtpFollow.AUTO:
+        env["CLIAIRPLAY_PTP_FOLLOW"] = follow.value
     return env
 
 
@@ -335,6 +346,24 @@ def probe_toggle(value: str) -> int:
     return int(value)
 
 
+def ptp_follow_option(value: str) -> PtpFollow:
+    """Convert a literal clock role at the CLI boundary.
+
+    Parameters:
+        value (str): Command-line token to validate.
+
+    Returns:
+        PtpFollow: The validated clock role.
+
+    Raises:
+        argparse.ArgumentTypeError: The token is not a supported clock role.
+    """
+    try:
+        return PtpFollow(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("Expected auto, 0 or 1") from None
+
+
 def parser() -> argparse.ArgumentParser:
     """Build the deliberately small, credential-free CLI."""
     result = argparse.ArgumentParser(description=__doc__)
@@ -347,7 +376,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--timing", choices=("ntp", "ptp"), default="ntp")
     result.add_argument("--sender-relay", type=probe_toggle, default=0)
     result.add_argument("--multiselect", type=probe_toggle, default=0)
-    result.add_argument("--ptp-follow", choices=("auto", "0", "1"), default="auto")
+    result.add_argument("--ptp-follow", type=ptp_follow_option, default=PtpFollow.AUTO)
     return result
 
 

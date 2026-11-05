@@ -431,7 +431,9 @@ may provoke unsupported relay messages: there is NO semantic relay handler,
 full native UI claim, or release intent.
 
 `--ptp-follow {auto,0,1}` defaults to `auto` (no child override); only an explicit
-`0` or `1` sets `CLIAIRPLAY_PTP_FOLLOW`. The helper still advertises HomePod TXT
+`0` or `1` sets `CLIAIRPLAY_PTP_FOLLOW`; other tokens are rejected before launch.
+The Python `child_env` helper also accepts these literal strings or `PtpFollow` values
+and raises `ValueError` for invalid selections. The helper still advertises HomePod TXT
 `igl=1`, and the clock role is chosen BEFORE SETUP. A declaration-induced role
 flip may stop receiver Sync. If clock readiness fails, repeat the SAME declaration
 with only `--ptp-follow 0` changed; there is no live clock hot-switching. Change

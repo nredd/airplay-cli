@@ -6,6 +6,7 @@ References:
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import io
 import json
@@ -181,6 +182,11 @@ class NativeSenderProbeTest(unittest.TestCase):
                             )
                             self.assertNotIn("private", str(env))
             self.assertTrue(set(keys).isdisjoint(probe.child_env(0)))
+        for follow in probe.PtpFollow:
+            self.assertEqual(
+                probe.child_env(0, ptp_follow=follow),
+                probe.child_env(0, ptp_follow=follow.value),
+            )
         for args in (
             (2, 0, 0, "auto"),
             (0, 2, 0, "auto"),
@@ -224,6 +230,16 @@ class NativeSenderProbeTest(unittest.TestCase):
         self.assertEqual(
             (opts.sender_relay, opts.multiselect, opts.ptp_follow), (0, 0, "auto")
         )
+        self.assertIs(opts.ptp_follow, probe.PtpFollow.AUTO)
+        for follow in probe.PtpFollow:
+            opts = probe.parser().parse_args(self.args("--ptp-follow", follow.value))
+            self.assertIs(opts.ptp_follow, follow)
+        with self.assertRaises(ValueError) as error:
+            probe.child_env(0, ptp_follow="private")
+        self.assertNotIn("private", str(error.exception))
+        with self.assertRaises(argparse.ArgumentTypeError) as error:
+            probe.ptp_follow_option("private")
+        self.assertNotIn("private", str(error.exception))
         for flag in ("--sender-relay", "--multiselect", "--ptp-follow"):
             for value in ("2", "yes", "private", "01", "+1"):
                 with (

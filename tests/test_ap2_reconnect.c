@@ -202,6 +202,12 @@ static void send_pause(int fd, const uint8_t secret[32])
     assert(len > 0); write_exact(fd, enc, (size_t)len); free(enc);
 }
 
+enum registration_flag {
+    DEVICE_INFO = 1, NOW_PLAYING = 2, SUPPORTED_COMMANDS = 4,
+    NOW_PLAYING_CLIENT = 8, PLAYBACK_STATE = 16, EXPECTED_TITLE = 32,
+    ALL_REGISTRATIONS = 63,
+};
+
 typedef struct {
     int control_listener, event_listener, event_port;
     EVP_PKEY *identity;
@@ -209,9 +215,10 @@ typedef struct {
     bool missing_first_event;
     bool send_commands;
     bool publication;
-    unsigned registrations[2];
-    uint8_t *nowplaying[2];
-    size_t nowplaying_len[2];
+    bool retry_with_intent;
+    unsigned registrations[3];
+    uint8_t *nowplaying[3];
+    size_t nowplaying_len[3];
 } receiver_t;
 
 static int listener(int *port)
@@ -228,7 +235,7 @@ static int listener(int *port)
 static void *receiver(void *arg)
 {
     receiver_t *r = arg;
-    for (unsigned session = 0; session < 2; session++) {
+    for (unsigned session = 0; session < (r->retry_with_intent ? 3u : 2u); session++) {
         int fd = accept(r->control_listener, NULL, NULL); assert(fd >= 0);
         struct timeval tv = {.tv_sec = 5};
         assert(!setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)));
@@ -242,17 +249,18 @@ static void *receiver(void *arg)
         struct ap2_hap_ctx hap = {0};
         pair_receiver(fd, r->identity, &hap);
         unsigned setups = 0; int event = -1;
-        bool omit_event = r->missing_first_event && session == 0;
+        bool omit_event = (r->missing_first_event && session == 0) ||
+                          (r->retry_with_intent && session == 1);
         for (;;) {
             size_t request_len = request(fd, &hap, buf, &offset);
             if (r->publication && !strncmp((char *)buf, "POST /command ", 14)) {
                 const uint8_t *data = NULL; size_t data_len = 0;
                 char type[64] = {0};
                 if (ap2_bplist_get_params_data(buf + offset, request_len - offset, &data, &data_len))
-                    r->registrations[session] |= 1;
+                    r->registrations[session] |= DEVICE_INFO;
                 if (ap2_bplist_get_root_string(buf + offset, request_len - offset, "type", type, sizeof(type))) {
                     if (!strcmp(type, "updateMRNowPlayingInfo")) {
-                        r->registrations[session] |= 2;
+                        r->registrations[session] |= NOW_PLAYING;
                         free(r->nowplaying[session]);
                         r->nowplaying_len[session] = request_len - offset;
                         r->nowplaying[session] = malloc(r->nowplaying_len[session]);
@@ -261,11 +269,11 @@ static void *receiver(void *arg)
                         const char title[] = "fixture title";
                         for (size_t i = offset; i + sizeof(title) - 1 <= request_len; i++)
                             if (!memcmp(buf + i, title, sizeof(title) - 1))
-                                r->registrations[session] |= 32;
+                                r->registrations[session] |= EXPECTED_TITLE;
                     }
-                    if (!strcmp(type, "updateMRSupportedCommands")) r->registrations[session] |= 4;
-                    if (!strcmp(type, "updateMRNowPlayingClient")) r->registrations[session] |= 8;
-                    if (!strcmp(type, "updateMRPlaybackState")) r->registrations[session] |= 16;
+                    if (!strcmp(type, "updateMRSupportedCommands")) r->registrations[session] |= SUPPORTED_COMMANDS;
+                    if (!strcmp(type, "updateMRNowPlayingClient")) r->registrations[session] |= NOW_PLAYING_CLIENT;
+                    if (!strcmp(type, "updateMRPlaybackState")) r->registrations[session] |= PLAYBACK_STATE;
                 }
             }
             cs = strstr((char *)buf, "\r\nCSeq: "); assert(cs);
@@ -312,6 +320,7 @@ static void intent_lifecycle(void)
     uint8_t *before = NULL, *after = NULL; int before_len = 0, after_len = 0;
     assert(ap2_mrp_build_nowplaying_command(first, &before, &before_len));
     ap2_mrp_intent_take(first, &intent);
+    assert(intent.playback_state == AP2_MRP_PLAYBACK_PAUSED && intent.elapsed_ms == 37000);
     ap2_mrp_destroy(first);
     assert(!ap2_mrp_intent_restore(NULL, &intent) && intent.valid);
     struct ap2_mrp_ctx *second = ap2_mrp_create("127.0.0.1", 1, NULL, NULL, NULL,
@@ -340,12 +349,14 @@ int main(int argc, char **argv)
 {
     assert(argc == 1 || (argc == 2 && (!strcmp(argv[1], "--missing-first-event") ||
         !strcmp(argv[1], "--mrp-disabled") || !strcmp(argv[1], "--non-apple") ||
-        !strcmp(argv[1], "--publication") || !strcmp(argv[1], "--retained-metadata"))));
+        !strcmp(argv[1], "--publication") || !strcmp(argv[1], "--retained-metadata") ||
+        !strcmp(argv[1], "--retained-retry"))));
     bool missing_event = argc == 2 && !strcmp(argv[1], "--missing-first-event");
     bool mrp_disabled = argc == 2 && !strcmp(argv[1], "--mrp-disabled");
-    bool retained_metadata = argc == 2 && !strcmp(argv[1], "--retained-metadata");
+    bool retained_retry = argc == 2 && !strcmp(argv[1], "--retained-retry");
+    bool retained_metadata = retained_retry || (argc == 2 && !strcmp(argv[1], "--retained-metadata"));
     bool publication = retained_metadata || (argc == 2 && !strcmp(argv[1], "--publication"));
-    bool non_apple = publication || (argc == 2 && !strcmp(argv[1], "--non-apple"));
+    bool non_apple = (publication && !retained_retry) || (argc == 2 && !strcmp(argv[1], "--non-apple"));
     bool admitted = !mrp_disabled && !non_apple;
     alarm(20); /* Bound failures even if a protocol peer regresses. */
     if (retained_metadata) intent_lifecycle();
@@ -366,7 +377,8 @@ int main(int argc, char **argv)
     for (size_t i = 0; i < sizeof(raw); i++) snprintf(credentials + 2 * i, 3, "%02x", raw[i]);
     int port;
     receiver_t r = {.identity = identity, .missing_first_event = missing_event,
-                    .send_commands = admitted, .publication = publication};
+                    .send_commands = admitted, .publication = publication,
+                    .retry_with_intent = retained_retry};
     r.control_listener = listener(&port); r.event_listener = listener(&r.event_port);
     pthread_t thread; assert(!pthread_create(&thread, NULL, receiver, &r));
     ap2_device_info_t device = {.name = "offline reconnect", .address = "127.0.0.1", .port = port,
@@ -376,9 +388,9 @@ int main(int argc, char **argv)
     assert(p); ap2cl_force_native(p); ap2cl_set_ptp(p, true);
     atomic_uint commands = 0;
     ap2cl_set_remote_command_callback(p, remote, &commands);
-    for (unsigned cycle = 1; cycle <= 2; cycle++) {
+    for (unsigned cycle = 1; cycle <= (retained_retry ? 3u : 2u); cycle++) {
         bool ok = ap2cl_connect(p);
-        if (missing_event && cycle == 1) {
+        if ((missing_event && cycle == 1) || (retained_retry && cycle == 2)) {
             const char *detail = NULL;
             assert(!ok);
             ap2cl_connect_error(p, NULL, &detail);
@@ -394,12 +406,13 @@ int main(int argc, char **argv)
         assert(ok && "native reconnect must attach a fresh reverse event channel");
         assert(ap2cl_state(p) == AP2_CONNECTED);
         assert(ap2cl_feedback(p));
-        assert(atomic_load(&commands) == (admitted ? cycle - (missing_event ? 1u : 0u) : 0));
+        assert(atomic_load(&commands) == (admitted ? cycle - ((missing_event || retained_retry) ? 1u : 0u) : 0) ||
+               (retained_retry && cycle == 1 && atomic_load(&commands) == 1));
         if (!ap2cl_control_healthy(p))
             fprintf(stderr, "control unhealthy on cycle %u\n", cycle);
         assert(ap2cl_control_healthy(p));
         if (publication) {
-            if (retained_metadata && cycle == 2)
+            if (retained_metadata && cycle > 1)
                 assert(ap2cl_mrp_push(p) == 200);
             else if (retained_metadata) {
                 assert(ap2cl_set_metadata_ex(p, "fixture title", "fixture artist", "fixture album",
@@ -413,16 +426,17 @@ int main(int argc, char **argv)
         assert(ap2cl_disconnect(p));
     }
     assert(ap2cl_destroy(p)); assert(!pthread_join(thread, NULL));
-    assert(r.sessions == 2);
+    assert(r.sessions == (retained_retry ? 3u : 2u));
     if (publication) {
-        fprintf(stderr, "registration masks: first=%u second=%u (expected 63 each)\n",
-                r.registrations[0], r.registrations[1]);
-        assert(r.registrations[0] == 63 && r.registrations[1] == 63);
+        unsigned last = retained_retry ? 2 : 1;
+        fprintf(stderr, "registration masks: first=%u last=%u (expected 63 each)\n",
+                r.registrations[0], r.registrations[last]);
+        assert(r.registrations[0] == ALL_REGISTRATIONS && r.registrations[last] == ALL_REGISTRATIONS);
         if (retained_metadata) {
-            assert(r.nowplaying_len[0] == r.nowplaying_len[1]);
-            assert(!memcmp(r.nowplaying[0], r.nowplaying[1], r.nowplaying_len[0]));
+            assert(r.nowplaying_len[0] == r.nowplaying_len[last]);
+            assert(!memcmp(r.nowplaying[0], r.nowplaying[last], r.nowplaying_len[0]));
         }
-        free(r.nowplaying[0]); free(r.nowplaying[1]);
+        for (unsigned i = 0; i < 3; i++) free(r.nowplaying[i]);
     }
     close(r.control_listener); close(r.event_listener);
     EVP_PKEY_free(identity);

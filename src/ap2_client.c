@@ -4903,7 +4903,8 @@ bool ap2cl_feedback(struct ap2cl_s *p)
     /* Service event/DataStream input after the receiver keepalive itself.
      * State output takes the publication lock only when immediately available,
      * so metadata work can never delay the next feedback cadence. */
-    if (!atomic_load(&p->rtsp_dead)) {
+    if (!atomic_load(&p->rtsp_dead) &&
+        pthread_mutex_trylock(&p->mrp_publish_lock) == 0) {
         pthread_mutex_lock(&p->mrp_lock);
         struct ap2_mrp_ctx *mrp = p->mrp;
         pthread_mutex_unlock(&p->mrp_lock);
@@ -4917,7 +4918,7 @@ bool ap2cl_feedback(struct ap2cl_s *p)
             }
             pthread_mutex_unlock(&p->mrp_lock);
 
-            if (pthread_mutex_trylock(&p->mrp_publish_lock) == 0) {
+            {
                 uint8_t *state = NULL;
                 int state_len = 0;
                 uint64_t state_generation = 0;
@@ -4937,11 +4938,9 @@ bool ap2cl_feedback(struct ap2cl_s *p)
                     pthread_mutex_unlock(&p->mrp_lock);
                 }
                 free(state);
-                pthread_mutex_unlock(&p->mrp_publish_lock);
-            } else {
-                LOG_SDEBUG("[MRP] state push deferred behind publication");
             }
         }
+        pthread_mutex_unlock(&p->mrp_publish_lock);
     }
     if (result == AP2_FEEDBACK_SUCCEEDED) {
         unsigned prior_misses = atomic_exchange(&p->feedback_failures, 0);

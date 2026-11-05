@@ -253,6 +253,7 @@ test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT
 	$(RECONNECT_TEST) --non-apple
 	$(RECONNECT_TEST) --publication
 	$(RECONNECT_TEST) --retained-metadata
+	$(RECONNECT_TEST) --retained-retry
 	$(TEST_EXECUTABLE)
 	$(RAOP_LIFECYCLE_TEST_EXECUTABLE)
 	$(RAOP_SESSION_TEST)

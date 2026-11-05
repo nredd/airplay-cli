@@ -107,8 +107,9 @@ and fresh metadata registration on each paired session. Native disconnect retire
 connection-owned HAP/MRP, timing, encoder and media sockets, plus publication
 receipts; a subsequent connect cannot reuse their keys or pending volume work.
 Desired MRP metadata, artwork, progress and playback intent survive disconnect
-and are released on destroy; the next MRP attachment restores them without
-reusing channel state or implying receiver-side now-playing acceptance.
+and a failed event admission, and are released on destroy. The next MRP
+attachment restores them without reusing channel state or implying receiver-side
+now-playing acceptance.
 
 ### Experimental HomePod remote admission
 

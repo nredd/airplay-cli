@@ -27,7 +27,7 @@
     fprintf(stderr, "fixture check failed %s:%d: %s\n", __FILE__, __LINE__, #c); \
     abort(); } } while (0)
 
-static void derive_key_from(const uint8_t *secret, size_t secret_len,
+static inline void derive_key_from(const uint8_t *secret, size_t secret_len,
                             const char *info, uint8_t key[KEY_SIZE])
 {
     EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
@@ -44,20 +44,20 @@ static void derive_key_from(const uint8_t *secret, size_t secret_len,
     EVP_PKEY_CTX_free(ctx);
 }
 
-static void derive_key(const uint8_t secret[KEY_SIZE], const char *info,
+static inline void derive_key(const uint8_t secret[KEY_SIZE], const char *info,
                        uint8_t key[KEY_SIZE])
 {
     derive_key_from(secret, KEY_SIZE, info, key);
 }
 
-static void make_nonce(uint64_t counter, uint8_t nonce[12])
+static inline void make_nonce(uint64_t counter, uint8_t nonce[12])
 {
     memset(nonce, 0, 12);
     for (int i = 0; i < 8; i++)
         nonce[4 + i] = (uint8_t)(counter >> (i * 8));
 }
 
-static int encrypt_frame(const uint8_t key[KEY_SIZE], uint64_t counter,
+static inline int encrypt_frame(const uint8_t key[KEY_SIZE], uint64_t counter,
                          const uint8_t *plain, int plain_len, uint8_t *frame)
 {
     uint8_t aad[2] = {plain_len & 0xff, (plain_len >> 8) & 0xff};
@@ -85,7 +85,7 @@ static int encrypt_frame(const uint8_t key[KEY_SIZE], uint64_t counter,
     return total + 2 + TAG_SIZE;
 }
 
-static int decrypt_frame(const uint8_t key[KEY_SIZE], uint64_t counter,
+static inline int decrypt_frame(const uint8_t key[KEY_SIZE], uint64_t counter,
                          const uint8_t *frame, int frame_len, uint8_t *plain)
 {
     must(frame_len >= 2 + TAG_SIZE);
@@ -114,7 +114,7 @@ static int decrypt_frame(const uint8_t key[KEY_SIZE], uint64_t counter,
     return total;
 }
 
-static struct ap2_mrp_ctx *create_mrp_with_callback(
+static inline struct ap2_mrp_ctx *create_mrp_with_callback(
     const uint8_t secret[KEY_SIZE], int event_sock,
     ap2_remote_command_cb_t callback, void *userdata)
 {
@@ -129,13 +129,13 @@ static struct ap2_mrp_ctx *create_mrp_with_callback(
     return mrp;
 }
 
-static struct ap2_mrp_ctx *create_mrp(const uint8_t secret[KEY_SIZE],
+static inline struct ap2_mrp_ctx *create_mrp(const uint8_t secret[KEY_SIZE],
                                       int event_sock)
 {
     return create_mrp_with_callback(secret, event_sock, NULL, NULL);
 }
 
-static int build_event_request(uint8_t *encrypted, size_t encrypted_size,
+static inline int build_event_request(uint8_t *encrypted, size_t encrypted_size,
                                const uint8_t key[KEY_SIZE],
                                uint64_t counter, int cseq,
                                const uint8_t *body, int body_len)
@@ -158,7 +158,7 @@ static int build_event_request(uint8_t *encrypted, size_t encrypted_size,
         key, counter, request, request_len, encrypted);
 }
 
-static int build_typed_command_request(
+static inline int build_typed_command_request(
     uint8_t *encrypted, size_t encrypted_size,
     const uint8_t key[KEY_SIZE], uint64_t counter, int cseq,
     const char *type, const char *value)
@@ -176,7 +176,7 @@ static int build_typed_command_request(
     return encrypted_len;
 }
 
-static int build_command_request(uint8_t *encrypted, size_t encrypted_size,
+static inline int build_command_request(uint8_t *encrypted, size_t encrypted_size,
                                  const uint8_t key[KEY_SIZE],
                                  uint64_t counter, int cseq,
                                  const char *value)
@@ -186,7 +186,7 @@ static int build_command_request(uint8_t *encrypted, size_t encrypted_size,
         "sendMediaRemoteCommand", value);
 }
 
-static void send_request(int fd, const uint8_t key[KEY_SIZE],
+static inline void send_request(int fd, const uint8_t key[KEY_SIZE],
                          uint64_t counter, int cseq, const char *value)
 {
     uint8_t encrypted[1200];
@@ -195,7 +195,7 @@ static void send_request(int fd, const uint8_t key[KEY_SIZE],
     must(write(fd, encrypted, (size_t)encrypted_len) == encrypted_len);
 }
 
-static void read_response(int fd, const uint8_t key[KEY_SIZE],
+static inline void read_response(int fd, const uint8_t key[KEY_SIZE],
                           uint64_t counter, int cseq)
 {
     uint8_t response_frame[2048], response[2048];

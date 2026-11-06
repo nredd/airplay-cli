@@ -44,12 +44,15 @@ typedef struct {
     int rtsp_fd, audio_fd, ctrl_fd, time_fd;
     uint16_t rtsp_port, audio_port, ctrl_port, time_port;
     atomic_bool stop;
+    bool stopped;       /* peer_stop() already ran */
     atomic_uint audio_units;
     atomic_ulong audio_bytes;
     atomic_uint teardowns;
     unsigned teardown_delay_ms;
     pthread_t rtsp_thread, audio_thread;
 } peer_t;
+
+static peer_t *live_peer;
 
 static int bind_udp(uint16_t *port)
 {
@@ -161,6 +164,7 @@ static bool peer_start(peer_t *peer)
     socklen_t len = sizeof(a);
 
     memset(peer, 0, sizeof(*peer));
+    live_peer = peer;
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     peer->rtsp_fd = socket(AF_INET, SOCK_STREAM, 0);
     CHECK(peer->rtsp_fd >= 0);
@@ -179,6 +183,9 @@ static bool peer_start(peer_t *peer)
 
 static void peer_stop(peer_t *peer)
 {
+    if (peer->stopped)
+        return;
+    peer->stopped = true;
     atomic_store(&peer->stop, true);
     pthread_join(peer->rtsp_thread, NULL);
     pthread_join(peer->audio_thread, NULL);
@@ -203,7 +210,12 @@ typedef struct {
     bool feeder_started;
     char out[262144];
     size_t out_len;
+    bool waited, cleaned;   /* reaped / resources released */
 } child_t;
+
+/* The live fixtures of the running case, so main() can reap them even when a
+ * CHECK returned early. Cases keep them in static storage for that reason. */
+static child_t *live_child;
 
 static bool set_flag(int fd, int flag)
 {
@@ -228,11 +240,28 @@ static void *feed_main(void *opaque)
     return NULL;
 }
 
+/* Completely full through the test's own (nonblocking) open file description:
+ * 512-byte writes, then single bytes until the kernel says EAGAIN. */
+static bool fill_pipe(int fd, size_t *total)
+{
+    char junk[512];
+
+    memset(junk, 'x', sizeof(junk));
+    *total = 0;
+    for (;;) {
+        ssize_t n = write(fd, junk, sizeof(junk));
+        if (n < 0)
+            break;
+        *total += (size_t)n;
+    }
+    for (ssize_t n; (n = write(fd, junk, 1)) > 0;)
+        *total += (size_t)n;
+    return errno == EAGAIN;
+}
+
 /* stdout_fifo: the child's stdout is a named FIFO, so this test owns a second,
  * independent open file description on it (its own O_NONBLOCK, used to fill it
  * without touching the child's flags). Otherwise a plain anonymous pipe. */
-static bool prefill_full(child_t *c);
-
 static bool child_start(child_t *c, const char *binary, uint16_t port,
                         bool receipt, bool stdout_fifo, bool prefill)
 {
@@ -241,6 +270,7 @@ static bool child_start(child_t *c, const char *binary, uint16_t port,
     posix_spawn_file_actions_t acts;
 
     memset(c, 0, sizeof(*c));
+    live_child = c;
     c->fill_w = c->stdout_r = c->cmd_w = -1;
     snprintf(c->dir, sizeof(c->dir), "/tmp/cliairplay-real-XXXXXX");
     CHECK(mkdtemp(c->dir) != NULL);
@@ -256,8 +286,10 @@ static bool child_start(child_t *c, const char *binary, uint16_t port,
         CHECK(c->stdout_r >= 0);
         c->fill_w = open(c->out_path, O_WRONLY | O_NONBLOCK);
         CHECK(c->fill_w >= 0);
-        if (prefill)
-            CHECK(prefill_full(c));
+        if (prefill) {
+            size_t total;
+            CHECK(fill_pipe(c->fill_w, &total));
+        }
         CHECK(posix_spawn_file_actions_addopen(&acts, 1, c->out_path,
                                                O_WRONLY, 0) == 0);
     } else {
@@ -310,36 +342,32 @@ static size_t drain_stdout(child_t *c)
     return c->out_len;
 }
 
+static ssize_t read_err(const child_t *c, char *buf, size_t size)
+{
+    int fd = open(c->err_path, O_RDONLY);
+    ssize_t n = fd < 0 ? -1 : read(fd, buf, size - 1);
+
+    if (fd >= 0)
+        close(fd);
+    if (n >= 0)
+        buf[n] = '\0';
+    return n;
+}
+
 static bool err_contains(const child_t *c, const char *needle)
 {
     char buf[65536];
-    int fd = open(c->err_path, O_RDONLY);
-    ssize_t n;
 
-    if (fd < 0)
-        return false;
-    n = read(fd, buf, sizeof(buf) - 1);
-    close(fd);
-    if (n < 0)
-        return false;
-    buf[n] = '\0';
-    return strstr(buf, needle) != NULL;
+    return read_err(c, buf, sizeof(buf)) >= 0 && strstr(buf, needle) != NULL;
 }
 
 static size_t err_count(const child_t *c, const char *needle)
 {
     char buf[65536];
-    int fd = open(c->err_path, O_RDONLY);
-    ssize_t n;
     size_t count = 0;
 
-    if (fd < 0)
+    if (read_err(c, buf, sizeof(buf)) < 0)
         return 0;
-    n = read(fd, buf, sizeof(buf) - 1);
-    close(fd);
-    if (n < 0)
-        return 0;
-    buf[n] = '\0';
     for (const char *p = buf; (p = strstr(p, needle)) != NULL; p += strlen(needle))
         count++;
     return count;
@@ -381,18 +409,14 @@ static void start_feeder(child_t *c)
     c->feeder_started = pthread_create(&c->feeder, NULL, feed_main, c) == 0;
 }
 
+static ssize_t read_err(const child_t *c, char *buf, size_t size);
+
 static void dump_err(const child_t *c)
 {
     char buf[16384];
-    int fd = open(c->err_path, O_RDONLY);
-    ssize_t n = fd < 0 ? -1 : read(fd, buf, sizeof(buf) - 1);
 
-    if (fd >= 0)
-        close(fd);
-    if (n > 0) {
-        buf[n] = '\0';
+    if (read_err(c, buf, sizeof(buf)) > 0)
         fprintf(stderr, "---- child stderr ----\n%s\n----\n", buf);
-    }
 }
 
 /* Wait for the actual process; never leave it behind. `drain` keeps a reader
@@ -404,6 +428,7 @@ static bool child_wait(child_t *c, unsigned ms, int *status, bool drain)
     for (;;) {
         pid_t r = waitpid(c->pid, status, WNOHANG);
         if (r == c->pid) {
+            c->waited = true;
             if (!WIFEXITED(*status) || WEXITSTATUS(*status) != 0) {
                 fprintf(stderr, "child ended abnormally, status 0x%x\n", *status);
                 dump_err(c);
@@ -419,11 +444,15 @@ static bool child_wait(child_t *c, unsigned ms, int *status, bool drain)
     fprintf(stderr, "child did not exit within %u ms; killing\n", ms);
     kill(c->pid, SIGKILL);
     waitpid(c->pid, status, 0);
+    c->waited = true;
     return false;
 }
 
 static void child_cleanup(child_t *c)
 {
+    if (c->cleaned)
+        return;
+    c->cleaned = true;
     atomic_store(&c->feeder_run, false);
     if (c->feeder_started)
         pthread_join(c->feeder, NULL);
@@ -435,6 +464,41 @@ static void child_cleanup(child_t *c)
     unlink(c->cmd_path);
     unlink(c->err_path);
     rmdir(c->dir);
+}
+
+/* The sender's count is final once the child exited; wait for the receiver
+ * socket to have delivered exactly that many datagrams. */
+static bool wait_receiver_settled(peer_t *peer, unsigned units)
+{
+    uint64_t end = now_ms() + 5000;
+
+    while (now_ms() < end) {
+        if (atomic_load(&peer->audio_units) == units)
+            return true;
+        sleep_ms(10);
+    }
+    fprintf(stderr, "receiver saw %u datagrams, sender counted %u\n",
+            atomic_load(&peer->audio_units), units);
+    return false;
+}
+
+/* Whatever the case left behind, even after a failed CHECK: no orphan child,
+ * no thread, no temp directory. */
+static void reap_live(void)
+{
+    int status;
+
+    if (live_child && live_child->pid > 0 && !live_child->waited) {
+        kill(live_child->pid, SIGKILL);
+        waitpid(live_child->pid, &status, 0);
+        live_child->waited = true;
+    }
+    if (live_child && live_child->dir[0] != '\0')
+        child_cleanup(live_child);
+    if (live_peer)
+        peer_stop(live_peer);
+    live_child = NULL;
+    live_peer = NULL;
 }
 
 static bool wait_units(peer_t *peer, unsigned units, unsigned ms)
@@ -512,8 +576,8 @@ static bool begin_playback(child_t *c, peer_t *peer, unsigned units)
  * final must count exactly what the owned receiver saw, to the owned target. */
 static bool case_positive(const char *binary)
 {
-    peer_t peer;
-    child_t c;
+    static peer_t peer;
+    static child_t c;
     record_t r;
     int status;
 
@@ -523,9 +587,9 @@ static bool case_positive(const char *binary)
     CHECK(send_command(&c, "ACTION=STOP\n"));
     CHECK(child_wait(&c, 20000, &status, true));
     drain_stdout(&c);
-    sleep_ms(200);      /* the receiver thread drains the last datagrams */
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     CHECK(parse_record(c.out, &r));
+    CHECK(wait_receiver_settled(&peer, r.fresh_units));
     CHECK(r.records == 1 && r.last_is_final);
     CHECK(r.stop && !r.fault && !r.overflow);
     CHECK(!strcmp(r.route, "raop") && r.epoch == 1);
@@ -550,8 +614,8 @@ static bool case_positive(const char *binary)
 /* Default off: identical run without the flag emits no record at all. */
 static bool case_default_off(const char *binary)
 {
-    peer_t peer;
-    child_t c;
+    static peer_t peer;
+    static child_t c;
     int status;
 
     CHECK(peer_start(&peer));
@@ -571,8 +635,8 @@ static bool case_default_off(const char *binary)
 /* Owner STOP with no START: no applied epoch, so never a qualifying record. */
 static bool case_stop_without_start(const char *binary)
 {
-    peer_t peer;
-    child_t c;
+    static peer_t peer;
+    static child_t c;
     record_t r;
     int status;
 
@@ -594,6 +658,29 @@ static bool case_stop_without_start(const char *binary)
     return true;
 }
 
+/* A real SIGTERM mid-stream: the record, if any, is abnormal and faulted. */
+static bool case_sigterm(const char *binary)
+{
+    static peer_t peer;
+    static child_t c;
+    record_t r;
+    int status;
+
+    CHECK(peer_start(&peer));
+    CHECK(child_start(&c, binary, peer.rtsp_port, true, false, false));
+    CHECK(begin_playback(&c, &peer, 10));
+    CHECK(kill(c.pid, SIGTERM) == 0);
+    CHECK(child_wait(&c, 20000, &status, true));
+    drain_stdout(&c);
+    CHECK(parse_record(c.out, &r));
+    CHECK(r.records == 1 && r.last_is_final);
+    CHECK(!r.stop && r.fault);
+    fprintf(stderr, "ok: real CLI SIGTERM mid-stream -> abnormal, fault=true\n");
+    child_cleanup(&c);
+    peer_stop(&peer);
+    return true;
+}
+
 /* `STOP\nSTART\n` in ONE FIFO read. The production reader only checks
  * g_running between buffered lines, so the second START either runs after the
  * freeze (then the record must be invalid) or is dropped by the owner stop
@@ -605,8 +692,8 @@ static bool case_buffered_stop_start(const char *binary)
     bool executed_once = false;
 
     for (int attempt = 0; attempt < 12 && !executed_once; attempt++) {
-        peer_t peer;
-        child_t c;
+        static peer_t peer;
+        static child_t c;
         record_t r;
         int status;
 
@@ -618,7 +705,6 @@ static bool case_buffered_stop_start(const char *binary)
         CHECK(send_command(&c, "ACTION=STOP\nACTION=START\n"));
         CHECK(child_wait(&c, 20000, &status, true));
         drain_stdout(&c);
-        sleep_ms(200);
         CHECK(parse_record(&c.out[0], &r));
         /* The post-freeze START ran when it left either of its two answers. */
         bool executed = err_count(&c, "[STATUS] started") > started ||
@@ -632,7 +718,7 @@ static bool case_buffered_stop_start(const char *binary)
                     "-> record invalid (fault=true)\n");
         } else if (r.records == 1) {
             CHECK(!r.fault && r.epoch == 1);
-            CHECK(r.fresh_units == atomic_load(&peer.audio_units));
+            CHECK(wait_receiver_settled(&peer, r.fresh_units));
             CHECK(r.fresh_bytes == atomic_load(&peer.audio_bytes));
         }
         child_cleanup(&c);
@@ -642,55 +728,27 @@ static bool case_buffered_stop_start(const char *binary)
     return true;
 }
 
-/* Completely full, no room at all. */
-static bool prefill_full(child_t *c)
-{
-    char junk[512];
-
-    memset(junk, 'x', sizeof(junk));
-    for (;;) {
-        ssize_t n = write(c->fill_w, junk, sizeof(junk));
-        if (n < 0)
-            break;
-    }
-    while (write(c->fill_w, junk, 1) > 0)
-        ;
-    return errno == EAGAIN;
-}
-
 /* Fill the child's stdout FIFO from this test's own file description so that
  * the route line already fit but the final record (~200 bytes) cannot: free
  * space is left at exactly `room` bytes inside one page-sized slot. */
 static bool fill_stdout_leaving(child_t *c, size_t room)
 {
     char junk[512];
-    char sink[4096];
+    char slot[4096];
+    size_t total;
 
     memset(junk, 'x', sizeof(junk));
-    size_t total = 0;
-
-    for (;;) {                                  /* completely full */
-        ssize_t n = write(c->fill_w, junk, sizeof(junk));
-        if (n < 0 && errno != EAGAIN)
-            return false;
-        if (n < 0)
-            break;
-        total += (size_t)n;
-    }
-    for (;;) {
-        ssize_t n = write(c->fill_w, junk, 1);
-        if (n < 0)
-            break;
-        total++;
-    }
-    /* One 4096-byte slot back, then re-fill it to all but `room` bytes. */
-    CHECK(read(c->stdout_r, sink, sizeof(sink)) == (ssize_t)sizeof(sink));
-    for (size_t left = sizeof(sink) - room; left > 0;) {
+    CHECK(fill_pipe(c->fill_w, &total));
+    /* One 4096-byte slot back (the pipe buffer granule on Linux and macOS, both
+     * verified), then re-fill it to all but `room` bytes. */
+    CHECK(read(c->stdout_r, slot, sizeof(slot)) == (ssize_t)sizeof(slot));
+    for (size_t left = sizeof(slot) - room; left > 0;) {
         ssize_t n = write(c->fill_w, junk, left < sizeof(junk) ? left : sizeof(junk));
         CHECK(n > 0);
         left -= (size_t)n;
     }
-    fprintf(stderr, "filled %zu bytes then freed/refilled to leave %zu\n", total, room);
+    fprintf(stderr, "filled %zu bytes, then freed and refilled to leave %zu\n",
+            total, room);
     return true;
 }
 
@@ -699,8 +757,8 @@ static bool fill_stdout_leaving(child_t *c, size_t room)
  * actual child must finish without waiting for the reader and omit the line. */
 static bool case_full_stdout(const char *binary)
 {
-    peer_t peer;
-    child_t c;
+    static peer_t peer;
+    static child_t c;
     int status;
     uint64_t start;
 
@@ -738,8 +796,8 @@ static bool case_full_stdout(const char *binary)
  * promise the child never blocks on stdout. */
 static bool case_early_full_stdout_blocks(const char *binary)
 {
-    peer_t peer;
-    child_t c;
+    static peer_t peer;
+    static child_t c;
     int status;
 
     CHECK(peer_start(&peer));
@@ -765,6 +823,7 @@ int main(int argc, char **argv)
         { "positive", case_positive },
         { "default-off", case_default_off },
         { "stop-without-start", case_stop_without_start },
+        { "sigterm", case_sigterm },
         { "buffered-stop-start", case_buffered_stop_start },
         { "full-stdout", case_full_stdout },
     };
@@ -773,12 +832,19 @@ int main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN);
     if (argc < 2 || argc > 3)
         return 2;
-    if (argc == 3 && !strcmp(argv[2], "early-full-stdout-blocks"))
-        return case_early_full_stdout_blocks(argv[1]) ? 0 : 1;
+    if (argc == 3 && !strcmp(argv[2], "early-full-stdout-blocks")) {
+        bool ok = case_early_full_stdout_blocks(argv[1]);
+
+        reap_live();
+        return ok ? 0 : 1;
+    }
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         if (argc == 3 && strcmp(argv[2], cases[i].name) != 0)
             continue;
-        if (!cases[i].fn(argv[1])) {
+        bool ok = cases[i].fn(argv[1]);
+
+        reap_live();
+        if (!ok) {
             fprintf(stderr, "FAILED case: %s\n", cases[i].name);
             return 1;
         }

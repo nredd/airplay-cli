@@ -189,7 +189,6 @@ static cli_config_t cfg = { .protocol = PROTO_AIRPLAY2, .sample_rate = 44100,
  * stubbed, anything else reads zeros rather than a neighboring object. */
 static struct ap2cl_s *fake_client;
 static int stdout_read_fd = -1;
-static int stdin_write_fd = -1;
 
 static void reset_stubs(void)
 {
@@ -754,7 +753,7 @@ static unsigned wait_events(char *out, size_t size, unsigned events)
  * ap2cl_destroy joins that worker; only then may the final go out. */
 static void test_real_feedback_teardown(void)
 {
-    char out[65536], tail[65536];
+    char out[65536];
     real_feedback_t rf;
     char discard[16384];
 
@@ -776,9 +775,7 @@ static void test_real_feedback_teardown(void)
     use_real_destroy = false;
     CHECK(destroy_calls == 1 && g_ap2cl == NULL);
     end_session();
-    used += drain_stdout(tail, sizeof(tail));
-    CHECK(used + 1 < sizeof(out));
-    memcpy(out + (used - strlen(tail)), tail, strlen(tail) + 1);
+    used += drain_stdout(out + used, sizeof(out) - used);
     char *last = NULL;
     unsigned records = 0;
     unsigned lines = split_lines(out, &last, &records);
@@ -838,7 +835,6 @@ int main(void)
     CHECK(dup2(out_pipe[1], STDOUT_FILENO) == STDOUT_FILENO);
     CHECK(dup2(in_pipe[0], STDIN_FILENO) == STDIN_FILENO);
     stdout_read_fd = out_pipe[0];
-    stdin_write_fd = in_pipe[1];
     CHECK(setvbuf(stdout, NULL, _IOFBF, 8192) == 0);
     setvbuf(stderr, NULL, _IONBF, 0);
     /* Quiet the production status lines on stderr. */

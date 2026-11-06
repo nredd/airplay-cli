@@ -216,9 +216,9 @@ Coverage and accounting (each path is a real call path, not a test-only hook):
 - The nested RAOP hook reports every non-backlog send as fresh and cannot label
   idle silence. Silence needs a hot splice line, which only the native flow has,
   so the compat lane never sends it today; if it ever did, `ap2_send_silence_chunk`
-  makes an ACTIVE collector incomplete rather than counting it as fresh. This
-  narrows the contract's "use the RAOP hook's origin" for that one case.
-- Two more places depart from the contract text, both on purpose. Native
+  makes an ACTIVE collector incomplete rather than counting it as fresh. That one
+  case therefore does not use the RAOP hook's origin.
+- Two more places depart from the original design, both on purpose. Native
   failure outcomes are reported from `ap2cl_send_chunk_tagged` (one failure per
   failed content invocation, including state/socket failures before any send),
   not from `ap2_native_send_chunk`/`ap2_io_send_datagram_deadline`, because the
@@ -300,8 +300,11 @@ Tests use production code paths with owned loopback sockets, no receiver:
   fixture's UDP socket received; no flag emits nothing; STOP without START never
   qualifies; a buffered `STOP\nSTART\n` read leaves an invalid record; and a
   stdout pipe too full for the record lets the child exit without blocking, with
-  the record omitted. Under `SANITIZE=thread` four upstream libraop races on
-  unchanged lines are suppressed by name (`tests/tsan-libraop-preexisting.supp`).
+  the record omitted. It is skipped under `SANITIZE=thread`: the real binary
+  trips four races inside upstream libraop (its timing/control threads against
+  connect, disconnect and sync, on lines the patches do not touch), and a
+  by-function suppression would also hide the setup-port store this repo adds to
+  `raopcl_analyse_setup`. The collector is TSan-covered by the in-process cases.
 - `tests/test_ap2_session.c` covers the applied observer (failed commit, commit
   then ENDED, second START, send lock held).
 

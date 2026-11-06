@@ -209,9 +209,9 @@ jobs:
         run: make test STATIC=1 CC=gcc CXX=g++ SANITIZE=address,undefined
 
   build-macos:
-    # Both arches build on the arm64 runner: arm64 natively, x86_64 cross-compiled
-    # via -arch (the Intel macos-13 runner is being retired).
-    runs-on: macos-14
+    # Both arches build on the supported macOS 15 arm64 runner: arm64 natively,
+    # x86_64 cross-compiled via -arch. macOS 14 runners are no longer supported.
+    runs-on: macos-15
     strategy:
       fail-fast: false
       matrix:

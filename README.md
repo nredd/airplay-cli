@@ -427,6 +427,12 @@ The same suite runs under ASan/UBSan on Linux with
 
 ## Platforms and CI
 
+Both macOS targets use the supported `macos-15` ARM64 hosted runner, listed
+[here](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+ARM64 runs the full native test suite and `--check`; x86_64 is cross-compiled
+with `-arch x86_64` and architecture-checked. This replaces the retired
+`macos-14` host without changing target architectures or validation coverage.
+
 CI (`.github/workflows/build.yml`) cross-builds four targets on every push —
 `linux-x86_64`, `linux-aarch64`, `macos-arm64`, `macos-x86_64` — validates
 `--check` on the natively runnable ones, and uploads the binaries as

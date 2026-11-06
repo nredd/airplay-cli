@@ -202,11 +202,11 @@ Coverage and accounting (each path is a real call path, not a test-only hook):
   Each content invocation yields one full-write event or one failure outcome.
   `ap2cl_send_chunk_tagged` carries an explicit `FRESH` (tag = applied epoch) or
   `IDLE` origin; `BACKLOG` and `IDLE` units are counted separately, never fresh.
-  The realtime loop labels a chunk `FRESH` only when it holds no splice pad
-  silence and at least one real input byte (`ap2_chunk_origin`): a chunk that is
-  all pad (the pad is at least one chunk) or pad followed by content is `IDLE`.
-  A fresh unit on this lane therefore always carries a whole chunk of real
-  PCM; the final short chunk at input EOF (zero-filled afterwards) is `IDLE` too.
+  The realtime loop labels a chunk `FRESH` only when it has no splice pad silence
+  and the whole chunk was read from the input (`ap2_chunk_origin`): a chunk that
+  is all pad (the pad is at least one chunk), pad followed by content, or the
+  final short chunk at input EOF (zero-filled afterwards) is `IDLE`. A fresh
+  unit on this lane therefore always carries a whole chunk of real PCM.
   The legacy RAOP and compat lanes cannot make that distinction: their hook
   labels every non-backlog send fresh, including a zero-filled EOF chunk. Only
   the label changes, never pacing or data.

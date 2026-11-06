@@ -618,9 +618,9 @@ static void test_silence_origin(void)
     say("cli receipt: idle silence keeps its IDLE label; unlabelled compat lane goes incomplete");
 }
 
-/* A chunk is FRESH only when it carries no splice pad silence and at least one
- * real content byte: an all-pad or pad-plus-content chunk is IDLE, so the
- * receipt never reports fresh without wholly-PCM wire content. */
+/* A chunk is FRESH only when it carries no splice pad silence and the whole
+ * chunk was read from the input: all-pad, pad-plus-content and the short EOF
+ * chunk are IDLE, so a fresh receipt only ever counts wholly-PCM chunks. */
 static void test_chunk_origin(void)
 {
     CHECK(ap2_chunk_origin(0, 1408, 1408) == AP2_MEDIA_FRESH);

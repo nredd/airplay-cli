@@ -54,12 +54,13 @@ typedef struct {
     atomic_ulong audio_bytes;
     atomic_uint teardowns;
     pthread_t rtsp_thread, audio_thread;
+    bool rtsp_started, audio_started;   /* threads that need a join */
     bool native;        /* np serves instead of the legacy fields above */
     native_peer_t np;
 } peer_t;
 
 static peer_t *live_peer;
-/* The wire route the next child and peer use; set by main() per route. */
+
 typedef struct {
     const char *name, *protocol, *record_route, *route_line;
     bool native;    /* HAP transient pairing, served by native_ap2_peer.c */
@@ -72,6 +73,7 @@ static const route_t routes[] = {
     { "native", "airplay2", "udp", "[STATUS] route protocol=airplay2 flow=native",
       true },
 };
+/* The wire route the next child and peer use; set by main() per route. */
 static const route_t *g_route = &routes[0];
 
 static unsigned peer_units(const peer_t *p)
@@ -203,6 +205,7 @@ static bool peer_start(peer_t *peer)
     socklen_t len = sizeof(a);
 
     memset(peer, 0, sizeof(*peer));
+    peer->rtsp_fd = peer->audio_fd = peer->ctrl_fd = peer->time_fd = -1;
     live_peer = peer;
     if (g_route->native) {
         peer->native = true;
@@ -219,8 +222,12 @@ static bool peer_start(peer_t *peer)
     peer->ctrl_fd = bind_udp(&peer->ctrl_port);
     peer->time_fd = bind_udp(&peer->time_port);
     CHECK(peer->audio_fd >= 0 && peer->ctrl_fd >= 0 && peer->time_fd >= 0);
-    CHECK(pthread_create(&peer->rtsp_thread, NULL, rtsp_main, peer) == 0);
-    CHECK(pthread_create(&peer->audio_thread, NULL, audio_main, peer) == 0);
+    peer->rtsp_started =
+        pthread_create(&peer->rtsp_thread, NULL, rtsp_main, peer) == 0;
+    CHECK(peer->rtsp_started);
+    peer->audio_started =
+        pthread_create(&peer->audio_thread, NULL, audio_main, peer) == 0;
+    CHECK(peer->audio_started);
     return true;
 }
 
@@ -234,12 +241,14 @@ static void peer_stop(peer_t *peer)
         return;
     }
     atomic_store(&peer->stop, true);
-    pthread_join(peer->rtsp_thread, NULL);
-    pthread_join(peer->audio_thread, NULL);
-    close(peer->rtsp_fd);
-    close(peer->audio_fd);
-    close(peer->ctrl_fd);
-    close(peer->time_fd);
+    if (peer->rtsp_started)
+        pthread_join(peer->rtsp_thread, NULL);
+    if (peer->audio_started)
+        pthread_join(peer->audio_thread, NULL);
+    int fds[] = { peer->rtsp_fd, peer->audio_fd, peer->ctrl_fd, peer->time_fd };
+    for (size_t i = 0; i < sizeof(fds) / sizeof(fds[0]); i++)
+        if (fds[i] >= 0)
+            close(fds[i]);
 }
 
 /* ---- child process ---- */
@@ -902,6 +911,7 @@ static bool case_native_splice_pad(const char *binary)
     CHECK(r.epoch == 1 && r.backlog_units == 0);
     CHECK(r.idle_units > 0 && r.fresh_units > 0);
     CHECK(r.fresh_bytes <= peer_bytes(&peer));
+    CHECK(atomic_load(&peer.np.pairings) == 1);
     fprintf(stderr, "ok: native splice pad -> %u idle (pad silence) + %u fresh "
             "== %u datagrams at the receiver\n", r.idle_units, r.fresh_units,
             peer_units(&peer));

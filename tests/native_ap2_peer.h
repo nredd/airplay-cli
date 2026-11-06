@@ -7,7 +7,8 @@
  * framed RTSP (SETUP x2, RECORD, SET_PARAMETER, FLUSH, POST /feedback and
  * /command, TEARDOWN). It counts the datagrams that arrive on its own UDP data
  * socket. Synthetic: a fresh random SRP salt/ephemeral per run, no credentials,
- * nothing real is contacted. It does not decrypt or decode the audio.
+ * nothing real is contacted. It does not decrypt or decode the audio. One
+ * connection is served at a time and only one peer may be live per process.
  */
 #ifndef NATIVE_AP2_PEER_H
 #define NATIVE_AP2_PEER_H

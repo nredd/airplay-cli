@@ -205,12 +205,11 @@ Coverage and accounting (each path is a real call path, not a test-only hook):
   The realtime loop labels a chunk `FRESH` only when it holds no splice pad
   silence and at least one real input byte (`ap2_chunk_origin`): a chunk that is
   all pad (the pad is at least one chunk) or pad followed by content is `IDLE`.
-  A fresh unit therefore always carries real PCM and no splice pad, so a receipt
-  is never `fresh` on pad silence alone. It does not mean every byte is PCM: the
-  final short chunk at input EOF is still `FRESH` although its tail is
-  zero-filled to a full chunk (the legacy RAOP and compat lanes label every
-  non-backlog send fresh in the same way). Only the label changes, never pacing
-  or data.
+  A fresh unit on this lane therefore always carries a whole chunk of real
+  PCM; the final short chunk at input EOF (zero-filled afterwards) is `IDLE` too.
+  The legacy RAOP and compat lanes cannot make that distinction: their hook
+  labels every non-backlog send fresh, including a zero-filled EOF chunk. Only
+  the label changes, never pacing or data.
 - Actual buffered TCP is explicitly **unsupported**: nothing is registered, the
   record reports `route=buffered` and `fault=true`, transport behavior is
   unchanged. A parked frame is never counted (`audio_packets_sent` advances at
@@ -780,7 +779,7 @@ src/ap2_session.c     Protocol-neutral single-stdin flush-and-refill engine
                       (persistent input reader + ring) used by legacy RAOP and
                       both AirPlay 2 flows
 src/raop_session.c    Legacy RAOP commit / flush / standby scheduling
-src/media_receipt.c    Optional private bounded media-write receipt collector and
+src/media_receipt.c   Optional private bounded media-write receipt collector and
                       its one `@MEDIA1` record (--private-media-receipt)
 src/ap2_hap.c         HAP pair-verify, transient and PIN pair-setup, encrypted
                       RTSP framing (ChaCha20-Poly1305)

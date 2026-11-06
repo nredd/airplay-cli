@@ -623,12 +623,12 @@ static void test_silence_origin(void)
  * receipt never reports fresh without wholly-PCM wire content. */
 static void test_chunk_origin(void)
 {
-    CHECK(ap2_chunk_origin(0, 1408) == AP2_MEDIA_FRESH);
-    CHECK(ap2_chunk_origin(0, 4) == AP2_MEDIA_FRESH);   /* short final PCM */
-    CHECK(ap2_chunk_origin(0, 0) == AP2_MEDIA_IDLE);
-    CHECK(ap2_chunk_origin(1408, 0) == AP2_MEDIA_IDLE); /* pad >= chunk */
-    CHECK(ap2_chunk_origin(400, 1008) == AP2_MEDIA_IDLE); /* mixed */
-    say("cli receipt: pad-only and mixed chunks are IDLE, pure content is FRESH");
+    CHECK(ap2_chunk_origin(0, 1408, 1408) == AP2_MEDIA_FRESH);
+    CHECK(ap2_chunk_origin(0, 4, 1408) == AP2_MEDIA_IDLE);  /* short EOF chunk */
+    CHECK(ap2_chunk_origin(0, 0, 1408) == AP2_MEDIA_IDLE);
+    CHECK(ap2_chunk_origin(1408, 0, 1408) == AP2_MEDIA_IDLE); /* pad >= chunk */
+    CHECK(ap2_chunk_origin(400, 1008, 1408) == AP2_MEDIA_IDLE); /* mixed */
+    say("cli receipt: only a wholly-input chunk is FRESH; pad-only, mixed and the short EOF chunk are IDLE");
 }
 
 /* The CLI-resolved route is compared with the installed hook path. */
@@ -643,8 +643,6 @@ static void test_resolved_route_cross_check(void)
     CHECK(mr_resolved_route(&buffered) == MR_ROUTE_BUFFERED);
     CHECK(mr_resolved_route(&raop) == MR_ROUTE_RAOP);
 
-    begin_session(false);               /* disabled: collector never starts */
-    end_session();
     reset_stubs();
     mr_init(&g_mr, true);
     g_resolved_route = MR_ROUTE_UDP;
@@ -656,9 +654,25 @@ static void test_resolved_route_cross_check(void)
     g_resolved_route = MR_ROUTE_COMPAT; /* resolved compat, actual native UDP */
     mr_install_ap2(fake_client);
     CHECK(g_mr.fault);
+
+    /* A buffered request that fell back to realtime UDP: resolved BUFFERED. */
+    mr_init(&g_mr, true);
+    g_resolved_route = MR_ROUTE_BUFFERED;
+    mr_install_ap2(fake_client);
+    CHECK(g_mr.fault);
+
+    /* Legacy RAOP client installed while the CLI resolved native UDP. */
+    mr_init(&g_mr, true);
+    g_resolved_route = MR_ROUTE_UDP;
+    mr_install_raop((struct raopcl_s *)fake_client);
+    CHECK(g_mr.fault);
+    mr_init(&g_mr, true);
+    g_resolved_route = MR_ROUTE_RAOP;
+    mr_install_raop((struct raopcl_s *)fake_client);
+    CHECK(!g_mr.fault);
     g_resolved_route = MR_ROUTE_UNKNOWN;
     mr_teardown(fake_client, NULL);
-    say("cli receipt: resolved route vs installed hook path, mismatch latches a fault");
+    say("cli receipt: resolved route vs installed hook path (compat, buffered fallback, raop), mismatch latches a fault");
 }
 
 static bool wait_flag(atomic_bool *flag)

@@ -927,14 +927,19 @@ int main(int argc, char **argv)
 
     alarm(600);     /* a regression fails instead of hanging CI */
     signal(SIGPIPE, SIG_IGN);
-    if (argc < 2 || argc > 4)
+    if (argc < 2 || argc > 4) {
+        fprintf(stderr, "usage: %s <binary> [case|all] [raop|compat|native]\n",
+                argv[0]);
         return 2;
+    }
     if (argc >= 3 && !strcmp(argv[2], "early-full-stdout-blocks")) {
         bool ok = case_early_full_stdout_blocks(argv[1]);
 
         reap_live();
         return ok ? 0 : 1;
     }
+    unsigned ran = 0;
+
     for (size_t r = 0; r < sizeof(routes) / sizeof(routes[0]); r++) {
         if (argc == 4 && strcmp(argv[3], routes[r].name) != 0)
             continue;
@@ -948,6 +953,7 @@ int main(int argc, char **argv)
                 continue;
             bool ok = cases[i].fn(argv[1]);
 
+            ran++;
             reap_live();
             if (!ok) {
                 fprintf(stderr, "FAILED case: %s (route %s)\n", cases[i].name,
@@ -955,6 +961,11 @@ int main(int argc, char **argv)
                 return 1;
             }
         }
+    }
+    if (ran == 0) {
+        fprintf(stderr, "no case ran: unknown case or route (usage: %s <binary> "
+                "[case|all] [raop|compat|native])\n", argv[0]);
+        return 2;
     }
     return 0;
 }

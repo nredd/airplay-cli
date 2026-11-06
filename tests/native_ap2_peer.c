@@ -387,7 +387,7 @@ static void consume(conn_t *c, const request_t *r)
     c->used -= r->total;
 }
 
-static bool is(const request_t *r, const char *prefix)
+static bool request_is(const request_t *r, const char *prefix)
 {
     return !strncmp(r->line, prefix, strlen(prefix));
 }
@@ -476,12 +476,12 @@ static void serve(native_peer_t *peer, int fd)
     while (next_request(&c, &r)) {
         bool ok = true;
 
-        if (is(&r, "POST /pair-setup"))
+        if (request_is(&r, "POST /pair-setup"))
             ok = pair_setup(&c, peer, &srp, key, &r);
-        else if (is(&r, "SETUP"))
+        else if (request_is(&r, "SETUP"))
             ok = reply_session_setup(&c, &r, peer);
         else {
-            if (is(&r, "TEARDOWN"))
+            if (request_is(&r, "TEARDOWN"))
                 atomic_fetch_add(&peer->teardowns, 1);
             /* /info, RECORD, SET_PARAMETER, FLUSH, /feedback, /command, ... */
             ok = respond(&c, r.cseq, NULL, 0);

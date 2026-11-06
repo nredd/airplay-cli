@@ -1657,16 +1657,17 @@ static bool ap2_send_silence_chunk(const cli_config_t *cfg, uint8_t *buf,
                                    AP2_MEDIA_IDLE, 0) != AP2_SEND_FATAL;
 }
 
-/* Receipt origin of one realtime chunk. FRESH only when the chunk has no splice
- * pad silence at its head and at least one real content byte. A chunk of pad
- * only, or pad followed by content, is labelled IDLE, so pad silence is never
- * counted as fresh. The label is taken before the final short chunk at input EOF
- * is zero-filled to a full chunk, so that one chunk is still FRESH. Only the
- * label changes, never pacing or data. */
-static ap2_media_origin_t ap2_chunk_origin(int pad_bytes, int content_bytes)
+/* Receipt origin of one realtime chunk. FRESH only when the whole chunk is real
+ * input: no splice pad silence at its head and every one of its `chunk_bytes`
+ * read from the input. A chunk of pad only, pad followed by content, or the
+ * final short chunk at input EOF (zero-filled afterwards) is labelled IDLE, so
+ * silence is never counted as fresh. Only the label changes, never pacing or
+ * data. */
+static ap2_media_origin_t ap2_chunk_origin(int pad_bytes, int content_bytes,
+                                           int chunk_bytes)
 {
-    return pad_bytes == 0 && content_bytes > 0 ? AP2_MEDIA_FRESH
-                                               : AP2_MEDIA_IDLE;
+    return pad_bytes == 0 && content_bytes == chunk_bytes ? AP2_MEDIA_FRESH
+                                                          : AP2_MEDIA_IDLE;
 }
 
 /* STOP and the health decision share the send lock: a completed STOP makes
@@ -2040,7 +2041,8 @@ static int run_airplay2(cli_config_t *cfg)
                 memset(buf, 0, (size_t)pad_bytes);
             /* Label before the final-chunk padding: n is the real content
              * read so far (0 when the pad filled the whole chunk). */
-            const ap2_media_origin_t origin = ap2_chunk_origin(pad_bytes, n);
+            const ap2_media_origin_t origin = ap2_chunk_origin(
+                pad_bytes, n, AP2_FRAMES_PER_CHUNK * ap2_input_bpf);
             n = pad_final_pcm_chunk(
                 buf, pad_bytes + n, AP2_FRAMES_PER_CHUNK * ap2_input_bpf,
                 ap2_input_bpf);

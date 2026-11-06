@@ -95,11 +95,12 @@ typedef struct {
 /* Zero state. Does not enable. */
 void mr_init(media_receipt_t *mr, bool enabled);
 
-/* Record the actual route and registered coverage before any media. A buffered
- * or unknown route, an absent setup port or a zero generation set the fault. */
 /* After mr_configure: a hook path that disagrees with the route the CLI
  * resolved up front is a sticky fault (UNKNOWN means not checked). */
 void mr_expect_route(media_receipt_t *mr, mr_route_t resolved);
+
+/* Record the actual route and registered coverage before any media. A buffered
+ * or unknown route, an absent setup port or a zero generation set the fault. */
 void mr_configure(media_receipt_t *mr, mr_route_t route, uint16_t setup_port,
                   uint32_t registration_generation);
 

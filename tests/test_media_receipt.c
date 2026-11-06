@@ -235,7 +235,7 @@ static void test_faults(void)
     mr.fresh_units = UINT32_MAX - 1;
     mr.fresh_bytes = UINT32_MAX - 100;
     mr_sent(&mr, MR_ORIGIN_FRESH, 90, target(6001), 6001, 1);
-    CHECK(mr.fresh_units == UINT32_MAX - 0 && !mr.overflow);
+    CHECK(mr.fresh_units == UINT32_MAX && !mr.overflow);
     mr_sent(&mr, MR_ORIGIN_FRESH, 90, target(6001), 6001, 1);
     CHECK(mr.fresh_units == UINT32_MAX && mr.fresh_bytes == UINT32_MAX && mr.overflow);
     puts("receipt: select error/nonready/error/unknown/endpoint/epoch/route/overflow faults");

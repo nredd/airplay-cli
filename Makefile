@@ -207,6 +207,7 @@ ATTESTATION_TEST = build/tests/test_attestation
 RAOP_CLIENT_PATCH = patches/libraop-raop-client-thread-join.patch
 RAOP_CLIENT_PATCHED = build/patched/raop-media/src/raop_client.c
 RAOP_MEDIA_PATCH = patches/libraop-media-write-callback.patch
+RAOP_RACES_PATCH = patches/libraop-raop-client-thread-races.patch
 RAOP_MEDIA_STAMP = build/patched/raop-media/.stamp
 RTSP_CLIENT_PATCH = patches/libraop-rtsp-setup-cleanup.patch
 RTSP_CLIENT_PATCHED = build/patched/rtsp_client.c
@@ -263,16 +264,18 @@ $(BUILDDIR)/ap2_client_raop_lifecycle_test.o: $(SRC)/ap2_client.c Makefile
 $(BUILDDIR)/raop_session_raop_lifecycle_test.o: $(SRC)/raop_session.c Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $(RAOP_LIFECYCLE_TEST_DEFINES) $< -c -o $@
 
-# Apply the fifth local patch AFTER the existing thread-join fix. Never modify
-# submodule sources or its gitlink. Generate both public header copies together.
+# Apply the fifth local patch AFTER the existing thread-join fix, then the
+# sixth (RTP thread data races) on top of both. Never modify submodule sources
+# or its gitlink. Generate both public header copies together.
 $(RAOP_MEDIA_STAMP): $(LIBRAOP)/src/raop_client.c $(RAOP_CLIENT_PATCH) \
-		$(RAOP_MEDIA_PATCH) $(LIBRAOP)/src/raop_client.h \
+		$(RAOP_MEDIA_PATCH) $(RAOP_RACES_PATCH) $(LIBRAOP)/src/raop_client.h \
 		$(LIBRAOP)/targets/include/raop_client.h Makefile
 	@mkdir -p build/patched/raop-media/src build/patched/raop-media/targets/include
 	patch -s -o $(RAOP_CLIENT_PATCHED) $(LIBRAOP)/src/raop_client.c $(RAOP_CLIENT_PATCH)
 	cp $(LIBRAOP)/src/raop_client.h build/patched/raop-media/src/
 	cp $(LIBRAOP)/targets/include/raop_client.h build/patched/raop-media/targets/include/
 	patch -s -d build/patched/raop-media -p1 < $(RAOP_MEDIA_PATCH)
+	patch -s -d build/patched/raop-media -p1 < $(RAOP_RACES_PATCH)
 	cmp build/patched/raop-media/src/raop_client.h build/patched/raop-media/targets/include/raop_client.h
 	@touch $@
 
@@ -720,20 +723,17 @@ test: test-compat-media
 .PHONY: test-compat-media
 
 # The real executable, driven through a real command FIFO, PCM pipe and stdout
-# pipe against an owned loopback RTSP/UDP fixture (legacy RAOP route).
+# pipe against owned loopback receivers on the legacy RAOP, AirPlay 2 compat
+# and native AirPlay 2 routes (tests/native_ap2_peer.c is the native one).
 CLI_REAL_RECEIPT_TEST = build/tests/test_cli_real_receipt
-$(CLI_REAL_RECEIPT_TEST): tests/test_cli_real_receipt.c Makefile
+$(CLI_REAL_RECEIPT_TEST): tests/test_cli_real_receipt.c tests/native_ap2_peer.c \
+		tests/native_ap2_peer.h $(BUILDDIR)/ap2_plist.o $(OPENSSL)/libopenssl.a Makefile
 	@mkdir -p build/tests
-	$(CC) $(TEST_CFLAGS) $< -lpthread -o $@
+	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_cli_real_receipt.c tests/native_ap2_peer.c \
+		$(BUILDDIR)/ap2_plist.o $(OPENSSL)/libopenssl.a -lpthread -ldl -o $@
 
-# Skipped under ThreadSanitizer: the real binary reports races inside upstream
-# libraop on lines this repo does not change (see the README).
 test-cli-real-receipt: directory $(EXECUTABLE) $(CLI_REAL_RECEIPT_TEST)
-ifneq ($(filter thread,$(SANITIZE)),)
-	@echo "test-cli-real-receipt skipped under ThreadSanitizer"
-else
 	$(CLI_REAL_RECEIPT_TEST) $(EXECUTABLE)
-endif
 
 test: test-cli-real-receipt
 .PHONY: test-cli-real-receipt

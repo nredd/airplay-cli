@@ -43,7 +43,7 @@ Protocol and architecture detail lives in `DESIGN.md`; open work in `TODO.md`.
 ## Optional RAOP library write callback
 
 The CLI-local `patches/libraop-media-write-callback.patch` is applied to build-local
-copies after the existing thread-join fix. The pinned submodule and its gitlink
+copies after the existing thread-join fix (a sixth patch, described under Building, then removes RTP thread races). The pinned submodule and its gitlink
 remain unchanged. Both public `raop_client.h` copies are patched identically;
 compilation uses the generated header (`ap2_client.c`, `ap2_ptp.c` and
 `cliairplay.c` include that generated `raop_client.h`, not the pinned copy). The
@@ -198,6 +198,11 @@ Coverage and accounting (each path is a real call path, not a test-only hook):
   Each content invocation yields one full-write event or one failure outcome.
   `ap2cl_send_chunk_tagged` carries an explicit `FRESH` (tag = applied epoch) or
   `IDLE` origin; `BACKLOG` and `IDLE` units are counted separately, never fresh.
+  The realtime loop labels a chunk `FRESH` only when it holds no splice pad
+  silence and at least one real input byte (`ap2_chunk_origin`): a chunk that is
+  all pad (the pad is at least one chunk) or pad followed by content is `IDLE`,
+  so a fresh unit always means wholly-PCM wire content and a receipt is never
+  `fresh` on silence alone. Only the label changes, never the pacing or data.
 - Actual buffered TCP is explicitly **unsupported**: nothing is registered, the
   record reports `route=buffered` and `fault=true`, transport behavior is
   unchanged. A parked frame is never counted (`audio_packets_sent` advances at
@@ -293,18 +298,34 @@ Tests use production code paths with owned loopback sockets, no receiver:
   before exactly one last final line, with a control where skipping the join
   lets a remote command follow the final. That is the real worker and MRP code
   on a scripted channel, not a paired AirPlay 2 session.
-- `make test-cli-real-receipt STATIC=1`: the REAL `cliairplay` executable
-  (legacy RAOP route) spawned with a real command FIFO, PCM stdin pipe and
-  stdout pipe against an owned loopback RTSP/UDP fixture: START, PCM, STOP gives
-  one `@MEDIA1` whose unit and byte counts, target and setup port equal what the
-  fixture's UDP socket received; no flag emits nothing; STOP without START never
-  qualifies; a buffered `STOP\nSTART\n` read leaves an invalid record; and a
-  stdout pipe too full for the record lets the child exit without blocking, with
-  the record omitted. It is skipped under `SANITIZE=thread`: the real binary
-  trips four races inside upstream libraop (its timing/control threads against
-  connect, disconnect and sync, on lines the patches do not touch), and a
-  by-function suppression would also hide the setup-port store this repo adds to
-  `raopcl_analyse_setup`. The collector is TSan-covered by the in-process cases.
+- `make test-cli-real-receipt STATIC=1`: the REAL `cliairplay` executable on
+  THREE wire routes, each spawned with a real command FIFO, PCM stdin pipe and
+  stdout pipe against an owned loopback receiver: legacy RAOP (`raop`), the
+  AirPlay 2 RAOP-compatible flow (`airplay2-compat`, route `compat`) and the
+  native AirPlay 2 flow (`--ap2-native`, route `udp`). The native receiver
+  (`tests/native_ap2_peer.c`) is synthetic: SRP-6a transient pair-setup with the
+  fixed PIN, HAP framed RTSP (SETUP twice, RECORD, SET_PARAMETER, FLUSH,
+  `/feedback`, `/command`, TEARDOWN), and a UDP data socket that counts
+  datagrams; it does not decrypt audio. Per route: START, PCM, STOP gives one
+  `@MEDIA1` whose unit and byte counts, target and setup port equal what the
+  receiver's UDP socket saw; no flag emits nothing; STOP without START never
+  qualifies; SIGTERM is abnormal and faulted; a buffered `STOP\nSTART\n` read is
+  ONE run that reports which branch the real binary took (START executed after
+  the freeze -> invalid, or dropped by the owner stop -> intact) and checks that
+  branch's invariant, with no retry; and a stdout pipe too full for the record
+  lets the child exit without blocking, record omitted. The native route adds a
+  splice-pad case: the test stops its own PCM feeder until the client logs a
+  `REANCHOR`, so the loop owes the wire whole pad chunks; those count as
+  `idle_units`, and `fresh + idle` equals every datagram the receiver got.
+  It runs under `SANITIZE=thread` too, unsuppressed. Not covered: buffered
+  (type 103) TCP stays unsupported and incomplete.
+- `make test-cli-media-receipt STATIC=1` also forces both orderings of a
+  buffered `STOP\nSTART\n` cohort deterministically: the REAL command reader
+  thread, a real FIFO and one `write`, with the transport stop held at a
+  fixture barrier. Owner stop first -> START dropped, record valid; stop not
+  requested -> START executes after the freeze, record invalid. The real-binary
+  case above cannot hold the legacy STOP (it sends no RTSP), which is why its
+  branch is only observed.
 - `tests/test_ap2_session.c` covers the applied observer (failed commit, commit
   then ENDED, second START, send lock held).
 
@@ -654,8 +675,14 @@ libcodecs, libmdns), plus `patch`. The build applies
 leaving the pinned submodule source unchanged. Both legacy RAOP and AirPlay 2
 RAOP-compat use this copy: failed connects only join successfully created RTP
 threads, and repeated cleanup does not rejoin them. A failed `pthread_create`
-also fails the connect cleanly. A second build-local patch,
-`patches/libraop-rtsp-setup-cleanup.patch`, frees the SETUP request's Transport
+also fails the connect cleanly. A further build-local patch,
+`patches/libraop-raop-client-thread-races.patch`, is applied after the media
+patch and removes data races ThreadSanitizer reports in the RTP threads
+against connect and disconnect: the run flags and the keepalive stamp are
+atomic, `_raopcl_send_sync` reads the state under the mutex, and the timing
+thread learns the receiver's timing port from its first request instead of
+racing the SETUP analysis on it (it always started with the port cleared, so
+this is the one path that already ran). `patches/libraop-rtsp-setup-cleanup.patch`, frees the SETUP request's Transport
 header on failure; the SETUP 500 sanitizer regression exposed that leak.
 `patches/libraop-logtime-bounds.patch` bounds timestamp formatting with
 `snprintf`, including the Windows path. Production and tests compile the same

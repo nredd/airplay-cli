@@ -32,6 +32,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "native_ap2_peer.h"
+
 #define CHECK(c) do { if (!(c)) { \
     fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); \
     return false; } } while (0)
@@ -48,11 +50,35 @@ typedef struct {
     atomic_uint audio_units;
     atomic_ulong audio_bytes;
     atomic_uint teardowns;
-    unsigned teardown_delay_ms;
     pthread_t rtsp_thread, audio_thread;
+    bool native;        /* np serves instead of the legacy fields above */
+    native_peer_t np;
 } peer_t;
 
 static peer_t *live_peer;
+/* Native AirPlay 2 wire route (HAP transient pairing) instead of RAOP-shaped. */
+static bool g_native;
+
+static unsigned peer_units(const peer_t *p)
+{
+    return atomic_load(p->native ? &p->np.audio_units : &p->audio_units);
+}
+static unsigned long peer_bytes(const peer_t *p)
+{
+    return atomic_load(p->native ? &p->np.audio_bytes : &p->audio_bytes);
+}
+static unsigned peer_teardowns(const peer_t *p)
+{
+    return atomic_load(p->native ? &p->np.teardowns : &p->teardowns);
+}
+static uint16_t peer_rtsp(const peer_t *p)
+{
+    return p->native ? p->np.rtsp_port : p->rtsp_port;
+}
+static uint16_t peer_audio_port(const peer_t *p)
+{
+    return p->native ? p->np.audio_port : p->audio_port;
+}
 
 static int bind_udp(uint16_t *port)
 {
@@ -135,7 +161,6 @@ static void serve(peer_t *peer, int fd)
         const char *cseq = strstr(buf, "CSeq:");
         if (!strncmp(buf, "TEARDOWN", 8)) {
             atomic_fetch_add(&peer->teardowns, 1);
-            sleep_ms(peer->teardown_delay_ms);
         }
         reply(peer, fd, cseq ? atoi(cseq + 5) : 0);
     }
@@ -165,6 +190,10 @@ static bool peer_start(peer_t *peer)
 
     memset(peer, 0, sizeof(*peer));
     live_peer = peer;
+    if (g_native) {
+        peer->native = true;
+        return native_peer_start(&peer->np);
+    }
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     peer->rtsp_fd = socket(AF_INET, SOCK_STREAM, 0);
     CHECK(peer->rtsp_fd >= 0);
@@ -186,6 +215,10 @@ static void peer_stop(peer_t *peer)
     if (peer->stopped)
         return;
     peer->stopped = true;
+    if (peer->native) {
+        native_peer_stop(&peer->np);
+        return;
+    }
     atomic_store(&peer->stop, true);
     pthread_join(peer->rtsp_thread, NULL);
     pthread_join(peer->audio_thread, NULL);
@@ -216,6 +249,10 @@ typedef struct {
 /* The live fixtures of the running case, so main() can reap them even when a
  * CHECK returned early. Cases keep them in static storage for that reason. */
 static child_t *live_child;
+/* Wire route of the next child: raop (legacy), airplay2-compat, ... */
+static const char *g_protocol = "raop";
+static const char *g_record_route = "raop";
+static const char *g_route_line = "[STATUS] route protocol=raop flow=legacy";
 
 static bool set_flag(int fd, int flag)
 {
@@ -306,11 +343,16 @@ static bool child_start(child_t *c, const char *binary, uint16_t port,
     int n = 0;
     args[n++] = (char *)binary;
     args[n++] = "--protocol";
-    args[n++] = "raop";
+    args[n++] = (char *)g_protocol;
     args[n++] = "--port";
     args[n++] = port_text;
     args[n++] = "--cmdpipe";
     args[n++] = c->cmd_path;
+    if (g_native) {
+        args[n++] = "--ap2-native";
+        args[n++] = "--timing";
+        args[n++] = "ntp";
+    }
     args[n++] = "--et";
     args[n++] = "0";
     if (receipt)
@@ -473,12 +515,12 @@ static bool wait_receiver_settled(peer_t *peer, unsigned units)
     uint64_t end = now_ms() + 5000;
 
     while (now_ms() < end) {
-        if (atomic_load(&peer->audio_units) == units)
+        if (peer_units(peer) == units)
             return true;
         sleep_ms(10);
     }
     fprintf(stderr, "receiver saw %u datagrams, sender counted %u\n",
-            atomic_load(&peer->audio_units), units);
+            peer_units(peer), units);
     return false;
 }
 
@@ -506,12 +548,12 @@ static bool wait_units(peer_t *peer, unsigned units, unsigned ms)
     uint64_t end = now_ms() + ms;
 
     while (now_ms() < end) {
-        if (atomic_load(&peer->audio_units) >= units)
+        if (peer_units(peer) >= units)
             return true;
         sleep_ms(20);
     }
     fprintf(stderr, "timeout: loopback receiver saw %u of %u datagrams\n",
-            atomic_load(&peer->audio_units), units);
+            peer_units(peer), units);
     return false;
 }
 
@@ -582,7 +624,7 @@ static bool case_positive(const char *binary)
     int status;
 
     CHECK(peer_start(&peer));
-    CHECK(child_start(&c, binary, peer.rtsp_port, true, false, false));
+    CHECK(child_start(&c, binary, peer_rtsp(&peer), true, false, false));
     CHECK(begin_playback(&c, &peer, 20));
     CHECK(send_command(&c, "ACTION=STOP\n"));
     CHECK(child_wait(&c, 20000, &status, true));
@@ -592,18 +634,18 @@ static bool case_positive(const char *binary)
     CHECK(wait_receiver_settled(&peer, r.fresh_units));
     CHECK(r.records == 1 && r.last_is_final);
     CHECK(r.stop && !r.fault && !r.overflow);
-    CHECK(!strcmp(r.route, "raop") && r.epoch == 1);
+    CHECK(!strcmp(r.route, g_record_route) && r.epoch == 1);
     CHECK(!strcmp(r.addr, "\"127.0.0.1\""));
-    CHECK(r.port == peer.audio_port && r.setup_port == peer.audio_port);
+    CHECK(r.port == peer_audio_port(&peer) && r.setup_port == peer_audio_port(&peer));
     CHECK(r.fresh_units >= 20 && r.idle_units == 0 && r.backlog_units == 0);
     /* Sender count == what the owned receiver actually got, units and bytes. */
     fprintf(stderr, "sender %u units/%u bytes, receiver %u units/%lu bytes\n",
-            r.fresh_units, r.fresh_bytes, atomic_load(&peer.audio_units),
-            atomic_load(&peer.audio_bytes));
-    CHECK(r.fresh_units == atomic_load(&peer.audio_units));
-    CHECK(r.fresh_bytes == atomic_load(&peer.audio_bytes));
-    CHECK(atomic_load(&peer.teardowns) >= 1);
-    CHECK(strstr(c.out, "[STATUS] route protocol=raop flow=legacy") != NULL);
+            r.fresh_units, r.fresh_bytes, peer_units(&peer),
+            peer_bytes(&peer));
+    CHECK(r.fresh_units == peer_units(&peer));
+    CHECK(r.fresh_bytes == peer_bytes(&peer));
+    CHECK(peer_teardowns(&peer) >= 1);
+    CHECK(strstr(c.out, g_route_line) != NULL);
     fprintf(stderr, "ok: real CLI START/PCM/STOP -> one @MEDIA1 (%u units, %u bytes) "
             "== receiver\n", r.fresh_units, r.fresh_bytes);
     child_cleanup(&c);
@@ -619,7 +661,7 @@ static bool case_default_off(const char *binary)
     int status;
 
     CHECK(peer_start(&peer));
-    CHECK(child_start(&c, binary, peer.rtsp_port, false, false, false));
+    CHECK(child_start(&c, binary, peer_rtsp(&peer), false, false, false));
     CHECK(begin_playback(&c, &peer, 5));
     CHECK(send_command(&c, "ACTION=STOP\n"));
     CHECK(child_wait(&c, 20000, &status, true));
@@ -641,7 +683,7 @@ static bool case_stop_without_start(const char *binary)
     int status;
 
     CHECK(peer_start(&peer));
-    CHECK(child_start(&c, binary, peer.rtsp_port, true, false, false));
+    CHECK(child_start(&c, binary, peer_rtsp(&peer), true, false, false));
     CHECK(wait_err(&c, "[STATUS] connected", 15000));
     CHECK(send_command(&c, "ACTION=STOP\n"));
     CHECK(child_wait(&c, 20000, &status, true));
@@ -651,7 +693,7 @@ static bool case_stop_without_start(const char *binary)
     /* Valid but empty: epoch 0, zero units and no target never qualifies. */
     CHECK(r.records == 0 || (r.epoch == 0 && r.fresh_units == 0 &&
                              r.fresh_bytes == 0 && !strcmp(r.addr, "null")));
-    CHECK(atomic_load(&peer.audio_units) == 0);
+    CHECK(peer_units(&peer) == 0);
     fprintf(stderr, "ok: real CLI STOP without START never qualifies\n");
     child_cleanup(&c);
     peer_stop(&peer);
@@ -667,7 +709,7 @@ static bool case_sigterm(const char *binary)
     int status;
 
     CHECK(peer_start(&peer));
-    CHECK(child_start(&c, binary, peer.rtsp_port, true, false, false));
+    CHECK(child_start(&c, binary, peer_rtsp(&peer), true, false, false));
     CHECK(begin_playback(&c, &peer, 10));
     CHECK(kill(c.pid, SIGTERM) == 0);
     CHECK(child_wait(&c, 20000, &status, true));
@@ -681,50 +723,45 @@ static bool case_sigterm(const char *binary)
     return true;
 }
 
-/* `STOP\nSTART\n` in ONE FIFO read. The production reader only checks
- * g_running between buffered lines, so the second START either runs after the
- * freeze (then the record must be invalid) or is dropped by the owner stop
- * (then it never ran and the measured interval is intact). Either way no
- * second epoch and no write after the freeze may be counted. The race is real,
- * so repeat until the START was actually executed at least once. */
+/* `STOP\nSTART\n` in ONE FIFO read, ONE run. The production reader only checks
+ * g_running between buffered lines, and the legacy STOP sends no RTSP the
+ * fixture could hold, so which branch the real binary takes is OBSERVATIONAL:
+ * either the START ran after the freeze (record must be invalid) or the owner
+ * stop dropped it (record intact). Both orderings are forced deterministically
+ * in test_cli_media_receipt (real reader + FIFO + transport barrier); this case
+ * asserts the invariant for whichever branch happened and reports it. It does
+ * not retry and is not the coverage proof of either branch. */
 static bool case_buffered_stop_start(const char *binary)
 {
-    bool executed_once = false;
+    static peer_t peer;
+    static child_t c;
+    record_t r;
+    int status;
 
-    for (int attempt = 0; attempt < 12 && !executed_once; attempt++) {
-        static peer_t peer;
-        static child_t c;
-        record_t r;
-        int status;
-
-        CHECK(peer_start(&peer));
-        peer.teardown_delay_ms = 150;
-        CHECK(child_start(&c, binary, peer.rtsp_port, true, false, false));
-        CHECK(begin_playback(&c, &peer, 10));
-        size_t started = err_count(&c, "[STATUS] started");
-        CHECK(send_command(&c, "ACTION=STOP\nACTION=START\n"));
-        CHECK(child_wait(&c, 20000, &status, true));
-        drain_stdout(&c);
-        CHECK(parse_record(&c.out[0], &r));
-        /* The post-freeze START ran when it left either of its two answers. */
-        bool executed = err_count(&c, "[STATUS] started") > started ||
-                        err_contains(&c, "START failed");
-        CHECK(r.records <= 1);
-        if (executed) {
-            executed_once = true;
-            CHECK(r.records == 1 && r.last_is_final);
-            CHECK(r.fault);                 /* post-freeze START invalidates */
-            fprintf(stderr, "ok: buffered STOP\\nSTART executed after the freeze "
-                    "-> record invalid (fault=true)\n");
-        } else if (r.records == 1) {
-            CHECK(!r.fault && r.epoch == 1);
-            CHECK(wait_receiver_settled(&peer, r.fresh_units));
-            CHECK(r.fresh_bytes == atomic_load(&peer.audio_bytes));
-        }
-        child_cleanup(&c);
-        peer_stop(&peer);
+    CHECK(peer_start(&peer));
+    CHECK(child_start(&c, binary, peer_rtsp(&peer), true, false, false));
+    CHECK(begin_playback(&c, &peer, 10));
+    size_t started = err_count(&c, "[STATUS] started");
+    CHECK(send_command(&c, "ACTION=STOP\nACTION=START\n"));
+    CHECK(child_wait(&c, 20000, &status, true));
+    drain_stdout(&c);
+    CHECK(parse_record(&c.out[0], &r));
+    bool executed = err_count(&c, "[STATUS] started") > started ||
+                    err_contains(&c, "START failed");
+    CHECK(r.records == 1 && r.last_is_final);
+    if (executed) {
+        CHECK(r.fault);                     /* post-freeze START invalidates */
+    } else {
+        CHECK(!r.fault && r.epoch == 1);
+        CHECK(wait_receiver_settled(&peer, r.fresh_units));
+        CHECK(r.fresh_bytes == peer_bytes(&peer));
     }
-    CHECK(executed_once);
+    fprintf(stderr, "ok: real CLI buffered STOP\\nSTART observed branch: %s "
+            "-> %s\n", executed ? "START executed after freeze" :
+            "START dropped by owner stop",
+            executed ? "record invalid (fault=true)" : "record intact");
+    child_cleanup(&c);
+    peer_stop(&peer);
     return true;
 }
 
@@ -763,7 +800,7 @@ static bool case_full_stdout(const char *binary)
     uint64_t start;
 
     CHECK(peer_start(&peer));
-    CHECK(child_start(&c, binary, peer.rtsp_port, true, true, false));
+    CHECK(child_start(&c, binary, peer_rtsp(&peer), true, true, false));
     CHECK(wait_err(&c, "[STATUS] connected", 15000));
     drain_stdout(&c);                           /* the route line is consumed */
     CHECK(strstr(c.out, "[STATUS] route") != NULL);
@@ -801,7 +838,7 @@ static bool case_early_full_stdout_blocks(const char *binary)
     int status;
 
     CHECK(peer_start(&peer));
-    CHECK(child_start(&c, binary, peer.rtsp_port, true, true, true));
+    CHECK(child_start(&c, binary, peer_rtsp(&peer), true, true, true));
     sleep_ms(3000);
     CHECK(waitpid(c.pid, &status, WNOHANG) == 0);        /* still alive */
     CHECK(!err_contains(&c, "[STATUS] connected"));     /* never got past it */
@@ -815,38 +852,114 @@ static bool case_early_full_stdout_blocks(const char *binary)
     return true;
 }
 
+static void stop_feeder(child_t *c)
+{
+    atomic_store(&c->feeder_run, false);
+    if (c->feeder_started) {
+        pthread_join(c->feeder, NULL);
+        c->feeder_started = false;
+    }
+}
+
+/* Native only: the PCM input runs dry (the test stops its own feeder) until the
+ * client announces a splice-pad recovery (`[STATUS] REANCHOR`), then resumes.
+ * The audio loop then owes the wire whole chunks of pad silence with no PCM in
+ * them. Those must be counted as IDLE, never fresh, while the receiver still
+ * sees every one: fresh + idle == all datagrams it received. */
+static bool case_native_splice_pad(const char *binary)
+{
+    static peer_t peer;
+    static child_t c;
+    record_t r;
+    int status;
+
+    CHECK(g_native);
+    CHECK(peer_start(&peer));
+    CHECK(child_start(&c, binary, peer_rtsp(&peer), true, false, false));
+    CHECK(begin_playback(&c, &peer, 20));
+    stop_feeder(&c);
+    CHECK(wait_err(&c, "[STATUS] REANCHOR", 20000));
+    unsigned after_gap = peer_units(&peer);
+    start_feeder(&c);
+    CHECK(wait_units(&peer, after_gap + 40, 20000));
+    CHECK(send_command(&c, "ACTION=STOP\n"));
+    CHECK(child_wait(&c, 20000, &status, true));
+    drain_stdout(&c);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(parse_record(c.out, &r));
+    CHECK(wait_receiver_settled(&peer, r.fresh_units + r.idle_units));
+    CHECK(r.records == 1 && r.last_is_final && r.stop && !r.fault && !r.overflow);
+    CHECK(r.epoch == 1 && r.backlog_units == 0);
+    CHECK(r.idle_units > 0 && r.fresh_units > 0);
+    CHECK(r.fresh_bytes <= peer_bytes(&peer));
+    fprintf(stderr, "ok: native splice pad -> %u idle (pad silence) + %u fresh "
+            "== %u datagrams at the receiver\n", r.idle_units, r.fresh_units,
+            peer_units(&peer));
+    child_cleanup(&c);
+    peer_stop(&peer);
+    return true;
+}
+
 typedef bool (*case_fn)(const char *);
 
+typedef struct {
+    const char *name, *protocol, *record_route, *route_line;
+    bool native;
+} route_t;
+
+static const route_t routes[] = {
+    { "raop", "raop", "raop", "[STATUS] route protocol=raop flow=legacy", false },
+    { "compat", "airplay2-compat", "compat",
+      "[STATUS] route protocol=airplay2 flow=raop-compat", false },
+    { "native", "airplay2", "udp", "[STATUS] route protocol=airplay2 flow=native",
+      true },
+};
+
+/* usage: driver <binary> [case] [route]; no case/route runs every one. */
 int main(int argc, char **argv)
 {
-    static const struct { const char *name; case_fn fn; } cases[] = {
-        { "positive", case_positive },
-        { "default-off", case_default_off },
-        { "stop-without-start", case_stop_without_start },
-        { "sigterm", case_sigterm },
-        { "buffered-stop-start", case_buffered_stop_start },
-        { "full-stdout", case_full_stdout },
+    static const struct { const char *name; case_fn fn; bool native_only; } cases[] = {
+        { "positive", case_positive, false },
+        { "default-off", case_default_off, false },
+        { "stop-without-start", case_stop_without_start, false },
+        { "sigterm", case_sigterm, false },
+        { "buffered-stop-start", case_buffered_stop_start, false },
+        { "full-stdout", case_full_stdout, false },
+        { "native-splice-pad", case_native_splice_pad, true },
     };
 
-    alarm(240);     /* a regression fails instead of hanging CI */
+    alarm(600);     /* a regression fails instead of hanging CI */
     signal(SIGPIPE, SIG_IGN);
-    if (argc < 2 || argc > 3)
+    if (argc < 2 || argc > 4)
         return 2;
-    if (argc == 3 && !strcmp(argv[2], "early-full-stdout-blocks")) {
+    if (argc >= 3 && !strcmp(argv[2], "early-full-stdout-blocks")) {
         bool ok = case_early_full_stdout_blocks(argv[1]);
 
         reap_live();
         return ok ? 0 : 1;
     }
-    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-        if (argc == 3 && strcmp(argv[2], cases[i].name) != 0)
+    for (size_t r = 0; r < sizeof(routes) / sizeof(routes[0]); r++) {
+        if (argc == 4 && strcmp(argv[3], routes[r].name) != 0)
             continue;
-        bool ok = cases[i].fn(argv[1]);
+        g_protocol = routes[r].protocol;
+        g_record_route = routes[r].record_route;
+        g_route_line = routes[r].route_line;
+        g_native = routes[r].native;
+        fprintf(stderr, "== route %s ==\n", routes[r].name);
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            if (argc >= 3 && strcmp(argv[2], "all") != 0 &&
+                strcmp(argv[2], cases[i].name) != 0)
+                continue;
+            if (cases[i].native_only && !g_native)
+                continue;
+            bool ok = cases[i].fn(argv[1]);
 
-        reap_live();
-        if (!ok) {
-            fprintf(stderr, "FAILED case: %s\n", cases[i].name);
-            return 1;
+            reap_live();
+            if (!ok) {
+                fprintf(stderr, "FAILED case: %s (route %s)\n", cases[i].name,
+                        routes[r].name);
+                return 1;
+            }
         }
     }
     return 0;

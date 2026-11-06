@@ -55,7 +55,18 @@ void ap2cl_force_native(struct ap2cl_s *p);
 static bool connected = true;
 static bool healthy = true;
 static ap2_commit_result_t next_commit = AP2_COMMIT_OK;
-static unsigned stop_calls, start_calls, resume_calls;
+static atomic_uint stop_calls, start_calls, resume_calls; /* touched by the real reader thread too */
+/* Fixture-owned barrier inside the stubbed transport stop: the REAL command
+ * reader holds a buffered `STOP\nSTART\n` cohort with the STOP in flight. */
+static atomic_bool stop_hold, stop_entered;
+
+static void stop_barrier(void)
+{
+    if (!atomic_load(&stop_hold)) return;
+    atomic_store(&stop_entered, true);
+    while (atomic_load(&stop_hold)) sched_yield();
+}
+
 static bool stop_saw_frozen, stop_saw_send_lock;
 static uint32_t generation = 5;
 static ap2_media_path_t media_path = AP2_MEDIA_PATH_NATIVE_UDP;
@@ -116,6 +127,7 @@ void test_stop(struct ap2cl_s *p)
     /* The measured interval closed BEFORE the transport stop, under the lock. */
     stop_saw_frozen = atomic_load(&g_mr.state) == MR_FROZEN;
     stop_saw_send_lock = pthread_mutex_trylock(&g_audio_send_lock) == EBUSY;
+    stop_barrier();
     connected = false;
 }
 
@@ -606,6 +618,91 @@ static void test_silence_origin(void)
     say("cli receipt: idle silence keeps its IDLE label; unlabelled compat lane goes incomplete");
 }
 
+/* A chunk is FRESH only when it carries no splice pad silence and at least one
+ * real content byte: an all-pad or pad-plus-content chunk is IDLE, so the
+ * receipt never reports fresh without wholly-PCM wire content. */
+static void test_chunk_origin(void)
+{
+    CHECK(ap2_chunk_origin(0, 1408) == AP2_MEDIA_FRESH);
+    CHECK(ap2_chunk_origin(0, 4) == AP2_MEDIA_FRESH);   /* short final PCM */
+    CHECK(ap2_chunk_origin(0, 0) == AP2_MEDIA_IDLE);
+    CHECK(ap2_chunk_origin(1408, 0) == AP2_MEDIA_IDLE); /* pad >= chunk */
+    CHECK(ap2_chunk_origin(400, 1008) == AP2_MEDIA_IDLE); /* mixed */
+    say("cli receipt: pad-only and mixed chunks are IDLE, pure content is FRESH");
+}
+
+static bool wait_flag(atomic_bool *flag)
+{
+    for (unsigned i = 0; i < 5000 && !atomic_load(flag); i++) usleep(1000);
+    return atomic_load(flag);
+}
+
+/* The production reader, a real FIFO and ONE write carrying `STOP\nSTART\n`.
+ * The barrier holds the STOP in the transport so both orderings of the owner
+ * stop vs the buffered START are forced, not raced: `owner_stop_first` is the
+ * audio loop having already requested process exit (START dropped), otherwise
+ * g_running is still set when the STOP returns (START executes). */
+static void run_buffered_cohort(bool owner_stop_first)
+{
+    char dir[] = "/tmp/cli-cohort-XXXXXX";
+    CHECK(mkdtemp(dir) != NULL);
+    char path[64];
+    snprintf(path, sizeof(path), "%s/cmd", dir);
+    CHECK(mkfifo(path, 0600) == 0);
+
+    begin_session(true);
+    handle_command("ACTION", "START", &cfg);
+    sender_content(3, AP2_MEDIA_FRESH);
+    unsigned before = start_calls + resume_calls;
+
+    cli_config_t reader_cfg = cfg;
+    reader_cfg.cmdpipe = path;
+    atomic_store(&g_running, true);
+    atomic_store(&stop_entered, false);
+    atomic_store(&stop_hold, true);
+    CHECK(start_command_thread(&reader_cfg));
+    int w = open(path, O_WRONLY | O_NONBLOCK);
+    CHECK(w >= 0);
+    const char cohort[] = "ACTION=STOP\nACTION=START\n";
+    CHECK(write(w, cohort, sizeof(cohort) - 1) == (ssize_t)(sizeof(cohort) - 1));
+
+    CHECK(wait_flag(&stop_entered));
+    CHECK(atomic_load(&g_mr.state) == MR_FROZEN);          /* freeze first */
+    CHECK(start_calls + resume_calls == before);
+    if (owner_stop_first) request_command_stop();
+    atomic_store(&stop_hold, false);
+    if (owner_stop_first) {
+        CHECK(join_command_thread());
+        CHECK(start_calls + resume_calls == before);        /* dropped */
+        CHECK(!atomic_load(&g_mr.terminal_invalid) && !g_mr.fault);
+        CHECK(g_mr.stop_frozen && g_mr.applied_count == 1);
+    } else {
+        for (unsigned i = 0; i < 5000 && start_calls + resume_calls == before; i++)
+            usleep(1000);
+        CHECK(start_calls + resume_calls == before + 1);    /* executed */
+        request_command_stop();
+        CHECK(join_command_thread());
+        CHECK(atomic_load(&g_mr.terminal_invalid));         /* post-freeze */
+        CHECK(g_mr.applied_count == 1);
+    }
+    CHECK(g_mr.fresh_units == 3 && g_mr.fresh_bytes == 3000);
+    close(w);
+    close(g_cmdpipe_fd);
+    g_cmdpipe_fd = -1;
+    g_cmdpipe_used = 0; /* the dropped START stays buffered in the one-shot process */
+    end_session();
+    atomic_store(&g_running, true);
+    unlink(path);
+    rmdir(dir);
+}
+
+static void test_buffered_stop_start_cohort(void)
+{
+    run_buffered_cohort(true);
+    run_buffered_cohort(false);
+    say("cli receipt: real reader + FIFO, STOP held at the barrier: owner-stop drops START (valid), live START latches invalid, deterministic both ways");
+}
+
 typedef struct {
     atomic_bool started, done;
     bool ok;
@@ -848,6 +945,8 @@ int main(void)
     test_commit_failure_never_activates();
     test_registration_changes();
     test_silence_origin();
+    test_chunk_origin();
+    test_buffered_stop_start_cohort();
     test_final_after_writers_joined();
     test_unjoined_writer_control();
     test_real_feedback_teardown();

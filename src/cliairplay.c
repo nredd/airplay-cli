@@ -183,7 +183,9 @@ static void status_connected(void)
 #define SESSION_IDLE_TIMEOUT_MS   120000  /* orphan safety net */
 static struct ap2_session_s *g_session = NULL;
 static pthread_mutex_t g_audio_send_lock = PTHREAD_MUTEX_INITIALIZER;
-static bool g_first_start_done = false;
+/* Written by the command thread under the send lock, polled by the audio loop
+ * before it takes that lock: atomic so the unlocked poll is not a data race. */
+static atomic_bool g_first_start_done = false;
 /* Optional private media-write receipt collector (--private-media-receipt),
  * disabled by default. Fixed storage that outlives every client and callback;
  * see media_receipt.h for the ownership and locking contract. */
@@ -1641,6 +1643,17 @@ static bool ap2_send_silence_chunk(const cli_config_t *cfg, uint8_t *buf,
                                    AP2_MEDIA_IDLE, 0) != AP2_SEND_FATAL;
 }
 
+/* Receipt origin of one realtime chunk. FRESH only when the chunk is entirely
+ * real content from the input (no splice pad silence at its head and at least
+ * one content byte). A chunk of pad only, or pad followed by content, is
+ * labelled IDLE: it is never counted as fresh, so a fresh receipt always
+ * means wholly-PCM chunks went to the wire. Only the label changes. */
+static ap2_media_origin_t ap2_chunk_origin(int pad_bytes, int content_bytes)
+{
+    return pad_bytes == 0 && content_bytes > 0 ? AP2_MEDIA_FRESH
+                                               : AP2_MEDIA_IDLE;
+}
+
 /* STOP and the health decision share the send lock: a completed STOP makes
  * the transport disconnected intentionally, not a playback failure. */
 static bool airplay2_should_exit(bool *playback_failed)
@@ -2010,6 +2023,9 @@ static int run_airplay2(cli_config_t *cfg)
             }
             if (pad_bytes)
                 memset(buf, 0, (size_t)pad_bytes);
+            /* Label before the final-chunk padding: n is the real content
+             * read so far (0 when the pad filled the whole chunk). */
+            const ap2_media_origin_t origin = ap2_chunk_origin(pad_bytes, n);
             n = pad_final_pcm_chunk(
                 buf, pad_bytes + n, AP2_FRAMES_PER_CHUNK * ap2_input_bpf,
                 ap2_input_bpf);
@@ -2024,7 +2040,8 @@ static int run_airplay2(cli_config_t *cfg)
                 send = ap2_alac_buf;
             }
             ap2_send_result_t result = ap2cl_send_chunk_tagged(
-                g_ap2cl, send, af, AP2_MEDIA_FRESH, mr_current_epoch(&g_mr));
+                g_ap2cl, send, af, origin,
+                origin == AP2_MEDIA_FRESH ? mr_current_epoch(&g_mr) : 0);
             if (result == AP2_SEND_FATAL) {
                 status_error("AirPlay 2 realtime send failed");
                 playback_failed = true;

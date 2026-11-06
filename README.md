@@ -40,6 +40,48 @@ Protocol and architecture detail lives in `DESIGN.md`; open work in `TODO.md`.
   first sample to be audible at an exact wall-clock instant, so every member of
   a sync group is handed the same instant and aligns by construction.
 
+## Optional RAOP library write callback
+
+The CLI-local `patches/libraop-media-write-callback.patch` is applied to build-local
+copies after the existing thread-join fix. The pinned submodule and its gitlink
+remain unchanged. Both public `raop_client.h` copies are patched identically;
+compilation uses the generated header. There is no CLI consumer or new status
+output, and native AirPlay 2 is not instrumented.
+
+`raopcl_set_media_write_cb(client, callback, ctx)` defaults to NULL. Install before
+media starts. The synchronous callback reports only full successful audio
+`sendto` writes following positive socket readiness: `RAOP_MEDIA_FRESH` from
+`raopcl_send_chunk`, or `RAOP_MEDIA_BACKLOG` from resumed `raopcl_accept_frames`,
+the full datagram size including the RTP header, and the actual destination.
+Origin identifies the caller path, not the content or stimulus. Sync, timing and
+RTX writes are excluded. Non-streaming, closed, non-ready, failed/short writes
+and select errors do not notify. Existing send attempts, return values, pacing,
+volume and retry behavior are unchanged, including the legacy select-error
+path that may still attempt a write without producing a notification.
+
+Both media callers hold the same client mutex through the callback. Copy only
+bounded data; do not perform I/O, block, retain the borrowed destination pointer,
+or reenter libraop. The pointer is valid only until callback return. The setter
+uses that mutex too: replacing or clearing waits for an in-flight callback.
+Keep the old context alive until the setter returns; clearing also clears the
+stored context. Before freeing the client, clear the callback, stop/join *all*
+API callers (including setters), then destroy with exclusive ownership. RTP
+thread joins do not join application media callers.
+
+This is success-only kernel write acceptance, NOT complete error/drop accounting,
+NIC egress, receiver receipt or playback evidence. It supplies no timestamps,
+START epochs, complete receipt, cross-process clock proof or final-output owner.
+
+`make test-raop-media STATIC=1` exercises the actual patched production unit,
+real fresh/backlog public caller paths and real UDP writes to owned loopback
+sockets with no receiver process. Test-only syscall hooks cover error/short/
+EINTR/non-ready paths, sync/RTX exclusions and concurrent unregister/context
+lifetime. `make test-raop-media-red STATIC=1` requires an intended callback
+assertion failure from a matched baseline-behavior fixture: it retains the new
+API solely to compile but drops notifications, as the old source did. This is
+not an assertion that the old source had the new API. Both targets run in
+`make test`, including the existing Linux ASan/UBSan CI gate.
+
 ## Usage
 
 ```bash

@@ -122,7 +122,7 @@ OPENSSL     = $(LIBRAOP)/libopenssl/targets/$(HOST)/$(PLATFORM)
 vpath %.c $(TOOLS):$(LIBRAOP)/src:$(DMAP_PARSER):$(SRC)
 vpath %.cpp $(TOOLS):$(LIBRAOP)/src:$(SRC)
 
-INCLUDE = -I$(TOOLS) \
+INCLUDE = -Ibuild/patched/raop-media/src -I$(TOOLS) \
 	-I$(DMAP_PARSER) \
 	-I$(MDNS)/include/mdnssvc -I$(MDNS)/include/mdnssd \
 	-I$(OPENSSL)/include \
@@ -205,7 +205,9 @@ ATTESTATION_TEST = build/tests/test_attestation
 # fails early (a zeroed pthread_t can crash Linux). The submodule stays pristine:
 # the fix is a patch applied to a build-local copy of raop_client.c.
 RAOP_CLIENT_PATCH = patches/libraop-raop-client-thread-join.patch
-RAOP_CLIENT_PATCHED = build/patched/raop_client.c
+RAOP_CLIENT_PATCHED = build/patched/raop-media/src/raop_client.c
+RAOP_MEDIA_PATCH = patches/libraop-media-write-callback.patch
+RAOP_MEDIA_STAMP = build/patched/raop-media/.stamp
 RTSP_CLIENT_PATCH = patches/libraop-rtsp-setup-cleanup.patch
 RTSP_CLIENT_PATCHED = build/patched/rtsp_client.c
 CROSS_NET_PATCH = patches/libraop-http-read-poll.patch
@@ -252,9 +254,21 @@ $(BUILDDIR)/ap2_client_raop_lifecycle_test.o: $(SRC)/ap2_client.c Makefile
 $(BUILDDIR)/raop_session_raop_lifecycle_test.o: $(SRC)/raop_session.c Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $(RAOP_LIFECYCLE_TEST_DEFINES) $< -c -o $@
 
-$(RAOP_CLIENT_PATCHED): $(LIBRAOP)/src/raop_client.c $(RAOP_CLIENT_PATCH)
-	@mkdir -p $(dir $@)
-	patch -s -o $@ $< $(RAOP_CLIENT_PATCH)
+# Apply the fifth local patch AFTER the existing thread-join fix. Never modify
+# submodule sources or its gitlink. Generate both public header copies together.
+$(RAOP_MEDIA_STAMP): $(LIBRAOP)/src/raop_client.c $(RAOP_CLIENT_PATCH) \
+		$(RAOP_MEDIA_PATCH) $(LIBRAOP)/src/raop_client.h \
+		$(LIBRAOP)/targets/include/raop_client.h Makefile
+	@mkdir -p build/patched/raop-media/src build/patched/raop-media/targets/include
+	patch -s -o $(RAOP_CLIENT_PATCHED) $(LIBRAOP)/src/raop_client.c $(RAOP_CLIENT_PATCH)
+	cp $(LIBRAOP)/src/raop_client.h build/patched/raop-media/src/
+	cp $(LIBRAOP)/targets/include/raop_client.h build/patched/raop-media/targets/include/
+	patch -s -d build/patched/raop-media -p1 < $(RAOP_MEDIA_PATCH)
+	cmp build/patched/raop-media/src/raop_client.h build/patched/raop-media/targets/include/raop_client.h
+	@touch $@
+
+$(RAOP_CLIENT_PATCHED): $(RAOP_MEDIA_STAMP)
+	@test -f $@
 
 $(RTSP_CLIENT_PATCHED): $(LIBRAOP)/src/rtsp_client.c $(RTSP_CLIENT_PATCH)
 	@mkdir -p $(dir $@)
@@ -279,6 +293,10 @@ $(BUILDDIR)/rtsp_client.o: $(RTSP_CLIENT_PATCHED)
 
 $(BUILDDIR)/raop_client.o: $(RAOP_CLIENT_PATCHED)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
+
+# All translation units see the same generated public API before compiling.
+$(OBJECTS_ALL) build/tests/ap2_client.o build/tests/test_ap2_client_main.o \
+		build/tests/cross_ssl.o: $(RAOP_MEDIA_STAMP)
 
 $(BUILDDIR)/%.o: %.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
@@ -523,3 +541,45 @@ test-rtsp-response: directory build/tests/test_rtsp_response_failure
 
 .PHONY: test-rtsp-response
 test: test-rtsp-response
+
+RAOP_MEDIA_TEST = build/tests/test_raop_media_write
+RAOP_MEDIA_TEST_OBJECTS = $(filter-out $(BUILDDIR)/raop_client.o,$(CLIENT_TEST_OBJECTS))
+
+build/tests/test_raop_media_write.o: tests/test_raop_media_write.c $(RAOP_CLIENT_PATCHED) Makefile
+	@mkdir -p build/tests
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -std=gnu11 $< -c -o $@
+
+$(RAOP_MEDIA_TEST): build/tests/test_raop_media_write.o build/tests/cross_ssl.o \
+		$(RAOP_MEDIA_TEST_OBJECTS) $(LIBCODECS_PATCHED) Makefile
+	$(CXX) build/tests/test_raop_media_write.o build/tests/cross_ssl.o \
+		$(RAOP_MEDIA_TEST_OBJECTS) $(filter-out $(OPENSSL)/libopenssl.a,$(LIBRARY)) \
+		$(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
+
+test-raop-media: directory $(RAOP_MEDIA_TEST)
+	$(RAOP_MEDIA_TEST)
+
+# This matched behavioral control retains the new API so the old behavior
+# fails at the successful-callback assertion, NOT at compilation/link/import.
+build/tests/raop_media_no_notification.c: $(RAOP_CLIENT_PATCHED) tests/raop_media_no_notification.patch
+	@mkdir -p build/tests
+	patch -s -o $@ $(RAOP_CLIENT_PATCHED) tests/raop_media_no_notification.patch
+
+build/tests/raop_media_no_notification.o: tests/test_raop_media_write.c build/tests/raop_media_no_notification.c Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -std=gnu11 \
+		-DRAOP_MEDIA_SOURCE='"../build/tests/raop_media_no_notification.c"' $< -c -o $@
+
+build/tests/test_raop_media_no_notification: build/tests/raop_media_no_notification.o \
+		build/tests/cross_ssl.o $(RAOP_MEDIA_TEST_OBJECTS) $(LIBCODECS_PATCHED) Makefile
+	$(CXX) build/tests/raop_media_no_notification.o build/tests/cross_ssl.o \
+		$(RAOP_MEDIA_TEST_OBJECTS) $(filter-out $(OPENSSL)/libopenssl.a,$(LIBRARY)) \
+		$(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
+
+test-raop-media-red: directory build/tests/test_raop_media_no_notification
+	@set +e; build/tests/test_raop_media_no_notification > build/tests/raop-media-red.log 2>&1; \
+		rc=$$?; set -e; test $$rc -eq 1; \
+		if grep -Eq 'Sanitizer|runtime error:' build/tests/raop-media-red.log; then exit 1; fi; \
+		grep -Eq '^FAIL line [0-9]+: atomic_load\(&capture.calls\) == 1$$' build/tests/raop-media-red.log; \
+		printf 'Matched baseline behavior: intended successful-callback assertion failed (exit 1)\n'
+
+test: test-raop-media test-raop-media-red
+.PHONY: test-raop-media test-raop-media-red

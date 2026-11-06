@@ -251,6 +251,17 @@ static void test_lifecycle_invalidation(void)
     mr_note_command(&mr); /* buffered post-freeze START/FLUSH/... */
     CHECK(atomic_load(&mr.terminal_invalid));
 
+    /* mr_note_start: only a START entered while one is applied latches. */
+    mr_init(&mr, true);
+    mr_note_start(&mr);
+    CHECK(!atomic_load(&mr.terminal_invalid));
+    mr = active(MR_ROUTE_UDP);
+    mr_note_start(&mr);
+    CHECK(atomic_load(&mr.terminal_invalid));
+    mr_init(&mr, false);
+    mr_note_start(&mr);
+    CHECK(!atomic_load(&mr.terminal_invalid));
+
     mr = active(MR_ROUTE_UDP);
     mr_freeze_for_stop(&mr, 5);
     mr_applied(&mr, 2); /* a post-freeze START that succeeds */

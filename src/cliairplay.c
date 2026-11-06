@@ -868,8 +868,10 @@ static void handle_announce(const cli_config_t *cfg)
 
 static void handle_command(const char *key, const char *value, cli_config_t *cfg)
 {
-    if (g_mr.enabled && mr_is_transport_command(key, value))
+    if (g_mr.enabled && mr_is_transport_command(key, value)) {
         mr_note_command(&g_mr);
+        if (strcmp(value, "START") == 0) mr_note_start(&g_mr);
+    }
     if (strcmp(key, "TITLE") == 0) {
         metadata_set(&g_metadata.title, value);
     } else if (strcmp(key, "ARTIST") == 0) {

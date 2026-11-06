@@ -126,6 +126,12 @@ void mr_freeze_for_stop(media_receipt_t *mr, uint32_t current_generation);
  * DISCONNECT, ANNOUNCE): latches terminal_invalid when already frozen. */
 void mr_note_command(media_receipt_t *mr);
 
+/* Entry of every START attempt, BEFORE any transport side effect, on the
+ * command thread that also runs the applied observer: latches terminal_invalid
+ * when a START is already applied (ACTIVE), whether or not the attempt commits.
+ * The first START, failed or not, is unaffected. */
+void mr_note_start(media_receipt_t *mr);
+
 /* Latch terminal_invalid (idempotent, sticky). */
 void mr_latch_invalid(media_receipt_t *mr);
 
@@ -140,10 +146,11 @@ void mr_begin_teardown(media_receipt_t *mr, uint32_t current_generation);
 /* Producers' view of the applied epoch for tagging, 0 while waiting. */
 uint64_t mr_current_epoch(const media_receipt_t *mr);
 
-/* Format the closed record for the sealed state. `playback_ok` is false when the
- * run loops reported a playback failure, a failed command join/cleanup or an
- * ended session without a commanded STOP. Returns the length (no NUL counted)
- * or 0 on a formatting error/overflow. */
+/* Format the closed record for the sealed state. `playback_ok` reflects the
+ * run-loop result. Observed client cleanup failures and an ended session without
+ * a commanded STOP instead set the collector's terminal-invalid latch. A failed
+ * final command join prevents emission. Returns the length (no NUL counted) or
+ * 0 on a formatting error/overflow. */
 size_t mr_format(const media_receipt_t *mr, bool playback_ok, char *buf,
                  size_t buf_size);
 

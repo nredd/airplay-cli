@@ -219,15 +219,17 @@ Coverage and accounting (each path is a real call path, not a test-only hook):
   CLI resolved up front (`ap2_resolve_route` plus the buffered decision) is
   compared with it and a disagreement latches a fault (a buffered request that
   falls back to realtime UDP is such a disagreement, so that run is incomplete).
-- One lifecycle: WAIT -> ACTIVE (epoch 1) -> FROZEN. A second applied START, an
-  unknown origin or destination, a second destination, a port mismatch, a
+- One lifecycle: WAIT -> ACTIVE (epoch 1) -> FROZEN. A second START attempt while
+  one is applied (checked at command entry, so a failed commit or early return
+  counts), an unknown origin or destination, a second destination, a port mismatch, a
   registration change (`*_media_registration_generation`, bumped by every hook
   set) or counter saturation sets a sticky fault. After the freeze a sticky
   terminal-invalid latches on any START (successful or failed, even one already
   buffered behind STOP), FLUSH/STANDBY/PAUSE/PLAY/DISCONNECT/ANNOUNCE, a second
-  STOP, a missing client, a changed registration, a failed playback
-  loop, a session ended without STOP or a failed client destroy/disconnect
-  observed by `finish_run`. The owner's one explicit unregister after the
+  STOP, a missing client, a changed registration, a session ended without STOP
+  or a failed client destroy/disconnect observed by `finish_run`. A failed
+  playback loop instead supplies `playback_ok=false`, producing an abnormal,
+  faulted record without setting that latch. The owner's one explicit unregister after the
   command thread joins is normal and only in that teardown phase.
 - The nested RAOP hook reports every non-backlog send as fresh and cannot label
   idle silence. Silence needs a hot splice line, which only the native flow has,

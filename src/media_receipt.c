@@ -167,6 +167,16 @@ void mr_note_command(media_receipt_t *mr)
     if (mr_state(mr) == MR_FROZEN) atomic_store(&mr->terminal_invalid, true);
 }
 
+void mr_note_start(media_receipt_t *mr)
+{
+    if (!mr->enabled) return;
+    /* Entry of any START while a START is already applied (ACTIVE): the
+     * one-start profile is broken whatever the attempt does next. A failed
+     * commit or an early ENDED return never reaches mr_applied, yet the
+     * transport may already have quiesced, re-anchored and flushed. */
+    if (mr_state(mr) == MR_ACTIVE) atomic_store(&mr->terminal_invalid, true);
+}
+
 void mr_latch_invalid(media_receipt_t *mr)
 {
     if (!mr->enabled) return;

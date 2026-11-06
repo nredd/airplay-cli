@@ -412,6 +412,59 @@ static void test_commit_failure_never_activates(void)
     say("cli receipt: failed START never activates, second START latches incomplete");
 }
 
+/* Fault flag of the record the collector would format right now. */
+static bool receipt_fault_now(void)
+{
+    char line[MEDIA_RECEIPT_MAX_LINE];
+    CHECK(mr_format(&g_mr, true, line, sizeof(line)) > 0);
+    bool fault = strstr(line, "\"fault\":true") != NULL;
+    CHECK(fault || strstr(line, "\"fault\":false"));
+    return fault;
+}
+
+/* Every second START attempt while ACTIVE is a fault, even one whose commit
+ * fails or that returns early (no applied callback, so the applied observer
+ * never sees it) while its transport side effects already ran. */
+static void test_second_start_invalidates(void)
+{
+    /* START ok, second START whose commit FAILS, then STOP. */
+    begin_session(true);
+    handle_command("ACTION", "START", &cfg);
+    CHECK(atomic_load(&g_mr.state) == MR_ACTIVE);
+    sender_content(1, AP2_MEDIA_FRESH);
+    next_commit = AP2_COMMIT_FAILED;
+    handle_command("ACTION", "START", &cfg);
+    CHECK(g_mr.applied_count == 1); /* the applied observer never ran */
+    CHECK(atomic_load(&g_mr.terminal_invalid));
+    handle_command("ACTION", "STOP", &cfg);
+    CHECK(receipt_fault_now());
+    end_session();
+
+    /* Early ENDED return of the second START: still faulted. */
+    begin_session(true);
+    handle_command("ACTION", "START", &cfg);
+    unsigned commits = start_calls + resume_calls;
+    ap2_session_end(g_session);
+    handle_command("ACTION", "START", &cfg);
+    CHECK(start_calls + resume_calls == commits); /* returned before commit */
+    handle_command("ACTION", "STOP", &cfg);
+    CHECK(receipt_fault_now());
+    end_session();
+
+    /* Controls: the first START, failed or not, stays clean. */
+    begin_session(true);
+    next_commit = AP2_COMMIT_FAILED;
+    handle_command("ACTION", "START", &cfg);
+    CHECK(!atomic_load(&g_mr.terminal_invalid));
+    next_commit = AP2_COMMIT_OK;
+    handle_command("ACTION", "START", &cfg);
+    sender_content(2, AP2_MEDIA_FRESH);
+    handle_command("ACTION", "STOP", &cfg);
+    CHECK(!atomic_load(&g_mr.terminal_invalid) && !receipt_fault_now());
+    end_session();
+    say("cli receipt: a second START (failed commit or early ended) faults, the first never");
+}
+
 static void test_registration_changes(void)
 {
     begin_session(true);
@@ -987,6 +1040,7 @@ int main(void)
     test_install_routes();
     test_stop_freezes_before_transport();
     test_commit_failure_never_activates();
+    test_second_start_invalidates();
     test_registration_changes();
     test_silence_origin();
     test_chunk_origin();

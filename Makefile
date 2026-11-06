@@ -66,6 +66,7 @@ EVENT_TEST    = build/tests/test_ap2_event
 CLIENT_TEST   = build/tests/test_ap2_client
 SESSION_TEST  = build/tests/test_ap2_session
 PTP_TEST      = build/tests/test_ap2_ptp
+PTP_POLICY_TEST = build/tests/test_ap2_ptp_policy
 TEST_CFLAGS   = -Wall -Wextra -Werror -O2 $(CPPFLAGS) $(EXTRA_CFLAGS)
 
 # Compiler flags
@@ -294,7 +295,7 @@ no_sanitizer_report = case "$(1)" in *Sanitizer*|*"runtime error:"*) \
 	printf '%s\n' "$(1)" >&2; false;; esac
 
 test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT_TEST) \
-		$(SESSION_TEST) $(PTP_TEST) $(TEST_EXECUTABLE) $(RAOP_LIFECYCLE_TEST_EXECUTABLE) \
+		$(SESSION_TEST) $(PTP_TEST) $(PTP_POLICY_TEST) $(TEST_EXECUTABLE) $(RAOP_LIFECYCLE_TEST_EXECUTABLE) \
 		$(RAOP_SESSION_TEST) $(ANNOUNCE_TEST) $(RAOP_EARLY_FAILURE_TEST) $(ATTESTATION_TEST)
 	$(TIMELINE_TEST)
 	$(EVENT_TEST)
@@ -302,6 +303,7 @@ test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT
 	$(CLIENT_TEST)
 	$(SESSION_TEST)
 	$(PTP_TEST)
+	$(PTP_POLICY_TEST)
 	$(TEST_EXECUTABLE)
 	$(RAOP_LIFECYCLE_TEST_EXECUTABLE)
 	$(RAOP_SESSION_TEST)
@@ -386,6 +388,15 @@ $(PTP_TEST): tests/test_ap2_ptp.c src/ap2_ptp.c src/ap2_ptp.h src/ap2_ptp_shm.c 
 	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_ap2_ptp.c \
 		build/tests/ap2_ptp_test.o src/ap2_ptp_shm.c src/host_clock.c $(CROSS_LOG_PATCHED) \
 		$(LDFLAGS) -o $@
+
+# Include the real receive/daemon implementation behind inert I/O boundaries.
+# Use the same patched production logger as the binary and other PTP tests.
+$(PTP_POLICY_TEST): tests/test_ap2_ptp_policy.c src/ap2_ptp.c src/ap2_ptp.h \
+		src/ap2_ptp_shm.c src/ap2_ptp_shm.h src/host_clock.c src/host_clock.h \
+		$(CROSS_LOG_PATCHED) Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_ap2_ptp_policy.c \
+		src/ap2_ptp_shm.c src/host_clock.c $(CROSS_LOG_PATCHED) $(LDFLAGS) -o $@
 
 $(TIMELINE_TEST): tests/test_ap2_timeline.c src/ap2_timeline.h Makefile
 	@mkdir -p $(dir $@)

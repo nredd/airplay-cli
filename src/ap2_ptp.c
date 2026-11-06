@@ -198,6 +198,10 @@ struct ap2_ptp_ctx {
      * the session clock as unicast PTP and never join an open multicast election. */
     char *peers[PTP_MAX_PEERS];
     int npeers;
+    /* Private trial gate: only addresses in `peers` may affect this engine.
+     * Off by default because ordinary PTP/BMCA deployments can legitimately
+     * hear a shared grandmaster outside their unicast receiver list. */
+    bool strict_peers;
 
     /* ---- BMCA / slave state (guarded by lock) ---- */
     pthread_mutex_t lock;
@@ -1045,6 +1049,24 @@ static void ptp_handle_follow_up(struct ap2_ptp_ctx *ctx, const uint8_t *buf, in
               " -> off=%" PRId64 "ns", seq, t1, t2, corr_sync + corr_fup, offset);
 }
 
+/* `peers` is protected by `lock`, so a packet admitted here is linearized
+ * before a concurrent SETPEERS retirement. The receive path never retains a
+ * peer string or address after this check. */
+static bool ptp_peer_is_registered(struct ap2_ptp_ctx *ctx, struct in_addr addr)
+{
+    bool registered = false;
+    pthread_mutex_lock(&ctx->lock);
+    for (int i = 0; i < ctx->npeers; i++) {
+        struct in_addr peer;
+        if (inet_pton(AF_INET, ctx->peers[i], &peer) == 1 && peer.s_addr == addr.s_addr) {
+            registered = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&ctx->lock);
+    return registered;
+}
+
 /* Record one Delay_Req/Pdelay_Req probe from `addr` into its exchange-streak
  * slot: extends the streak if the gap since the last probe is within
  * PTP_EXCHANGE_GAP_NS, otherwise starts a fresh one. Tracked in any BMCA role,
@@ -1165,6 +1187,12 @@ static void *ptp_thread_func(void *arg)
             for (int k = 0; k < 8; k++) src_clock = (src_clock << 8) | buf[20 + k];
             if (src_clock == ctx->clock_id) continue;
 
+            /* This private trial gate applies to every input effect: responses,
+             * exchange accounting, BMCA, followed-clock state and unicast
+             * grants. Its membership check is serialized with SETPEERS, so an
+             * address retired before admission cannot act on the engine. */
+            if (ctx->strict_peers && !ptp_peer_is_registered(ctx, src.sin_addr)) continue;
+
             switch (msg_type) {
             case PTP_MSG_DELAY_REQ:
                 ptp_track_exchange(ctx, src.sin_addr, rx);
@@ -1226,7 +1254,14 @@ struct ap2_ptp_ctx *ap2_ptp_create(void)
      * before the engine ever runs. */
     ctx->is_grandmaster = true;
     ctx->hold_master = true;
+    const char *strict_peers = getenv("CLIAIRPLAY_PTP_STRICT_PEERS");
+    ctx->strict_peers = strict_peers && strcmp(strict_peers, "1") == 0;
     return ctx;
+}
+
+bool ap2_ptp_strict_peers(const struct ap2_ptp_ctx *ctx)
+{
+    return ctx && ctx->strict_peers;
 }
 
 void ap2_ptp_destroy(struct ap2_ptp_ctx *ctx)
@@ -1879,8 +1914,9 @@ int ap2_ptp_run_daemon(struct in_addr bind_addr, uint64_t clock_id,
 
     uint64_t start_ns = ap2_ptp_now_ns(ctx);
     struct ptp_peerset ps = {0};
-    LOG_INFO("[PTP] daemon up: engine on 319/320, clock in %s, control on %s:%d",
-             AP2_PTP_SHM_NAME, AP2_PTP_CTRL_ADDR, AP2_PTP_CTRL_PORT);
+    LOG_INFO("[PTP] daemon up: engine on 319/320, clock in %s, control on %s:%d, strict-peers=%s",
+             AP2_PTP_SHM_NAME, AP2_PTP_CTRL_ADDR, AP2_PTP_CTRL_PORT,
+             ap2_ptp_strict_peers(ctx) ? "on" : "off");
 
     /* Publish immediately so an early-attaching stream sees a live sample. */
     struct ap2_ptp_shm_sample sample;

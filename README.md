@@ -242,6 +242,7 @@ cliairplay [options] --cmdpipe <path> <host_ip>
 | `--buffered` | Force the buffered stream (type 103, RTP over TCP + PTP anchor) on a native PTP route. Default: auto by the SupportsBufferedAudio feature bit (in-code deny-list for measured-hostile models). `CLIAIRPLAY_BUFFERED=0\|1` outranks both — kill switch / fleet A/B lever. |
 | `--ptp-shared` | Prefer the shared PTP daemon clock (multi-room): attach the daemon's shm instead of running an engine; fall back to the in-process engine when no daemon is live. Picks the clock *source*, not the timing mode — pair it with `--ptp` or a `--txt` advertising SupportsPTP. |
 | `CLIAIRPLAY_PTP_FOLLOW=0\|1` (env) | Override for following a receiver's **own** PTP clock instead of serving it ours. Default: auto — a standalone HomePod on HomePod OS 27+ (`model=AudioAccessory*`, `igl=1`, no `pgid`, no `tsid`, `osvers`>=27) is followed, because it keeps announcing its own grandmaster for the whole session and never renders audio anchored to the sender's timeline; every other receiver is served our grandmaster as before. `0` never follows (kill switch), `1` follows every receiver. Per receiver: the engine (or the `--ptp-daemon`) stays grandmaster for the other peers, so mixed multi-room keeps working. |
+| `CLIAIRPLAY_PTP_STRICT_PEERS=1` (private trial env) | On context creation, admit PTP receive-side effects only from the current registered timing peers: Delay/Pdelay replies, exchange accounting, BMCA, followed-clock dispatch and unicast grants. Exact `1` enables it; unset or every other value preserves ordinary PTP behavior. `SETPEERS` and daemon registration updates are serialized with admission, so a peer retired before admission cannot act. The `--ptp-daemon` ready line attests the effective value as `strict-peers=on` or `strict-peers=off` so a supervisor can verify the gate is live rather than trust the environment it passed. This filters source IPv4 addresses, not cryptographic identities, and does not prevent IP spoofing or isolate discovery or other lifecycle traffic. Admission is not draining: a previously admitted packet may finish after removal returns. Keep it off outside the private trial. See `DESIGN.md` for boundaries and offline regression coverage. |
 
 ### Utility / daemon modes
 
@@ -425,6 +426,12 @@ The same suite runs under ASan/UBSan on Linux with
 `make test STATIC=1 CC=gcc CXX=g++ SANITIZE=address,undefined` after `make clean`.
 
 ## Platforms and CI
+
+Both macOS targets use the supported `macos-15` ARM64 hosted runner, listed
+[here](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+ARM64 runs the full native test suite and `--check`; x86_64 is cross-compiled
+with `-arch x86_64` and architecture-checked. This replaces the retired
+`macos-14` host without changing target architectures or validation coverage.
 
 CI (`.github/workflows/build.yml`) cross-builds four targets on every push —
 `linux-x86_64`, `linux-aarch64`, `macos-arm64`, `macos-x86_64` — validates

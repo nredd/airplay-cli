@@ -5,13 +5,15 @@
  * and native AirPlay 2 routes with a real command FIFO, a real stdin PCM pipe
  * and a real stdout pipe/FIFO. The peer is an owned loopback fixture: a
  * scripted RTSP listener (RAOP-shaped, or the synthetic native receiver in
- * native_ap2_peer.c) whose SETUP names an owned UDP audio socket. Nothing leaves the loopback interface and no real
- * receiver, pairing or credential is involved. The code path under test is the
- * production main()/run_raop()/run_airplay2()/command thread/finish_run()/
- * mr_emit(), not a
- * compiled-in copy of it.
+ * native_ap2_peer.c) whose SETUP names an owned UDP audio socket. Nothing
+ * leaves the loopback interface and no real receiver, pairing or credential is
+ * involved. The code path under test is the production main()/run_raop()/
+ * run_airplay2()/command thread/finish_run()/mr_emit(), not a compiled-in copy
+ * of it.
  *
  * Usage: test_cli_real_receipt <cliairplay-binary> [case|all] [route]
+ *        test_cli_real_receipt <cliairplay-binary> early-full-stdout-blocks
+ *        (manual experiment, not in the default run)
  *        (routes: raop, compat, native; no case/route runs everything)
  */
 #include <arpa/inet.h>

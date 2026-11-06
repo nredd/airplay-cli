@@ -225,7 +225,7 @@ Coverage and accounting (each path is a real call path, not a test-only hook):
   set) or counter saturation sets a sticky fault. After the freeze a sticky
   terminal-invalid latches on any START (successful or failed, even one already
   buffered behind STOP), FLUSH/STANDBY/PAUSE/PLAY/DISCONNECT/ANNOUNCE, a second
-  STOP, a missing client, a changed registration, a signal, a failed playback
+  STOP, a missing client, a changed registration, a failed playback
   loop, a session ended without STOP or a failed client destroy/disconnect
   observed by `finish_run`. The owner's one explicit unregister after the
   command thread joins is normal and only in that teardown phase.
@@ -281,7 +281,8 @@ post-freeze invalidation, signal or failure is merged into `fault`. The endpoint
 is private: keep it out of logs, public text and fixtures (tests use
 documentation addresses only).
 
-Tests use production code paths with owned loopback sockets, no receiver:
+Tests use production code paths with owned loopback sockets and synthetic
+receivers; nothing external is contacted:
 
 - `make test-raop-media test-raop-media-red STATIC=1`: the patched libraop
   outcome matrix (fresh/backlog, negative/short/EINTR send, nonready, select

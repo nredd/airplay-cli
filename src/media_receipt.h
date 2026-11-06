@@ -18,7 +18,8 @@
  * under the send lock, BEFORE the transport is stopped). No reactivation. The
  * measured interval closes at the freeze; eligibility is separate: a sticky
  * terminal_invalid latches on any later START/command/registration change/
- * signal/failure until the final record is sealed.
+ * failure until the final record is sealed; a signal is recorded separately and
+ * merged into the record's `fault` when it is formatted.
  *
  * Threading contract (no locks and no I/O inside this module's event entry
  * points; they are safe to call from the transport callbacks):

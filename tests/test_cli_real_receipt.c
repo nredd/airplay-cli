@@ -1,15 +1,18 @@
 /*
  * Real-binary integration test for --private-media-receipt.
  *
- * Spawns the actual cliairplay executable (legacy RAOP route) with a real
- * command FIFO, a real stdin PCM pipe and a real stdout pipe/FIFO. The peer is
- * an owned loopback fixture: a scripted RTSP listener whose SETUP names an
- * owned UDP audio socket. Nothing leaves the loopback interface and no real
+ * Spawns the actual cliairplay executable on the legacy RAOP, AirPlay 2 compat
+ * and native AirPlay 2 routes with a real command FIFO, a real stdin PCM pipe
+ * and a real stdout pipe/FIFO. The peer is an owned loopback fixture: a
+ * scripted RTSP listener (RAOP-shaped, or the synthetic native receiver in
+ * native_ap2_peer.c) whose SETUP names an owned UDP audio socket. Nothing leaves the loopback interface and no real
  * receiver, pairing or credential is involved. The code path under test is the
- * production main()/run_raop()/command thread/finish_run()/mr_emit(), not a
+ * production main()/run_raop()/run_airplay2()/command thread/finish_run()/
+ * mr_emit(), not a
  * compiled-in copy of it.
  *
- * Usage: test_cli_real_receipt <cliairplay-binary> [case]
+ * Usage: test_cli_real_receipt <cliairplay-binary> [case|all] [route]
+ *        (routes: raop, compat, native; no case/route runs everything)
  */
 #include <arpa/inet.h>
 #include <errno.h>
@@ -56,8 +59,20 @@ typedef struct {
 } peer_t;
 
 static peer_t *live_peer;
-/* Native AirPlay 2 wire route (HAP transient pairing) instead of RAOP-shaped. */
-static bool g_native;
+/* The wire route the next child and peer use; set by main() per route. */
+typedef struct {
+    const char *name, *protocol, *record_route, *route_line;
+    bool native;    /* HAP transient pairing, served by native_ap2_peer.c */
+} route_t;
+
+static const route_t routes[] = {
+    { "raop", "raop", "raop", "[STATUS] route protocol=raop flow=legacy", false },
+    { "compat", "airplay2-compat", "compat",
+      "[STATUS] route protocol=airplay2 flow=raop-compat", false },
+    { "native", "airplay2", "udp", "[STATUS] route protocol=airplay2 flow=native",
+      true },
+};
+static const route_t *g_route = &routes[0];
 
 static unsigned peer_units(const peer_t *p)
 {
@@ -136,7 +151,6 @@ static void reply(peer_t *peer, int fd, int cseq)
                      "timing_port=%u\r\n\r\n", cseq, peer->audio_port,
                      peer->ctrl_port, peer->time_port);
 
-    (void)peer;
     (void)!write(fd, buf, (size_t)n);
 }
 
@@ -190,7 +204,7 @@ static bool peer_start(peer_t *peer)
 
     memset(peer, 0, sizeof(*peer));
     live_peer = peer;
-    if (g_native) {
+    if (g_route->native) {
         peer->native = true;
         return native_peer_start(&peer->np);
     }
@@ -249,10 +263,6 @@ typedef struct {
 /* The live fixtures of the running case, so main() can reap them even when a
  * CHECK returned early. Cases keep them in static storage for that reason. */
 static child_t *live_child;
-/* Wire route of the next child: raop (legacy), airplay2-compat, ... */
-static const char *g_protocol = "raop";
-static const char *g_record_route = "raop";
-static const char *g_route_line = "[STATUS] route protocol=raop flow=legacy";
 
 static bool set_flag(int fd, int flag)
 {
@@ -343,12 +353,12 @@ static bool child_start(child_t *c, const char *binary, uint16_t port,
     int n = 0;
     args[n++] = (char *)binary;
     args[n++] = "--protocol";
-    args[n++] = (char *)g_protocol;
+    args[n++] = (char *)g_route->protocol;
     args[n++] = "--port";
     args[n++] = port_text;
     args[n++] = "--cmdpipe";
     args[n++] = c->cmd_path;
-    if (g_native) {
+    if (g_route->native) {
         args[n++] = "--ap2-native";
         args[n++] = "--timing";
         args[n++] = "ntp";
@@ -450,8 +460,6 @@ static void start_feeder(child_t *c)
     atomic_store(&c->feeder_run, true);
     c->feeder_started = pthread_create(&c->feeder, NULL, feed_main, c) == 0;
 }
-
-static ssize_t read_err(const child_t *c, char *buf, size_t size);
 
 static void dump_err(const child_t *c)
 {
@@ -634,7 +642,7 @@ static bool case_positive(const char *binary)
     CHECK(wait_receiver_settled(&peer, r.fresh_units));
     CHECK(r.records == 1 && r.last_is_final);
     CHECK(r.stop && !r.fault && !r.overflow);
-    CHECK(!strcmp(r.route, g_record_route) && r.epoch == 1);
+    CHECK(!strcmp(r.route, g_route->record_route) && r.epoch == 1);
     CHECK(!strcmp(r.addr, "\"127.0.0.1\""));
     CHECK(r.port == peer_audio_port(&peer) && r.setup_port == peer_audio_port(&peer));
     CHECK(r.fresh_units >= 20 && r.idle_units == 0 && r.backlog_units == 0);
@@ -645,7 +653,9 @@ static bool case_positive(const char *binary)
     CHECK(r.fresh_units == peer_units(&peer));
     CHECK(r.fresh_bytes == peer_bytes(&peer));
     CHECK(peer_teardowns(&peer) >= 1);
-    CHECK(strstr(c.out, g_route_line) != NULL);
+    /* Native: the HAP transient pair-setup really completed, exactly once. */
+    CHECK(!g_route->native || atomic_load(&peer.np.pairings) == 1);
+    CHECK(strstr(c.out, g_route->route_line) != NULL);
     fprintf(stderr, "ok: real CLI START/PCM/STOP -> one @MEDIA1 (%u units, %u bytes) "
             "== receiver\n", r.fresh_units, r.fresh_bytes);
     child_cleanup(&c);
@@ -873,7 +883,7 @@ static bool case_native_splice_pad(const char *binary)
     record_t r;
     int status;
 
-    CHECK(g_native);
+    CHECK(g_route->native);
     CHECK(peer_start(&peer));
     CHECK(child_start(&c, binary, peer_rtsp(&peer), true, false, false));
     CHECK(begin_playback(&c, &peer, 20));
@@ -902,19 +912,6 @@ static bool case_native_splice_pad(const char *binary)
 
 typedef bool (*case_fn)(const char *);
 
-typedef struct {
-    const char *name, *protocol, *record_route, *route_line;
-    bool native;
-} route_t;
-
-static const route_t routes[] = {
-    { "raop", "raop", "raop", "[STATUS] route protocol=raop flow=legacy", false },
-    { "compat", "airplay2-compat", "compat",
-      "[STATUS] route protocol=airplay2 flow=raop-compat", false },
-    { "native", "airplay2", "udp", "[STATUS] route protocol=airplay2 flow=native",
-      true },
-};
-
 /* usage: driver <binary> [case] [route]; no case/route runs every one. */
 int main(int argc, char **argv)
 {
@@ -941,16 +938,13 @@ int main(int argc, char **argv)
     for (size_t r = 0; r < sizeof(routes) / sizeof(routes[0]); r++) {
         if (argc == 4 && strcmp(argv[3], routes[r].name) != 0)
             continue;
-        g_protocol = routes[r].protocol;
-        g_record_route = routes[r].record_route;
-        g_route_line = routes[r].route_line;
-        g_native = routes[r].native;
+        g_route = &routes[r];
         fprintf(stderr, "== route %s ==\n", routes[r].name);
         for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
             if (argc >= 3 && strcmp(argv[2], "all") != 0 &&
                 strcmp(argv[2], cases[i].name) != 0)
                 continue;
-            if (cases[i].native_only && !g_native)
+            if (cases[i].native_only && !g_route->native)
                 continue;
             bool ok = cases[i].fn(argv[1]);
 

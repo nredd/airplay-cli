@@ -200,9 +200,11 @@ Coverage and accounting (each path is a real call path, not a test-only hook):
   `IDLE` origin; `BACKLOG` and `IDLE` units are counted separately, never fresh.
   The realtime loop labels a chunk `FRESH` only when it holds no splice pad
   silence and at least one real input byte (`ap2_chunk_origin`): a chunk that is
-  all pad (the pad is at least one chunk) or pad followed by content is `IDLE`,
-  so a fresh unit always means wholly-PCM wire content and a receipt is never
-  `fresh` on silence alone. Only the label changes, never the pacing or data.
+  all pad (the pad is at least one chunk) or pad followed by content is `IDLE`.
+  A fresh unit therefore always carries real PCM and no splice pad, so a receipt
+  is never `fresh` on pad silence alone. It does not mean every byte is PCM: the
+  final short chunk at input EOF is still `FRESH` although its tail is
+  zero-filled to a full chunk. Only the label changes, never pacing or data.
 - Actual buffered TCP is explicitly **unsupported**: nothing is registered, the
   record reports `route=buffered` and `fault=true`, transport behavior is
   unchanged. A parked frame is never counted (`audio_packets_sent` advances at
@@ -682,7 +684,8 @@ against connect and disconnect: the run flags and the keepalive stamp are
 atomic, `_raopcl_send_sync` reads the state under the mutex, and the timing
 thread learns the receiver's timing port from its first request instead of
 racing the SETUP analysis on it (it always started with the port cleared, so
-this is the one path that already ran). `patches/libraop-rtsp-setup-cleanup.patch`, frees the SETUP request's Transport
+this is the one path that already ran). A separate build-local patch,
+`patches/libraop-rtsp-setup-cleanup.patch`, frees the SETUP request's Transport
 header on failure; the SETUP 500 sanitizer regression exposed that leak.
 `patches/libraop-logtime-bounds.patch` bounds timestamp formatting with
 `snprintf`, including the Windows path. Production and tests compile the same

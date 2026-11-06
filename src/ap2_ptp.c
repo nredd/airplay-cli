@@ -272,13 +272,14 @@ static void *timing_thread_func(void *arg)
     struct sockaddr_in addr;
     socklen_t addr_len;
 
-    /* Set before this thread started; ap2_ptp_stop() resets the context's copy
-     * to -1 while this thread may still be unwinding, so never re-read it. */
-    const int sock = ctx->timing_sock;
     struct timeval tv = {.tv_sec = 1};
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(ctx->timing_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     while (ctx->running) {
+        /* ap2_ptp_stop() closes the socket and stores -1 before it joins: read
+         * the (atomic) value once per pass so a closed socket ends the loop. */
+        const int sock = ctx->timing_sock;
+        if (sock < 0) break;
         addr_len = sizeof(addr);
         int n = recvfrom(sock, buf, sizeof(buf), 0,
                          (struct sockaddr *)&addr, &addr_len);

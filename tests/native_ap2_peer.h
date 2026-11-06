@@ -25,7 +25,7 @@ typedef struct {
     atomic_uint audio_units;
     atomic_ulong audio_bytes;
     pthread_t rtsp_thread, audio_thread;
-    bool started;
+    bool rtsp_started, audio_started;   /* threads that need a join */
 } native_peer_t;
 
 /* Bind the owned loopback sockets and start the serving threads. */

@@ -469,7 +469,10 @@ static void serve(native_peer_t *peer, int fd)
 
     memset(&c, 0, sizeof(c));
     c.fd = fd;
-    if (!srp_init(&srp, "3939")) return;
+    if (!srp_init(&srp, "3939")) {
+        srp_free(&srp);
+        return;
+    }
     while (next_request(&c, &r)) {
         bool ok = true;
 
@@ -559,24 +562,21 @@ bool native_peer_start(native_peer_t *peer)
         native_peer_stop(peer);
         return false;
     }
-    if (pthread_create(&peer->rtsp_thread, NULL, rtsp_main, peer) != 0 ||
-        pthread_create(&peer->audio_thread, NULL, audio_main, peer) != 0) {
-        atomic_store(&peer->stop, true);
-        native_peer_stop(peer);
+    peer->rtsp_started = pthread_create(&peer->rtsp_thread, NULL, rtsp_main, peer) == 0;
+    peer->audio_started = pthread_create(&peer->audio_thread, NULL, audio_main, peer) == 0;
+    if (!peer->rtsp_started || !peer->audio_started) {
+        native_peer_stop(peer);     /* joins whichever thread did start */
         return false;
     }
-    peer->started = true;
     return true;
 }
 
 void native_peer_stop(native_peer_t *peer)
 {
     atomic_store(&peer->stop, true);
-    if (peer->started) {
-        pthread_join(peer->rtsp_thread, NULL);
-        pthread_join(peer->audio_thread, NULL);
-        peer->started = false;
-    }
+    if (peer->rtsp_started) pthread_join(peer->rtsp_thread, NULL);
+    if (peer->audio_started) pthread_join(peer->audio_thread, NULL);
+    peer->rtsp_started = peer->audio_started = false;
     if (peer->rtsp_fd >= 0) close(peer->rtsp_fd);
     if (peer->audio_fd >= 0) close(peer->audio_fd);
     if (peer->ctrl_fd >= 0) close(peer->ctrl_fd);

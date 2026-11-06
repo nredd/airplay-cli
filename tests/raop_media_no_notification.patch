@@ -1,0 +1,9 @@
+--- a/raop_client.c
++++ b/raop_client.c
+@@ -660,6 +660,5 @@
+ 			/* Preserve legacy send/return behavior even after select errors,
+ 			 * but do not notify without positive socket readiness. */
+-			if (ready > 0 && p->media_write_cb)
+-				p->media_write_cb(p->media_write_ctx, origin, n, &addr);
++			(void) origin; /* Matched baseline behavior: no notification. */
+ 		}

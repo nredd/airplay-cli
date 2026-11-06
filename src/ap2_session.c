@@ -365,6 +365,8 @@ ap2_commit_result_t ap2_session_start(struct ap2_session_s *s,
     }
     s->epoch++;
     s->state = AP2_SESSION_PLAYING;
+    /* Scalar-only observer, see ap2_session_ops_t::applied for its contract. */
+    if (s->ops.applied) s->ops.applied(s->ops.transport, s->epoch);
     /* The caller is driving the session, so the orphan window re-opens from
      * here. It only bites after the input closed, where PLAYING alone no
      * longer holds the timeout off. */

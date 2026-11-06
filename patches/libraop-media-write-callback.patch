@@ -1,17 +1,23 @@
 diff --git a/src/raop_client.c b/src/raop_client.c
-index 00acfad..3da37cb 100644
+index 00acfad..18c39a9 100644
 --- a/src/raop_client.c
 +++ b/src/raop_client.c
-@@ -165,6 +165,8 @@ typedef struct raopcl_s {
+@@ -165,6 +165,14 @@ typedef struct raopcl_s {
  	// set only once pthread_create succeeded, so terminate never joins a zeroed pthread_t
  	bool time_started, ctrl_started;
  	pthread_mutex_t mutex;
 +	raop_media_write_cb media_write_cb;
 +	void *media_write_ctx;
++	raop_media_outcome_cb media_outcome_cb;
++	void *media_outcome_ctx;
++	// bumped by every media hook set, even an identical one
++	uint32_t media_reg_gen;
++	// SETUP server_port parsed separately and strictly, 0 when absent/invalid
++	uint16_t media_setup_port;
  	bool time_running, ctrl_running;
  	int sample_rate, sample_size, channels;
  	raop_codec_t codec;
-@@ -186,7 +188,7 @@ static void 	*_rtp_timing_thread(void *args);
+@@ -186,7 +194,7 @@ static void 	*_rtp_timing_thread(void *args);
  static void 	*_rtp_control_thread(void *args);
  static void 	_raopcl_terminate_rtp(struct raopcl_s *p);
  static void 	_raopcl_send_sync(struct raopcl_s *p, bool first);
@@ -20,7 +26,7 @@ index 00acfad..3da37cb 100644
  static bool 	_raopcl_disconnect(struct raopcl_s *p, bool force);
  
  /*----------------------------------------------------------------------------*/
-@@ -476,7 +478,7 @@ bool raopcl_accept_frames(struct raopcl_s *p)
+@@ -476,7 +484,7 @@ bool raopcl_accept_frames(struct raopcl_s *p)
  
  				p->head_ts += p->chunk_len;
  
@@ -29,7 +35,7 @@ index 00acfad..3da37cb 100644
  			}
  
  			LOG_DEBUG("[%p]: finished resend %u", p, i);
-@@ -584,7 +586,7 @@ bool raopcl_send_chunk(struct raopcl_s *p, uint8_t *sample, int frames, uint64_t
+@@ -584,7 +592,7 @@ bool raopcl_send_chunk(struct raopcl_s *p, uint8_t *sample, int frames, uint64_t
  
  	p->head_ts += p->chunk_len;
  
@@ -38,25 +44,51 @@ index 00acfad..3da37cb 100644
  
  	pthread_mutex_unlock(&p->mutex);
  
-@@ -602,12 +604,15 @@ bool raopcl_send_chunk(struct raopcl_s *p, uint8_t *sample, int frames, uint64_t
+@@ -602,13 +610,28 @@ bool raopcl_send_chunk(struct raopcl_s *p, uint8_t *sample, int frames, uint64_t
  }
  
  /*----------------------------------------------------------------------------*/
 -bool _raopcl_send_audio(struct raopcl_s *p, rtp_audio_pkt_t *packet, int size)
-+/* Both callers hold p->mutex through the synchronous callback. */
++/* Exactly one outcome per audio attempt, still under p->mutex. */
++static void _raopcl_media_outcome(struct raopcl_s *p, raop_media_outcome_t outcome,
++								  raop_media_origin_t origin, size_t bytes,
++								  const struct sockaddr_in *destination)
++{
++	if (p->media_outcome_cb)
++		p->media_outcome_cb(p->media_outcome_ctx, outcome, origin, bytes, destination,
++							p->media_setup_port);
++}
++
++/*----------------------------------------------------------------------------*/
++/* Both callers hold p->mutex through the synchronous callbacks. */
 +bool _raopcl_send_audio(struct raopcl_s *p, rtp_audio_pkt_t *packet, int size,
 +					   raop_media_origin_t origin)
  {
  	struct timeval timeout;
  	fd_set wfds;
 -	struct sockaddr_in addr;
+-	size_t n;
 +	struct sockaddr_in addr = {0};
- 	size_t n;
++	size_t n = 0;
 +	int ready;
  	bool ret = true;
++	raop_media_outcome_t outcome = RAOP_MEDIA_OUTCOME_SENT;
  
  	/*
-@@ -635,7 +640,8 @@ bool _raopcl_send_audio(struct raopcl_s *p, rtp_audio_pkt_t *packet, int size)
+ 	 Do not send if audio port closed or we are not yet in streaming state. We
+@@ -618,7 +641,10 @@ bool _raopcl_send_audio(struct raopcl_s *p, rtp_audio_pkt_t *packet, int size)
+ 	 uses raopcld_accept_frames() and tries to send frames even before the
+ 	 connect has returned in case of multi-threaded application
+ 	*/
+-	if (p->rtp_ports.audio.fd == -1 || p->state != RAOP_STREAMING) return false;
++	if (p->rtp_ports.audio.fd == -1 || p->state != RAOP_STREAMING) {
++		_raopcl_media_outcome(p, RAOP_MEDIA_OUTCOME_UNAVAILABLE, origin, 0, NULL);
++		return false;
++	}
+ 
+ 	addr.sin_family = AF_INET;
+ 	addr.sin_addr = p->peer_addr;
+@@ -635,7 +661,8 @@ bool _raopcl_send_audio(struct raopcl_s *p, rtp_audio_pkt_t *packet, int size)
  	timeout.tv_sec = 0;
  	timeout.tv_usec = (p->chunk_len * 1000000L) / (p->sample_rate * 2);
  
@@ -66,8 +98,11 @@ index 00acfad..3da37cb 100644
  		LOG_ERROR("[%p]: audio socket closed", p);
  		p->sane.audio.select++;
  	}
-@@ -648,7 +654,13 @@ bool _raopcl_send_audio(struct raopcl_s *p, rtp_audio_pkt_t *packet, int size)
+@@ -646,20 +673,92 @@ bool _raopcl_send_audio(struct raopcl_s *p, rtp_audio_pkt_t *packet, int size)
+ 		if (n != size) {
+ 			LOG_DEBUG("[%p]: error sending audio packet", p);
  			ret = false;
++			outcome = RAOP_MEDIA_OUTCOME_SEND_ERROR;
  			p->sane.audio.send++;
  		}
 -		else p->sane.audio.send = 0;
@@ -77,14 +112,33 @@ index 00acfad..3da37cb 100644
 +			 * but do not notify without positive socket readiness. */
 +			if (ready > 0 && p->media_write_cb)
 +				p->media_write_cb(p->media_write_ctx, origin, n, &addr);
++			if (ready <= 0) outcome = RAOP_MEDIA_OUTCOME_NOT_READY;
 +		}
  		p->sane.audio.avail = 0;
  	}
  	else {
-@@ -660,6 +672,17 @@ bool _raopcl_send_audio(struct raopcl_s *p, rtp_audio_pkt_t *packet, int size)
+ 		LOG_DEBUG("[%p]: audio socket unavailable", p);
+ 		ret = false;
++		outcome = RAOP_MEDIA_OUTCOME_NOT_READY;
+ 		p->sane.audio.avail++;
+ 	}
+ 
++	/* A select error is never a qualifying write, even if sendto succeeded. */
++	if (ready == -1) outcome = RAOP_MEDIA_OUTCOME_SELECT_ERROR;
++	_raopcl_media_outcome(p, outcome, origin,
++						  outcome == RAOP_MEDIA_OUTCOME_SENT ? n : 0,
++						  outcome == RAOP_MEDIA_OUTCOME_SENT ? &addr : NULL);
++
  	return ret;
  }
  
++/*----------------------------------------------------------------------------*/
++/* Every media hook set, even an identical one, changes the generation. */
++static void _raopcl_media_registration_bump(struct raopcl_s *p)
++{
++	if (++p->media_reg_gen == 0) p->media_reg_gen = 1;
++}
++
 +/*----------------------------------------------------------------------------*/
 +void raopcl_set_media_write_cb(struct raopcl_s *p, raop_media_write_cb callback, void *ctx)
 +{
@@ -93,17 +147,75 @@ index 00acfad..3da37cb 100644
 +	pthread_mutex_lock(&p->mutex);
 +	p->media_write_cb = callback;
 +	p->media_write_ctx = callback ? ctx : NULL;
++	_raopcl_media_registration_bump(p);
 +	pthread_mutex_unlock(&p->mutex);
++}
++
++/*----------------------------------------------------------------------------*/
++void raopcl_set_media_outcome_cb(struct raopcl_s *p, raop_media_outcome_cb callback, void *ctx)
++{
++	if (!p) return;
++
++	pthread_mutex_lock(&p->mutex);
++	p->media_outcome_cb = callback;
++	p->media_outcome_ctx = callback ? ctx : NULL;
++	_raopcl_media_registration_bump(p);
++	pthread_mutex_unlock(&p->mutex);
++}
++
++/*----------------------------------------------------------------------------*/
++uint32_t raopcl_media_registration_generation(struct raopcl_s *p)
++{
++	uint32_t generation;
++
++	if (!p) return 0;
++
++	pthread_mutex_lock(&p->mutex);
++	generation = p->media_reg_gen;
++	pthread_mutex_unlock(&p->mutex);
++	return generation;
++}
++
++/*----------------------------------------------------------------------------*/
++uint16_t raopcl_media_setup_port(struct raopcl_s *p)
++{
++	uint16_t port;
++
++	if (!p) return 0;
++
++	pthread_mutex_lock(&p->mutex);
++	port = p->media_setup_port;
++	pthread_mutex_unlock(&p->mutex);
++	return port;
 +}
 +
  /*----------------------------------------------------------------------------*/
  struct raopcl_s *raopcl_create(struct in_addr host, uint16_t port_base, uint16_t port_range,
  							   char *DACP_id, char *active_remote,
+@@ -941,11 +1040,17 @@ static bool raopcl_analyse_setup(struct raopcl_s *p, key_data_t *setup_kd)
+ 		rc = false;
+ 	}
+ 
++	p->media_setup_port = 0;
+ 	token = strtok(buf, delimiters);
+ 	while (token) {
+ 		if ((pc = strstr(token, "=")) != NULL) {
+ 			*pc = 0;
+-			if (!strcmp(token,"server_port")) p->rtp_ports.audio.rport=atoi(pc+1);
++			if (!strcmp(token,"server_port")) {
++				char *end = NULL;
++				long port = strtol(pc + 1, &end, 10);
++				p->media_setup_port = (end != pc + 1 && !*end && port > 0 && port <= 65535) ? (uint16_t) port : 0;
++				p->rtp_ports.audio.rport=atoi(pc+1);
++			}
+ 			if (!strcmp(token,"control_port")) p->rtp_ports.ctrl.rport=atoi(pc+1);
+ 			if (!strcmp(token,"timing_port")) p->rtp_ports.time.rport=atoi(pc+1);
+ 		}
 diff --git a/src/raop_client.h b/src/raop_client.h
-index 4be0ff8..95206b2 100644
+index 4be0ff8..4bdffd0 100644
 --- a/src/raop_client.h
 +++ b/src/raop_client.h
-@@ -84,6 +84,32 @@ typedef struct raopcl_t {uint32_t dummy;} raopcl_t;
+@@ -84,6 +84,66 @@ typedef struct raopcl_t {uint32_t dummy;} raopcl_t;
  
  struct raopcl_s;
  
@@ -132,15 +244,49 @@ index 4be0ff8..95206b2 100644
 + * A concurrent setter must also be joined before destroying the client.
 + */
 +void raopcl_set_media_write_cb(struct raopcl_s *p, raop_media_write_cb callback, void *ctx);
++
++/* Separate optional synchronous OUTCOME hook, default NULL, same locking and
++ * lifetime rules as raop_media_write_cb (set/clear only outside callbacks and
++ * under the caller's external send ownership; never from a callback). Exactly
++ * one outcome is reported for every audio attempt of both callers (fresh and
++ * backlog), with the caller origin. destination is non-NULL only for SENT: the
++ * actual sendto address of one full datagram that select reported ready.
++ * SELECT_ERROR is reported even when the legacy path still sent successfully,
++ * so that write is never a qualifying observation. setup_port is the SETUP
++ * server_port parsed separately and strictly (0 when absent or invalid), NOT
++ * derived from the send address. Sync, control and RTX are never reported.
++ * Legacy send behavior and return values are unchanged. Kernel write acceptance
++ * only, not egress, delivery or playback evidence. */
++typedef enum {
++	RAOP_MEDIA_OUTCOME_SENT = 0,
++	RAOP_MEDIA_OUTCOME_NOT_READY,
++	RAOP_MEDIA_OUTCOME_SELECT_ERROR,
++	RAOP_MEDIA_OUTCOME_SEND_ERROR,
++	RAOP_MEDIA_OUTCOME_UNAVAILABLE
++} raop_media_outcome_t;
++
++typedef void (*raop_media_outcome_cb)(void *ctx, raop_media_outcome_t outcome,
++									raop_media_origin_t origin, size_t datagram_bytes,
++									const struct sockaddr_in *destination,
++									uint16_t setup_port);
++
++void raopcl_set_media_outcome_cb(struct raopcl_s *p, raop_media_outcome_cb callback, void *ctx);
++
++/* Nonzero count bumped by every media hook set (write or outcome), even an
++ * identical one, so an owner can detect a registration change. 0 for NULL. */
++uint32_t raopcl_media_registration_generation(struct raopcl_s *p);
++
++/* The separately parsed SETUP server_port, 0 when unknown. */
++uint16_t raopcl_media_setup_port(struct raopcl_s *p);
 +
  typedef enum raop_codec_s { RAOP_PCM = 0, RAOP_ALAC_RAW, RAOP_ALAC, RAOP_AAC,
  							RAOP_AAL_ELC } raop_codec_t;
  typedef enum raop_crypto_s { RAOP_CLEAR = 0, RAOP_RSA, RAOP_FAIRPLAY, RAOP_MFISAP,
 diff --git a/targets/include/raop_client.h b/targets/include/raop_client.h
-index 4be0ff8..95206b2 100644
+index 4be0ff8..4bdffd0 100644
 --- a/targets/include/raop_client.h
 +++ b/targets/include/raop_client.h
-@@ -84,6 +84,32 @@ typedef struct raopcl_t {uint32_t dummy;} raopcl_t;
+@@ -84,6 +84,66 @@ typedef struct raopcl_t {uint32_t dummy;} raopcl_t;
  
  struct raopcl_s;
  
@@ -169,6 +315,40 @@ index 4be0ff8..95206b2 100644
 + * A concurrent setter must also be joined before destroying the client.
 + */
 +void raopcl_set_media_write_cb(struct raopcl_s *p, raop_media_write_cb callback, void *ctx);
++
++/* Separate optional synchronous OUTCOME hook, default NULL, same locking and
++ * lifetime rules as raop_media_write_cb (set/clear only outside callbacks and
++ * under the caller's external send ownership; never from a callback). Exactly
++ * one outcome is reported for every audio attempt of both callers (fresh and
++ * backlog), with the caller origin. destination is non-NULL only for SENT: the
++ * actual sendto address of one full datagram that select reported ready.
++ * SELECT_ERROR is reported even when the legacy path still sent successfully,
++ * so that write is never a qualifying observation. setup_port is the SETUP
++ * server_port parsed separately and strictly (0 when absent or invalid), NOT
++ * derived from the send address. Sync, control and RTX are never reported.
++ * Legacy send behavior and return values are unchanged. Kernel write acceptance
++ * only, not egress, delivery or playback evidence. */
++typedef enum {
++	RAOP_MEDIA_OUTCOME_SENT = 0,
++	RAOP_MEDIA_OUTCOME_NOT_READY,
++	RAOP_MEDIA_OUTCOME_SELECT_ERROR,
++	RAOP_MEDIA_OUTCOME_SEND_ERROR,
++	RAOP_MEDIA_OUTCOME_UNAVAILABLE
++} raop_media_outcome_t;
++
++typedef void (*raop_media_outcome_cb)(void *ctx, raop_media_outcome_t outcome,
++									raop_media_origin_t origin, size_t datagram_bytes,
++									const struct sockaddr_in *destination,
++									uint16_t setup_port);
++
++void raopcl_set_media_outcome_cb(struct raopcl_s *p, raop_media_outcome_cb callback, void *ctx);
++
++/* Nonzero count bumped by every media hook set (write or outcome), even an
++ * identical one, so an owner can detect a registration change. 0 for NULL. */
++uint32_t raopcl_media_registration_generation(struct raopcl_s *p);
++
++/* The separately parsed SETUP server_port, 0 when unknown. */
++uint16_t raopcl_media_setup_port(struct raopcl_s *p);
 +
  typedef enum raop_codec_s { RAOP_PCM = 0, RAOP_ALAC_RAW, RAOP_ALAC, RAOP_AAC,
  							RAOP_AAL_ELC } raop_codec_t;

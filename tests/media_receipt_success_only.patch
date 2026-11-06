@@ -1,0 +1,15 @@
+--- a/media_receipt.c
++++ b/media_receipt.c
+@@ -308,10 +308,8 @@
+                         uint16_t setup_port)
+ {
+     media_receipt_t *mr = ctx;
+-    if (outcome != RAOP_MEDIA_OUTCOME_SENT) {
+-        mr_failure(mr);
+-        return;
+-    }
++    /* Matched baseline: success-only hook, failures never observed. */
++    if (outcome != RAOP_MEDIA_OUTCOME_SENT) return;
+     /* The RAOP lanes carry no tag: the producer is under the send lock with the
+      * applied epoch current, so the collector's own epoch is the fresh tag.
+      * Libraop's FRESH only means "not backlog": the CLI's scoped input origin

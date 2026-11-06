@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <unistd.h>
 #include <errno.h>
 #include <pthread.h>
@@ -39,7 +40,7 @@
 
 #include "../libraop/crosstools/src/platform.h"
 #include "../libraop/crosstools/src/cross_net.h"
-#include "../libraop/src/raop_client.h"
+#include "raop_client.h"
 #include "cross_log.h"
 #include "ap2_ptp.h"
 #include "ap2_ptp_shm.h"
@@ -176,9 +177,9 @@ struct ap2_ptp_ctx {
     int64_t offset_ns;
 
     /* NTP timing responder */
-    int timing_sock;
+    atomic_int timing_sock;    /* reset by stop while the responder unwinds */
     pthread_t timing_thread;
-    bool running;
+    atomic_bool running;       /* polled by the responder thread */
     char *device_ip;
 
     /* PTP grandmaster engine */
@@ -187,8 +188,8 @@ struct ap2_ptp_ctx {
     int event_sock;              /* UDP 319 */
     int general_sock;            /* UDP 320 */
     pthread_t ptp_thread;
-    bool ptp_running;
-    bool engine_active;
+    atomic_bool ptp_running;   /* polled by the engine thread */
+    atomic_bool engine_active;
     struct in_addr bind_addr;    /* multicast join interface (INADDR_ANY = default) */
     struct in_addr mcast_addr;
     uint16_t sync_seq;
@@ -275,8 +276,12 @@ static void *timing_thread_func(void *arg)
     setsockopt(ctx->timing_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     while (ctx->running) {
+        /* ap2_ptp_stop() closes the socket and stores -1 before it joins: read
+         * the (atomic) value once per pass so a closed socket ends the loop. */
+        const int sock = ctx->timing_sock;
+        if (sock < 0) break;
         addr_len = sizeof(addr);
-        int n = recvfrom(ctx->timing_sock, buf, sizeof(buf), 0,
+        int n = recvfrom(sock, buf, sizeof(buf), 0,
                          (struct sockaddr *)&addr, &addr_len);
         if (n < 32 || !ctx->running) continue;
 
@@ -317,7 +322,7 @@ static void *timing_thread_func(void *arg)
         /* Send time = same as receive time (we respond immediately) */
         memcpy(resp + 24, resp + 16, 8);
 
-        sendto(ctx->timing_sock, resp, 32, 0,
+        sendto(sock, resp, 32, 0,
                (struct sockaddr *)&addr, addr_len);
     }
 

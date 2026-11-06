@@ -261,6 +261,160 @@ static void test_failures(uint16_t port)
     puts("media failures: negative/short/EINTR/select error/select EINTR/nonready/down/closed, paired positives");
 }
 
+
+/* The separate OUTCOME hook: exactly one outcome per audio attempt. */
+struct outcomes {
+    atomic_uint calls;
+    unsigned counts[5];
+    raop_media_outcome_t last;
+    raop_media_origin_t origin;
+    size_t bytes;
+    bool have_destination;
+    struct sockaddr_in destination;
+    uint16_t setup_port;
+};
+
+static void capture_outcome(void *ctx, raop_media_outcome_t outcome,
+                            raop_media_origin_t origin, size_t bytes,
+                            const struct sockaddr_in *destination,
+                            uint16_t setup_port)
+{
+    struct outcomes *out = ctx;
+    out->last = outcome;
+    out->origin = origin;
+    out->bytes = bytes;
+    out->have_destination = destination != NULL;
+    if (destination) out->destination = *destination;
+    out->setup_port = setup_port;
+    out->counts[outcome]++;
+    atomic_fetch_add(&out->calls, 1);
+}
+
+static void test_outcomes(uint16_t port)
+{
+    struct raopcl_s *p = client_create(port);
+    struct outcomes out = {0};
+    struct capture capture = { .client = p };
+    p->media_setup_port = port;
+    CHECK(p->media_outcome_cb == NULL);
+    CHECK(raopcl_media_registration_generation(p) == 0);
+    fresh(p); /* default off: no outcome, legacy behavior */
+    uint32_t generation = 0;
+    raopcl_set_media_outcome_cb(p, capture_outcome, &out);
+    CHECK((generation = raopcl_media_registration_generation(p)) == 1);
+    CHECK(raopcl_media_setup_port(p) == port);
+    CHECK(atomic_load(&out.calls) == 0);
+
+    fresh(p);
+    CHECK(atomic_load(&out.calls) == 1 && out.last == RAOP_MEDIA_OUTCOME_SENT);
+    CHECK(out.origin == RAOP_MEDIA_FRESH && out.bytes == last_length);
+    CHECK(out.have_destination && out.setup_port == port);
+    CHECK(out.destination.sin_family == AF_INET);
+    CHECK(out.destination.sin_port == htons(port));
+    CHECK(out.destination.sin_addr.s_addr == last_destination.sin_addr.s_addr);
+
+    resume_one(p); /* backlog */
+    CHECK(atomic_load(&out.calls) == 2 && out.last == RAOP_MEDIA_OUTCOME_SENT);
+    CHECK(out.origin == RAOP_MEDIA_BACKLOG && out.have_destination);
+
+    /* Sync and RTX are never outcomes. */
+    _raopcl_send_sync(p, false);
+    CHECK(atomic_load(&out.calls) == 2);
+
+    /* Both hooks coexist; the success hook semantics are unchanged. */
+    raopcl_set_media_write_cb(p, capture_write, &capture);
+    CHECK(raopcl_media_registration_generation(p) == generation + 1);
+    fresh(p);
+    CHECK(atomic_load(&capture.calls) == 1 && atomic_load(&out.calls) == 3);
+
+    static const struct {
+        enum fault fault;
+        raop_media_outcome_t expected;
+        bool sendto_reached;
+    } matrix[] = {
+        { NEGATIVE_SEND, RAOP_MEDIA_OUTCOME_SEND_ERROR, true },
+        { SHORT_SEND, RAOP_MEDIA_OUTCOME_SEND_ERROR, true },
+        { EINTR_SEND, RAOP_MEDIA_OUTCOME_SEND_ERROR, true },
+        { NOT_READY, RAOP_MEDIA_OUTCOME_NOT_READY, false },
+        /* A select error NEVER qualifies, even though legacy still sent. */
+        { SELECT_ERROR, RAOP_MEDIA_OUTCOME_SELECT_ERROR, true },
+        { SELECT_EINTR, RAOP_MEDIA_OUTCOME_SELECT_ERROR, true },
+    };
+    for (size_t i = 0; i < sizeof(matrix) / sizeof(matrix[0]); i++) {
+        unsigned calls = atomic_load(&out.calls);
+        unsigned success_calls = atomic_load(&capture.calls);
+        size_t before = writes;
+        fault = matrix[i].fault;
+        fresh(p);
+        CHECK(atomic_load(&out.calls) == calls + 1);
+        CHECK(out.last == matrix[i].expected && out.origin == RAOP_MEDIA_FRESH);
+        CHECK(!out.have_destination && out.bytes == 0);
+        CHECK((writes == before + 1) == matrix[i].sendto_reached);
+        CHECK(atomic_load(&capture.calls) == success_calls);
+        resume_one(p);
+        CHECK(atomic_load(&out.calls) == calls + 2);
+        CHECK(out.last == matrix[i].expected && out.origin == RAOP_MEDIA_BACKLOG);
+        fault = REAL_SEND;
+    }
+    CHECK(out.counts[RAOP_MEDIA_OUTCOME_SELECT_ERROR] == 4);
+
+    /* The legacy return value stays false for failed attempts. */
+    {
+        uint8_t pcm[4] = {0};
+        uint64_t playtime = 0;
+        fault = NOT_READY;
+        CHECK(raopcl_send_chunk(p, pcm, 1, &playtime)); /* caller ignores it */
+        fault = REAL_SEND;
+    }
+
+    /* Unavailable preconditions: down and a closed audio socket. */
+    unsigned calls = atomic_load(&out.calls);
+    p->state = RAOP_DOWN;
+    fresh(p);
+    CHECK(out.last == RAOP_MEDIA_OUTCOME_UNAVAILABLE && !out.have_destination);
+    p->state = RAOP_STREAMING;
+    CHECK(close(p->rtp_ports.audio.fd) == 0);
+    p->rtp_ports.audio.fd = -1;
+    fresh(p);
+    CHECK(out.last == RAOP_MEDIA_OUTCOME_UNAVAILABLE);
+    CHECK(atomic_load(&out.calls) == calls + 2);
+
+    raopcl_set_media_outcome_cb(p, NULL, &out);
+    CHECK(p->media_outcome_cb == NULL && p->media_outcome_ctx == NULL);
+    CHECK(raopcl_media_registration_generation(p) > generation + 1);
+    raopcl_set_media_write_cb(p, NULL, NULL);
+    dispose(p);
+    raopcl_set_media_outcome_cb(NULL, NULL, NULL);
+    CHECK(raopcl_media_registration_generation(NULL) == 0);
+    CHECK(raopcl_media_setup_port(NULL) == 0);
+    puts("media outcomes: one per attempt, fresh/backlog, select error never qualifies, unavailable, default off, generation");
+}
+
+static void test_setup_port_parse(void)
+{
+    static const struct { const char *transport; uint16_t port; } cases[] = {
+        { "RTP/AVP/UDP;unicast;mode=record;server_port=6001;control_port=6002;timing_port=6003", 6001 },
+        { "RTP/AVP/UDP;server_port=65535;control_port=6002", 65535 },
+        { "RTP/AVP/UDP;server_port=65536;control_port=6002", 0 },
+        { "RTP/AVP/UDP;server_port=70000;control_port=6002", 0 },
+        { "RTP/AVP/UDP;server_port=60x1;control_port=6002", 0 },
+        { "RTP/AVP/UDP;server_port=;control_port=6002", 0 },
+        { "RTP/AVP/UDP;server_port=0;control_port=6002", 0 },
+        { "RTP/AVP/UDP;control_port=6002", 0 },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        struct raopcl_s *p = client_create(1);
+        p->media_setup_port = 1234; /* a stale value must not survive */
+        key_data_t kd[2] = {{0}};
+        CHECK(kd_add(kd, "Transport", cases[i].transport));
+        (void)raopcl_analyse_setup(p, kd); /* legacy result is not the subject */
+        CHECK(raopcl_media_setup_port(p) == cases[i].port);
+        kd_free(kd);
+        dispose(p);
+    }
+    puts("media setup port: strict separately parsed server_port");
+}
+
 struct concurrent {
     struct raopcl_s *client;
     atomic_bool start, cleared;
@@ -313,6 +467,8 @@ int main(void)
     int sink = loopback_socket(&port);
     test_positive_and_exclusions(port);
     test_failures(port);
+    test_outcomes(port);
+    test_setup_port_parse();
     test_unregister(port);
     CHECK(close(sink) == 0);
     puts("RAOP media write tests passed");

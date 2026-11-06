@@ -33,7 +33,7 @@
 #include "../libraop/crosstools/src/cross_thread.h"
 #include "../libraop/crosstools/src/cross_net.h"
 #include "../libraop/crosstools/src/cross_ssl.h"
-#include "../libraop/src/raop_client.h"
+#include "raop_client.h"
 #include "cross_util.h"
 #include "cross_log.h"
 #include "ap2_client.h"
@@ -47,6 +47,7 @@
 #include "announce.h"
 #include "host_clock.h"
 #include "attestation.h"
+#include "media_receipt.h"
 
 #define VERSION "0.5.2"
 /* Overridden at build time from the git tag for tagged releases (see Makefile). */
@@ -182,7 +183,13 @@ static void status_connected(void)
 #define SESSION_IDLE_TIMEOUT_MS   120000  /* orphan safety net */
 static struct ap2_session_s *g_session = NULL;
 static pthread_mutex_t g_audio_send_lock = PTHREAD_MUTEX_INITIALIZER;
-static bool g_first_start_done = false;
+/* Written by the command thread under the send lock, polled by the audio loop
+ * before it takes that lock: atomic so the unlocked poll is not a data race. */
+static atomic_bool g_first_start_done = false;
+/* Optional private media-write receipt collector (--private-media-receipt),
+ * disabled by default. Fixed storage that outlives every client and callback;
+ * see media_receipt.h for the ownership and locking contract. */
+static media_receipt_t g_mr;
 /* A SENDMETA delivered real track metadata (latched only on a send that
  * reached the receiver, so a failed pre-START push keeps the first-START
  * re-send as its retry): the placeholder re-send at the first START is then
@@ -201,6 +208,103 @@ static void session_resume(void *transport)
 {
     (void)transport;
     pthread_mutex_unlock(&g_audio_send_lock);
+}
+
+/* Runs inside ap2_session_start under the send and session locks: scalar store
+ * only, see ap2_session_ops_t::applied. */
+static void session_applied(void *transport, uint64_t epoch)
+{
+    (void)transport;
+    mr_applied(&g_mr, epoch);
+}
+
+/* Live registration generation of whichever client currently owns the hooks. */
+static uint32_t mr_live_generation(struct ap2cl_s *ap2, struct raopcl_s *raop)
+{
+    if (ap2) return ap2cl_media_registration_generation(ap2);
+    if (raop) return raopcl_media_registration_generation(raop);
+    return 0;
+}
+
+/* The route the CLI resolved up front (set once by main before any client
+ * exists); MR_ROUTE_UNKNOWN means unchecked. The record's route comes from the
+ * actual hook path, so a disagreement with it latches a fault. */
+static mr_route_t g_resolved_route = MR_ROUTE_UNKNOWN;
+
+static mr_route_t mr_resolved_route(const ap2_route_t *route)
+{
+    if (route->use_raop) return MR_ROUTE_RAOP;
+    if (!route->native) return MR_ROUTE_COMPAT;
+    return route->buffered ? MR_ROUTE_BUFFERED : MR_ROUTE_UDP;
+}
+
+/* Install the collector's hooks on the legacy RAOP client before any media. */
+static void mr_install_raop(struct raopcl_s *client)
+{
+    if (!g_mr.enabled) return;
+    pthread_mutex_lock(&g_audio_send_lock);
+    raopcl_set_media_outcome_cb(client, mr_raop_outcome_cb, &g_mr);
+    mr_configure(&g_mr, MR_ROUTE_RAOP, raopcl_media_setup_port(client),
+                 raopcl_media_registration_generation(client));
+    mr_expect_route(&g_mr, g_resolved_route);
+    pthread_mutex_unlock(&g_audio_send_lock);
+}
+
+/* Install on the actual AirPlay 2 media path. Buffered TCP is explicitly
+ * unsupported: nothing is registered and the record is incomplete. */
+static void mr_install_ap2(struct ap2cl_s *client)
+{
+    if (!g_mr.enabled) return;
+    pthread_mutex_lock(&g_audio_send_lock);
+    mr_route_t route = MR_ROUTE_UNKNOWN;
+    switch (ap2cl_media_path(client)) {
+    case AP2_MEDIA_PATH_NATIVE_UDP:
+        ap2cl_set_media_write_cb(client, mr_ap2_write_cb, &g_mr);
+        ap2cl_set_media_outcome_cb(client, mr_ap2_outcome_cb, &g_mr);
+        route = MR_ROUTE_UDP;
+        break;
+    case AP2_MEDIA_PATH_RAOP_COMPAT:
+        if (ap2cl_set_raop_media_outcome_cb(client, mr_raop_outcome_cb, &g_mr))
+            route = MR_ROUTE_COMPAT;
+        break;
+    case AP2_MEDIA_PATH_NATIVE_BUFFERED:
+        route = MR_ROUTE_BUFFERED;
+        break;
+    default:
+        break;
+    }
+    mr_configure(&g_mr, route, ap2cl_media_setup_port(client),
+                 ap2cl_media_registration_generation(client));
+    mr_expect_route(&g_mr, g_resolved_route);
+    pthread_mutex_unlock(&g_audio_send_lock);
+}
+
+/* Owner-driven teardown after the command thread joined, before destruction:
+ * check the registration, then make the clear an expected event. */
+static void mr_teardown(struct ap2cl_s *ap2, struct raopcl_s *raop)
+{
+    if (!g_mr.enabled) return;
+    pthread_mutex_lock(&g_audio_send_lock);
+    mr_begin_teardown(&g_mr, mr_live_generation(ap2, raop));
+    if (ap2) {
+        ap2cl_set_media_write_cb(ap2, NULL, NULL);
+        ap2cl_set_media_outcome_cb(ap2, NULL, NULL);
+        ap2cl_set_raop_media_outcome_cb(ap2, NULL, NULL);
+    }
+    if (raop) raopcl_set_media_outcome_cb(raop, NULL, NULL);
+    pthread_mutex_unlock(&g_audio_send_lock);
+}
+
+/* Transport commands that are unexpected after the STOP freeze. */
+static bool mr_is_transport_command(const char *key, const char *value)
+{
+    static const char *const verbs[] = {
+        "START", "FLUSH", "STANDBY", "PAUSE", "PLAY", "DISCONNECT", "ANNOUNCE",
+    };
+    if (strcmp(key, "ACTION") != 0) return false;
+    for (size_t i = 0; i < sizeof(verbs) / sizeof(verbs[0]); i++)
+        if (strcmp(value, verbs[i]) == 0) return true;
+    return false;
 }
 
 static void status_playing(uint64_t elapsed_ms)
@@ -616,6 +720,34 @@ static int pad_final_pcm_chunk(uint8_t *buf, int bytes, int chunk_bytes,
     return chunk_bytes;
 }
 
+/* Receipt origin of one realtime chunk. FRESH only when the whole chunk is real
+ * input: no splice pad silence at its head and every one of its `chunk_bytes`
+ * read from the input. A chunk of pad only, pad followed by content, or the
+ * final short chunk at input EOF (zero-filled afterwards) is labelled IDLE, so
+ * silence is never counted as fresh. Only the label changes, never pacing or
+ * data. */
+static ap2_media_origin_t ap2_chunk_origin(int pad_bytes, int content_bytes,
+                                           int chunk_bytes)
+{
+    return pad_bytes == 0 && content_bytes == chunk_bytes ? AP2_MEDIA_FRESH
+                                                          : AP2_MEDIA_IDLE;
+}
+
+/* One realtime chunk with its explicit caller origin. The tag is the applied
+ * epoch for FRESH and 0 otherwise (native route). The same origin is scoped for
+ * the nested RAOP outcome hook, which only reports FRESH/BACKLOG (compat). The
+ * send lock is held. */
+static ap2_send_result_t ap2_send_tagged(uint8_t *data, int frames,
+                                         ap2_media_origin_t origin)
+{
+    mr_origin_scope_enter(&g_mr, mr_origin_from_ap2(origin));
+    ap2_send_result_t result = ap2cl_send_chunk_tagged(
+        g_ap2cl, data, frames, origin,
+        origin == AP2_MEDIA_FRESH ? mr_current_epoch(&g_mr) : 0);
+    mr_origin_scope_exit(&g_mr);
+    return result;
+}
+
 /* ---- Command pipe handler ---- */
 
 static struct {
@@ -764,6 +896,10 @@ static void handle_announce(const cli_config_t *cfg)
 
 static void handle_command(const char *key, const char *value, cli_config_t *cfg)
 {
+    if (g_mr.enabled && mr_is_transport_command(key, value)) {
+        mr_note_command(&g_mr);
+        if (strcmp(value, "START") == 0) mr_note_start(&g_mr);
+    }
     if (strcmp(key, "TITLE") == 0) {
         metadata_set(&g_metadata.title, value);
     } else if (strcmp(key, "ARTIST") == 0) {
@@ -963,6 +1099,9 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "STOP") == 0) {
         bool stopped_ap2 = false;
         pthread_mutex_lock(&g_audio_send_lock);
+        /* Close the measured interval BEFORE the transport is stopped. */
+        if (g_mr.enabled)
+            mr_freeze_for_stop(&g_mr, mr_live_generation(g_ap2cl, g_raopcl));
         announce_abort();
         g_status = STATUS_STOPPED;
         if (cfg->protocol == PROTO_RAOP && g_raopcl) {
@@ -976,6 +1115,7 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
              * can be seen here is having no client to make the call on. The
              * stopped line still goes out below: the caller treats STOP as
              * terminal and tears the process down either way. */
+            mr_latch_invalid(&g_mr);
             status_error_ex(ERROR_CODE_STOP_FAILED, 0,
                             "no transport client to stop",
                             "STOP failed");
@@ -1243,6 +1383,7 @@ static bool start_stream_session(cli_config_t *cfg, int input_bpf,
         .stop = session_stop_op,
         .status = session_status_line,
         .warm_head_unix_ms = session_warm_head_unix_ms,
+        .applied = g_mr.enabled ? session_applied : NULL,
         .transport = cfg,
     };
     g_session = ap2_session_create(
@@ -1341,6 +1482,7 @@ static int run_raop(cli_config_t *cfg)
         return 1;
     }
     atomic_store(&g_raopcl, client);
+    mr_install_raop(client);
 
     latency = raopcl_latency(g_raopcl);
     int input_bpf = (cfg->bit_depth <= 16 ? 2 : 4) * cfg->channels;
@@ -1468,6 +1610,10 @@ static int run_raop(cli_config_t *cfg)
                 usleep(1000);
                 continue;
             }
+            /* Label before the EOF pad: only a whole chunk read from the input
+             * is content; the zero-filled short tail is IDLE. */
+            const ap2_media_origin_t origin = ap2_chunk_origin(
+                0, n, DEFAULT_FRAMES_PER_CHUNK * input_bpf);
             n = pad_final_pcm_chunk(
                 buf, n, DEFAULT_FRAMES_PER_CHUNK * input_bpf, input_bpf);
 
@@ -1484,8 +1630,14 @@ static int run_raop(cli_config_t *cfg)
                 send_buf = alac_buf;
             }
             uint64_t playtime;
-            if (!raopcl_send_chunk(
-                    g_raopcl, send_buf, audio_frames, &playtime)) {
+            /* The RAOP hook cannot tell a zero-padded EOF tail from content:
+             * scope the CLI-owned origin around the actual send. */
+            mr_origin_scope_enter(&g_mr,
+                                  mr_origin_from_ap2(origin));
+            const bool sent = raopcl_send_chunk(
+                g_raopcl, send_buf, audio_frames, &playtime);
+            mr_origin_scope_exit(&g_mr);
+            if (!sent) {
                 status_error("RAOP audio send failed");
                 playback_failed = true;
                 pthread_mutex_unlock(&g_audio_send_lock);
@@ -1506,6 +1658,9 @@ static int run_raop(cli_config_t *cfg)
     pthread_mutex_unlock(&g_audio_send_lock);
     request_command_stop();
     bool command_joined = join_command_thread();
+    /* A session that ended without being stopped is not a clean STOP. */
+    if (g_session && ap2_session_state(g_session) == AP2_SESSION_ENDED)
+        mr_latch_invalid(&g_mr);
     ap2_session_destroy(g_session);
     g_session = NULL;
     free(buf);
@@ -1533,7 +1688,7 @@ static bool ap2_send_silence_chunk(const cli_config_t *cfg, uint8_t *buf,
         truncate_32to24(buf, AP2_FRAMES_PER_CHUNK * input_bpf, alac_buf);
         send = alac_buf;
     }
-    return ap2cl_send_chunk(g_ap2cl, send, AP2_FRAMES_PER_CHUNK) !=
+    return ap2_send_tagged(send, AP2_FRAMES_PER_CHUNK, AP2_MEDIA_IDLE) !=
            AP2_SEND_FATAL;
 }
 
@@ -1613,6 +1768,7 @@ static int run_airplay2(cli_config_t *cfg)
         return 1;
     }
     atomic_store(&g_ap2cl, client);
+    mr_install_ap2(client);
 
     /* Report the MRP now-playing path so MA can log which one is active. The
      * type-130 data channel (path B) is opt-in; -1 means it was not attempted
@@ -1905,6 +2061,10 @@ static int run_airplay2(cli_config_t *cfg)
             }
             if (pad_bytes)
                 memset(buf, 0, (size_t)pad_bytes);
+            /* Label before the final-chunk padding: n is the real content
+             * read so far (0 when the pad filled the whole chunk). */
+            const ap2_media_origin_t origin = ap2_chunk_origin(
+                pad_bytes, n, AP2_FRAMES_PER_CHUNK * ap2_input_bpf);
             n = pad_final_pcm_chunk(
                 buf, pad_bytes + n, AP2_FRAMES_PER_CHUNK * ap2_input_bpf,
                 ap2_input_bpf);
@@ -1918,8 +2078,7 @@ static int run_airplay2(cli_config_t *cfg)
                 truncate_32to24(buf, n, ap2_alac_buf);
                 send = ap2_alac_buf;
             }
-            ap2_send_result_t result =
-                ap2cl_send_chunk(g_ap2cl, send, af);
+            ap2_send_result_t result = ap2_send_tagged(send, af, origin);
             if (result == AP2_SEND_FATAL) {
                 status_error("AirPlay 2 realtime send failed");
                 playback_failed = true;
@@ -1981,6 +2140,9 @@ static int run_airplay2(cli_config_t *cfg)
     content_cut_report(ap2_input_byte_rate);
     request_command_stop();
     bool command_joined = join_command_thread();
+    /* A session that ended without being stopped is not a clean STOP. */
+    if (g_session && ap2_session_state(g_session) == AP2_SESSION_ENDED)
+        mr_latch_invalid(&g_mr);
     ap2_session_destroy(g_session);
     g_session = NULL;
     free(buf);
@@ -1996,6 +2158,7 @@ static void signal_handler(int sig)
     (void)sig;
     g_running = false;
     g_status = STATUS_STOPPED;
+    mr_signal(&g_mr);
 }
 
 /* ---- HomeKit pair-setup mode ---- */
@@ -2136,6 +2299,9 @@ static void print_usage(const char *name)
     printf("  --if <ip>                  Local interface IP to bind (multi-homed hosts)\n");
     printf("  --debug <0-9>              Debug level (default: 3)\n");
     printf("  --check                    Print check info and exit\n");
+    printf("  --private-media-receipt    Private owned child only: emit one closed @MEDIA1\n");
+    printf("                             stdout record of full media writes for one\n");
+    printf("                             STOP-terminated epoch (default off, see README)\n");
     printf("  --clock-offset-ns <ns>     Run START_UNIX_MS and AirPlay timing on the raw\n");
     printf("                             host clock plus this offset instead of the wall\n");
     printf("                             clock. Give every process of a group the same value\n");
@@ -2204,6 +2370,38 @@ static bool parse_attestation_fd(const char *value, int *fd)
     }
     if (parsed < 3 || parsed > INT_MAX) return false;
     *fd = (int)parsed;
+    return true;
+}
+
+/* Teardown shared by every run: join the command thread, retire the transport
+ * clients and, last, emit the private receipt. Returns false when the command
+ * thread cannot be joined, before anything was destroyed (no final record). */
+static bool finish_run(const cli_config_t *cfg, int result)
+{
+    request_command_stop();
+    if (!join_command_thread()) return false;
+    struct ap2cl_s *ap2_client = atomic_exchange(&g_ap2cl, NULL);
+    struct raopcl_s *raop_client = atomic_exchange(&g_raopcl, NULL);
+    /* Explicit owner unregister phase; the clients are still alive here. */
+    mr_teardown(ap2_client, raop_client);
+    if (cfg->cmdpipe) {
+        if (g_cmdpipe_fd >= 0) close(g_cmdpipe_fd);
+        unlink(cfg->cmdpipe);
+    }
+    /* A failed destroy/disconnect is an observed cleanup failure that merges
+     * into the receipt's fault; the process result itself is unchanged. */
+    bool cleanup_ok = true;
+    if (ap2_client) cleanup_ok = ap2cl_destroy(ap2_client);
+    if (raop_client) {
+        cleanup_ok &= raopcl_disconnect(raop_client);
+        cleanup_ok &= raopcl_destroy(raop_client);
+    }
+    /* Terminal receipt: the command thread is joined, the callbacks cleared and
+     * the clients destroyed (their feedback/MRP workers joined), so no other
+     * stdout writer exists. No media or session lock is held. */
+    if (!cleanup_ok) mr_latch_invalid(&g_mr);
+    if (g_mr.enabled && !mr_emit(&g_mr, result == 0, stdout))
+        LOG_WARN("Media receipt omitted");
     return true;
 }
 
@@ -2286,6 +2484,7 @@ int main(int argc, char *argv[])
         {"attest-fd",    required_argument, 0, 1016},
         {"attest-nonce", required_argument, 0, 1017},
         {"attest-only",  no_argument,       0, 1018},
+        {"private-media-receipt", no_argument, 0, 1019},
         {"help",         no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -2375,6 +2574,9 @@ int main(int argc, char *argv[])
                 return 1;
             }
             attest_only = true;
+            break;
+        case 1019:
+            mr_init(&g_mr, true);
             break;
         case 1002:
             if (!attestation_requested) {
@@ -2514,6 +2716,7 @@ int main(int argc, char *argv[])
     cfg.route.buffered =
         ap2_buffered_route(&cfg.route, cfg.ap2_txt, cfg.am, cfg.buffered);
     cfg.protocol = cfg.route.use_raop ? PROTO_RAOP : PROTO_AIRPLAY2;
+    g_resolved_route = mr_resolved_route(&cfg.route);
     LOG_INFO("[AP2] auto-selected: %s; timing=%s; features=0x%llx; flags=0x%llx; bitdepth=%d",
              cfg.route.reason,
              cfg.route.use_raop ? "n/a" : (cfg.route.ptp ? "PTP" : "NTP"),
@@ -2566,19 +2769,7 @@ int main(int argc, char *argv[])
         ? run_raop(&cfg) : run_airplay2(&cfg);
 
     /* Cleanup */
-    request_command_stop();
-    if (!join_command_thread()) return 1;
-    struct ap2cl_s *ap2_client = atomic_exchange(&g_ap2cl, NULL);
-    struct raopcl_s *raop_client = atomic_exchange(&g_raopcl, NULL);
-    if (cfg.cmdpipe) {
-        if (g_cmdpipe_fd >= 0) close(g_cmdpipe_fd);
-        unlink(cfg.cmdpipe);
-    }
-    if (ap2_client) ap2cl_destroy(ap2_client);
-    if (raop_client) {
-        raopcl_disconnect(raop_client);
-        raopcl_destroy(raop_client);
-    }
+    if (!finish_run(&cfg, result)) return 1;
     free(g_metadata.title);
     free(g_metadata.artist);
     free(g_metadata.album);

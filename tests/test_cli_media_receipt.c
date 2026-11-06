@@ -631,6 +631,36 @@ static void test_chunk_origin(void)
     say("cli receipt: pad-only and mixed chunks are IDLE, pure content is FRESH");
 }
 
+/* The CLI-resolved route is compared with the installed hook path. */
+static void test_resolved_route_cross_check(void)
+{
+    const ap2_route_t compat = { .native = false }, udp = { .native = true },
+        buffered = { .native = true, .buffered = true },
+        raop = { .use_raop = true };
+
+    CHECK(mr_resolved_route(&compat) == MR_ROUTE_COMPAT);
+    CHECK(mr_resolved_route(&udp) == MR_ROUTE_UDP);
+    CHECK(mr_resolved_route(&buffered) == MR_ROUTE_BUFFERED);
+    CHECK(mr_resolved_route(&raop) == MR_ROUTE_RAOP);
+
+    begin_session(false);               /* disabled: collector never starts */
+    end_session();
+    reset_stubs();
+    mr_init(&g_mr, true);
+    g_resolved_route = MR_ROUTE_UDP;
+    media_path = AP2_MEDIA_PATH_NATIVE_UDP;
+    mr_install_ap2(fake_client);
+    CHECK(!g_mr.fault);                 /* resolved == installed */
+
+    mr_init(&g_mr, true);
+    g_resolved_route = MR_ROUTE_COMPAT; /* resolved compat, actual native UDP */
+    mr_install_ap2(fake_client);
+    CHECK(g_mr.fault);
+    g_resolved_route = MR_ROUTE_UNKNOWN;
+    mr_teardown(fake_client, NULL);
+    say("cli receipt: resolved route vs installed hook path, mismatch latches a fault");
+}
+
 static bool wait_flag(atomic_bool *flag)
 {
     for (unsigned i = 0; i < 5000 && !atomic_load(flag); i++) usleep(1000);
@@ -947,6 +977,7 @@ int main(void)
     test_silence_origin();
     test_chunk_origin();
     test_buffered_stop_start_cohort();
+    test_resolved_route_cross_check();
     test_final_after_writers_joined();
     test_unjoined_writer_control();
     test_real_feedback_teardown();

@@ -57,6 +57,12 @@ void mr_configure(media_receipt_t *mr, mr_route_t route, uint16_t setup_port,
         mr->fault = true;
 }
 
+void mr_expect_route(media_receipt_t *mr, mr_route_t resolved)
+{
+    if (!mr->enabled || !mr->configured || resolved == MR_ROUTE_UNKNOWN) return;
+    if (mr->route != resolved) mr->fault = true;
+}
+
 void mr_applied(media_receipt_t *mr, uint64_t epoch)
 {
     if (!mr->enabled) return;

@@ -493,9 +493,29 @@ static void test_emit_failures(void)
     puts("receipt: refused non-pipe, fcntl/flush/write failures, EINTR/partial/EAGAIN, real full pipe, no waiting");
 }
 
+/* The route the CLI resolved up front must equal the hook path's route. */
+static void test_expect_route(void)
+{
+    media_receipt_t mr;
+
+    mr_init(&mr, true);
+    mr_configure(&mr, MR_ROUTE_UDP, 6001, 5);
+    mr_expect_route(&mr, MR_ROUTE_UNKNOWN);     /* unchecked */
+    mr_expect_route(&mr, MR_ROUTE_UDP);
+    CHECK(!mr.fault);
+    mr_expect_route(&mr, MR_ROUTE_COMPAT);      /* resolved != actual path */
+    CHECK(mr.fault);
+
+    mr_init(&mr, false);                        /* disabled: no effect */
+    mr_expect_route(&mr, MR_ROUTE_COMPAT);
+    CHECK(!mr.fault);
+    puts("media receipt: resolved route must match the hook path");
+}
+
 int main(void)
 {
     alarm(60);
+    test_expect_route();
     test_default_off();
     test_counting();
     test_faults();

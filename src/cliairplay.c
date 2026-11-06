@@ -226,6 +226,18 @@ static uint32_t mr_live_generation(struct ap2cl_s *ap2, struct raopcl_s *raop)
     return 0;
 }
 
+/* The route the CLI resolved up front (set once by main before any client
+ * exists); MR_ROUTE_UNKNOWN means unchecked. The record's route comes from the
+ * actual hook path, so a disagreement with it latches a fault. */
+static mr_route_t g_resolved_route = MR_ROUTE_UNKNOWN;
+
+static mr_route_t mr_resolved_route(const ap2_route_t *route)
+{
+    if (route->use_raop) return MR_ROUTE_RAOP;
+    if (!route->native) return MR_ROUTE_COMPAT;
+    return route->buffered ? MR_ROUTE_BUFFERED : MR_ROUTE_UDP;
+}
+
 /* Install the collector's hooks on the legacy RAOP client before any media. */
 static void mr_install_raop(struct raopcl_s *client)
 {
@@ -234,6 +246,7 @@ static void mr_install_raop(struct raopcl_s *client)
     raopcl_set_media_outcome_cb(client, mr_raop_outcome_cb, &g_mr);
     mr_configure(&g_mr, MR_ROUTE_RAOP, raopcl_media_setup_port(client),
                  raopcl_media_registration_generation(client));
+    mr_expect_route(&g_mr, g_resolved_route);
     pthread_mutex_unlock(&g_audio_send_lock);
 }
 
@@ -262,6 +275,7 @@ static void mr_install_ap2(struct ap2cl_s *client)
     }
     mr_configure(&g_mr, route, ap2cl_media_setup_port(client),
                  ap2cl_media_registration_generation(client));
+    mr_expect_route(&g_mr, g_resolved_route);
     pthread_mutex_unlock(&g_audio_send_lock);
 }
 
@@ -1643,11 +1657,12 @@ static bool ap2_send_silence_chunk(const cli_config_t *cfg, uint8_t *buf,
                                    AP2_MEDIA_IDLE, 0) != AP2_SEND_FATAL;
 }
 
-/* Receipt origin of one realtime chunk. FRESH only when the chunk is entirely
- * real content from the input (no splice pad silence at its head and at least
- * one content byte). A chunk of pad only, or pad followed by content, is
- * labelled IDLE: it is never counted as fresh, so a fresh receipt always
- * means wholly-PCM chunks went to the wire. Only the label changes. */
+/* Receipt origin of one realtime chunk. FRESH only when the chunk has no splice
+ * pad silence at its head and at least one real content byte. A chunk of pad
+ * only, or pad followed by content, is labelled IDLE, so pad silence is never
+ * counted as fresh. The label is taken before the final short chunk at input EOF
+ * is zero-filled to a full chunk, so that one chunk is still FRESH. Only the
+ * label changes, never pacing or data. */
 static ap2_media_origin_t ap2_chunk_origin(int pad_bytes, int content_bytes)
 {
     return pad_bytes == 0 && content_bytes > 0 ? AP2_MEDIA_FRESH
@@ -2679,6 +2694,7 @@ int main(int argc, char *argv[])
     cfg.route.buffered =
         ap2_buffered_route(&cfg.route, cfg.ap2_txt, cfg.am, cfg.buffered);
     cfg.protocol = cfg.route.use_raop ? PROTO_RAOP : PROTO_AIRPLAY2;
+    g_resolved_route = mr_resolved_route(&cfg.route);
     LOG_INFO("[AP2] auto-selected: %s; timing=%s; features=0x%llx; flags=0x%llx; bitdepth=%d",
              cfg.route.reason,
              cfg.route.use_raop ? "n/a" : (cfg.route.ptp ? "PTP" : "NTP"),

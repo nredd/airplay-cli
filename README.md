@@ -46,7 +46,7 @@ The CLI-local `patches/libraop-media-write-callback.patch` is applied to build-l
 copies after the existing thread-join fix. The pinned submodule and its gitlink
 remain unchanged. Both public `raop_client.h` copies are patched identically;
 compilation uses the generated header. There is no CLI consumer or new status
-output, and native AirPlay 2 is not instrumented.
+output. Native AirPlay 2 has a separate optional hook described below.
 
 `raopcl_set_media_write_cb(client, callback, ctx)` defaults to NULL. Install before
 media starts. The synchronous callback reports only full successful audio
@@ -81,6 +81,78 @@ assertion failure from a matched baseline-behavior fixture: it retains the new
 API solely to compile but drops notifications, as the old source did. This is
 not an assertion that the old source had the new API. Both targets run in
 `make test`, including the existing Linux ASan/UBSan CI gate.
+
+## Optional native AP2 write callback
+
+`ap2cl_set_media_write_cb(client, callback, ctx)` defaults to NULL and has no
+CLI consumer or new output. `ap2cl_send_chunk_tagged(client, pcm, frames, origin,
+tag)` accepts caller labels `AP2_MEDIA_FRESH`, `AP2_MEDIA_IDLE`,
+`AP2_MEDIA_BACKLOG`, or `AP2_MEDIA_UNKNOWN`, plus an opaque `uint64_t` scalar.
+The old `ap2cl_send_chunk` remains compatible and labels writes UNKNOWN/0,
+including ordinary idle silence. Labels are NOT content proof or applied START
+epochs. This does not change return values, retry/drop rules, pacing, volume,
+anchors or session behavior. RAOP-compatible sends do not invoke this hook.
+
+Each borrowed `ap2_media_write_t` describes one successful original native media
+unit: route `AP2_MEDIA_REALTIME_UDP` only after `AP2_SEND_SENT` for the full
+original datagram, or `AP2_MEDIA_BUFFERED_TCP` only when the final byte of the
+length-prefixed encrypted frame is accepted by `send`. `bytes` includes the RTP
+header, encrypted payload, auth tag and nonce, plus the TCP length prefix when
+buffered. Queuing, partial writes, drops, errors, sync/control and RTX do not
+notify. `audio_packets_sent` can advance while a TCP tail remains unwritten;
+it is NOT a completion counter. A later successful tail drain invokes exactly
+once with the original frame's snapshotted origin, scalar and total bytes,
+including when draining during quiesce. Discarding a wholly unwritten frame or
+disconnecting/canceling an incomplete tail never produces completion. A hard
+TCP write error also invalidates that frame's notification, even if an API caller
+later retries and drains its tail; this hook cannot certify completeness.
+
+UDP destination is the actual `sendto` sockaddr, not the RTSP port. TCP snapshots
+`getpeername` on the live data connection when queueing; disconnect closes that
+connection and discards its pending frame before reconnect. Failed peer lookup
+is explicit as `destination_known=false` and a zero destination, not a guessed
+peer. A known tuple is local socket evidence, not independently observed egress.
+
+Unlike libraop's internally locked setter, the native media API already relies
+on **caller-owned serialization**. Use the SAME external mutex or exclusive
+ownership for registration/clear, send/accept, flush/standby/resume/stop,
+connect/disconnect and destruction. The CLI uses `g_audio_send_lock` and its
+session quiesce bracket; a future consumer must call the setter within that
+bracket too. The setter does not join callers or acquire a new internal lock.
+Under this contract, clearing/replacing returns with no old callback in flight,
+so the old context can be freed immediately. Pending frames store no callback
+or userdata pointer. Every setter call, even an identical registration,
+invalidates notification for any parked TCP frame without altering its bytes.
+Later drain is deliberately suppressed, NOT attributed to a new context; a frame
+queued while unregistered is never adopted. This trades completeness across
+registration changes for a small lifetime-safe opt-in API. Calling the setter
+concurrently without the shared serialization is outside the API contract.
+
+Callbacks run synchronously inside the caller's media serialization. Copy only
+bounded values; do not block, perform I/O, reenter the client, or retain pointers.
+Clear, stop/join ALL API callers (setters included), then destroy exclusively.
+No new lock spans blocking socket I/O and existing bounded stop is unchanged.
+This remains success-only kernel acceptance, not complete error/drop accounting,
+NIC egress, receiver receipt, playback, timestamps, applied epochs, cross-process
+clock proof or a final receipt. Suppression and late errors require separate
+future completeness accounting; this PR adds no collector or binary pin change.
+
+`make test-ap2-media STATIC=1` uses the production client, encoder, encryption,
+IO and pending-flush paths with owned loopback UDP/TCP sockets. It covers full
+writes on both routes, caller/default labels, real TCP backpressure, injected
+EINTR/EAGAIN/timeout/short UDP/hard errors, final-byte completion, warm
+flush/resume, quiesce/discard, reconnect/cancel and serialized context clearing.
+`make test-ap2-media-red STATIC=1` runs the same built fixture with an intentional
+false completion assertion: the queued counter advances with an unwritten tail
+while the new callback remains zero. It must fail at that assertion, not build.
+The negative fixture clears registration, destroys its client and closes the
+peer before the intentional assertion exits, so Linux LeakSanitizer can retain
+its normal leak checks. The target still requires exit 1, the exact assertion
+and no sanitizer report. Rejected controls print the exit status and at most
+20 log lines of 240 characters, with path tokens redacted; the full local log
+remains in `build/tests/ap2-media-red.log`.
+Both targets run under the unchanged normal and Linux sanitizer `make test`
+gates; architecture CI gates remain unchanged.
 
 ## Usage
 

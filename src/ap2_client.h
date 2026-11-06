@@ -259,6 +259,60 @@ void ap2cl_standby(struct ap2cl_s *p);
 ap2_send_result_t ap2cl_send_chunk(struct ap2cl_s *p, uint8_t *sample,
                                    int frames);
 
+/* Caller labels only, NOT stimulus or applied START-epoch evidence. The legacy
+ * send API uses UNKNOWN (including idle silence); no origin is inferred. */
+typedef enum {
+    AP2_MEDIA_UNKNOWN = 0,
+    AP2_MEDIA_FRESH,
+    AP2_MEDIA_IDLE,
+    AP2_MEDIA_BACKLOG,
+} ap2_media_origin_t;
+
+typedef enum {
+    AP2_MEDIA_REALTIME_UDP = 0,
+    AP2_MEDIA_BUFFERED_TCP,
+} ap2_media_route_t;
+
+typedef struct {
+    ap2_media_route_t route;
+    ap2_media_origin_t origin;
+    uint64_t tag;                 /* opaque caller scalar, not an epoch proof */
+    size_t bytes;                 /* one full datagram or length-prefixed frame */
+    bool destination_known;
+    struct sockaddr_in destination; /* actual sendto address / connected peer */
+} ap2_media_write_t;
+
+typedef void (*ap2_media_write_cb)(void *ctx, const ap2_media_write_t *write);
+
+/* Optional synchronous success-only hook, NULL by default. Native AP2 only;
+ * never sync, control or retransmits. TCP notifies only at final-byte acceptance,
+ * not when queued or audio_packets_sent advances. No error/drop completeness,
+ * timestamps, receiver receipt, NIC egress or playback claim.
+ *
+ * NATIVE MEDIA API SERIALIZATION IS CALLER-OWNED: use the same external lock or
+ * exclusive ownership for this setter, send/accept, flush/standby/resume/stop,
+ * connect/disconnect and destruction. The CLI's g_audio_send_lock is one such
+ * lock; this setter does NOT acquire an internal lock or join API callers.
+ * Do not call it concurrently with those operations. Under that contract no
+ * callback is in flight on setter return, so the old ctx can be freed then.
+ * Every set (even identical) invalidates notifications for an already parked
+ * TCP frame; its bytes still drain normally, never into the new registration.
+ * A frame queued with no callback is never adopted by a later registration.
+ * Clear, stop/join all API callers, then destroy with exclusive ownership.
+ *
+ * Callback data is borrowed until return. Copy bounded values only: no I/O,
+ * blocking, reentry, or retained pointers. The callback runs under the caller's
+ * media serialization, NOT the RTSP/RTX lock. TCP peer is snapshotted at queueing
+ * on the live connected socket; disconnect discards the pending frame. Failed
+ * peer lookup is explicit (destination_known=false), not a guessed port. */
+void ap2cl_set_media_write_cb(struct ap2cl_s *p, ap2_media_write_cb cb, void *ctx);
+
+/* Same behavior/return contract as ap2cl_send_chunk; labels apply to this frame
+ * only and survive pending-tail drains through accept/flush/quiesce/resume. */
+ap2_send_result_t ap2cl_send_chunk_tagged(struct ap2cl_s *p, uint8_t *sample,
+                                        int frames, ap2_media_origin_t origin,
+                                        uint64_t tag);
+
 /* Check if the client is ready to accept more audio frames. */
 bool ap2cl_accept_frames(struct ap2cl_s *p);
 

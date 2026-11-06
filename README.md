@@ -218,6 +218,17 @@ Coverage and accounting (each path is a real call path, not a test-only hook):
   so the compat lane never sends it today; if it ever did, `ap2_send_silence_chunk`
   makes an ACTIVE collector incomplete rather than counting it as fresh. This
   narrows the contract's "use the RAOP hook's origin" for that one case.
+- Two more places depart from the contract text, both on purpose. Native
+  failure outcomes are reported from `ap2cl_send_chunk_tagged` (one failure per
+  failed content invocation, including state/socket failures before any send),
+  not from `ap2_native_send_chunk`/`ap2_io_send_datagram_deadline`, because the
+  wrapper is the single exit every native content call passes through; the
+  success hook stays where it was. Registration loss is detected with a
+  per-client generation counter bumped by every hook set (polled at the STOP
+  freeze and at teardown start) rather than by comparing callback pointers, so
+  an identical re-registration is caught too. A compat content send with the
+  nested client already gone reports no outcome, but the live generation then
+  reads 0, which differs from the installed one and faults the record.
 
 The record is written exactly once, by `finish_run` (called from `main`), after the command thread
 joined, the callbacks were cleared and `ap2cl_destroy`/`raopcl_destroy` returned.

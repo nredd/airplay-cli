@@ -4234,6 +4234,8 @@ ap2_send_result_t ap2cl_send_chunk_tagged(struct ap2cl_s *p, uint8_t *sample,
         ap2_media_outcome_notify(p, result, origin, tag);
         return result;
     }
+    /* No nested client: no outcome hook can see this. The registration
+     * generation then reads 0, which the collector detects at its freeze. */
     if (!p->raopcl) return AP2_SEND_FATAL;
     uint64_t playtime;
     if (!raopcl_send_chunk(p->raopcl, sample, frames, &playtime))

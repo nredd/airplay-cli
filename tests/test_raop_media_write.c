@@ -199,6 +199,8 @@ static void test_positive_and_exclusions(uint16_t port)
     CHECK(atomic_load(&capture.calls) == 2);
     CHECK(capture.origin == RAOP_MEDIA_BACKLOG);
     CHECK(capture.bytes == last_length);
+    CHECK(capture.destination.sin_family == last_destination.sin_family);
+    CHECK(capture.destination.sin_addr.s_addr == last_destination.sin_addr.s_addr);
     CHECK(capture.destination.sin_port == last_destination.sin_port);
 
     _raopcl_send_sync(p, false);
@@ -246,11 +248,13 @@ static void test_failures(uint16_t port)
     p->state = RAOP_DOWN;
     size_t before = writes;
     fresh(p);
+    resume_one(p);
     CHECK(writes == before && atomic_load(&capture.calls) == 0);
     p->state = RAOP_STREAMING;
     CHECK(close(p->rtp_ports.audio.fd) == 0);
     p->rtp_ports.audio.fd = -1;
     fresh(p);
+    resume_one(p);
     CHECK(writes == before && atomic_load(&capture.calls) == 0);
     dispose(p);
     raopcl_set_media_write_cb(NULL, NULL, NULL);

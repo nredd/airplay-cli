@@ -577,6 +577,7 @@ build/tests/test_raop_media_no_notification: build/tests/raop_media_no_notificat
 test-raop-media-red: directory build/tests/test_raop_media_no_notification
 	@set +e; build/tests/test_raop_media_no_notification > build/tests/raop-media-red.log 2>&1; \
 		rc=$$?; set -e; test $$rc -eq 1; \
+		if grep -Eq 'Sanitizer|runtime error:' build/tests/raop-media-red.log; then exit 1; fi; \
 		grep -Eq '^FAIL line [0-9]+: atomic_load\(&capture.calls\) == 1$$' build/tests/raop-media-red.log; \
 		printf 'Matched baseline behavior: intended successful-callback assertion failed (exit 1)\n'
 

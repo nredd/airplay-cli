@@ -18,6 +18,7 @@
 #include <stdint.h>
 #include <netinet/in.h>
 
+#include "raop_client.h"
 #include "ap2_io.h"
 #include "ap2_mrp.h"
 #include "ap2_session.h"
@@ -306,6 +307,53 @@ typedef void (*ap2_media_write_cb)(void *ctx, const ap2_media_write_t *write);
  * on the live connected socket; disconnect discards the pending frame. Failed
  * peer lookup is explicit (destination_known=false), not a guessed port. */
 void ap2cl_set_media_write_cb(struct ap2cl_s *p, ap2_media_write_cb cb, void *ctx);
+
+/* Failure outcome of one native realtime content invocation, reported by
+ * ap2cl_send_chunk_tagged for DROPPED (transient local UDP drop) and FATAL
+ * (state, sync, encode, encrypt, allocation or send failure). A successful
+ * full datagram is reported only through the write hook above, so each content
+ * invocation yields exactly one of the two. Retries handled inside the IO layer
+ * are not drops when the datagram is eventually sent. Native AP2 only; the
+ * RAOP-compatible nested client uses ap2cl_set_raop_media_outcome_cb.
+ * Same caller-owned serialization, borrowed-data and no-reentry rules as the
+ * write hook. Default NULL; origin/tag are the caller's labels for that call. */
+typedef enum {
+    AP2_MEDIA_OUTCOME_DROPPED = 1,
+    AP2_MEDIA_OUTCOME_FATAL,
+} ap2_media_outcome_t;
+
+typedef void (*ap2_media_outcome_cb)(void *ctx, ap2_media_outcome_t outcome,
+                                     ap2_media_origin_t origin, uint64_t tag);
+
+void ap2cl_set_media_outcome_cb(struct ap2cl_s *p, ap2_media_outcome_cb cb,
+                                void *ctx);
+
+/* The actual media transport after connect: native UDP, native buffered TCP
+ * (unsupported for receipts), or the nested RAOP-compatible client. */
+typedef enum {
+    AP2_MEDIA_PATH_UNKNOWN = 0,
+    AP2_MEDIA_PATH_NATIVE_UDP,
+    AP2_MEDIA_PATH_NATIVE_BUFFERED,
+    AP2_MEDIA_PATH_RAOP_COMPAT,
+} ap2_media_path_t;
+
+ap2_media_path_t ap2cl_media_path(struct ap2cl_s *p);
+
+/* The SETUP data/server port parsed separately from the send address (native:
+ * dataPort, compat: the nested client's server_port); 0 when absent/invalid. */
+uint16_t ap2cl_media_setup_port(struct ap2cl_s *p);
+
+/* Nonzero count bumped by every media hook set (even an identical one) on the
+ * active path, so an owner can detect a registration change; 0 when no
+ * registration surface exists. */
+uint32_t ap2cl_media_registration_generation(struct ap2cl_s *p);
+
+/* Register the RAOP OUTCOME hook on the nested RAOP-compatible client (after a
+ * successful connect, before media). Returns false on a native client or when
+ * no nested client exists. Cleared automatically before nested destruction;
+ * the owner clears it explicitly under its send lock first. */
+bool ap2cl_set_raop_media_outcome_cb(struct ap2cl_s *p,
+                                     raop_media_outcome_cb cb, void *ctx);
 
 /* Same behavior/return contract as ap2cl_send_chunk; labels apply to this frame
  * only and survive pending-tail drains through accept/flush/quiesce/resume. */

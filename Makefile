@@ -144,7 +144,7 @@ AP2_SOURCES = ap2_client.c ap2_hap.c ap2_io.c ap2_ptp.c ap2_ptp_shm.c ap2_plist.
 
 # Common/CLI sources
 CLI_SOURCES = cross_log.c cross_ssl.c cross_util.c cross_net.c platform.c host_clock.c \
-	attestation.c cliairplay.c net_address.c raop_response.c raop_session.c artwork.c announce.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
+	attestation.c media_receipt.c cliairplay.c net_address.c raop_response.c raop_session.c artwork.c announce.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
 
 # Pre-built static libraries
 # We use a patched copy of libcodecs.a with the buggy alac_create_encoder removed,
@@ -624,3 +624,84 @@ test-ap2-media-red: directory $(AP2_MEDIA_TEST)
 
 test: test-ap2-media test-ap2-media-red
 .PHONY: test-ap2-media test-ap2-media-red
+
+# The terminal emitter and collector with its fcntl/fflush/write seams routed
+# through test hooks; the real syscalls still back every positive case.
+MEDIA_RECEIPT_TEST = build/tests/test_media_receipt
+build/tests/media_receipt_seams.o: src/media_receipt.c src/media_receipt.h \
+		$(RAOP_MEDIA_STAMP) Makefile
+	@mkdir -p build/tests
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -Dfcntl=mr_test_fcntl \
+		-Dfflush=mr_test_fflush -Dwrite=mr_test_write $< -c -o $@
+
+$(MEDIA_RECEIPT_TEST): tests/test_media_receipt.c build/tests/media_receipt_seams.o Makefile
+	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_media_receipt.c \
+		build/tests/media_receipt_seams.o $(EXTRA_LDFLAGS) -o $@
+
+test-media-receipt: directory $(MEDIA_RECEIPT_TEST)
+	$(MEDIA_RECEIPT_TEST)
+
+# Matched baseline: a success-only observer (no outcome accounting) must fail
+# the failure-fault assertion, NOT compilation or a sanitizer report.
+build/tests/media_receipt_success_only.c: src/media_receipt.c tests/media_receipt_success_only.patch
+	@mkdir -p build/tests
+	patch -s -o $@ src/media_receipt.c tests/media_receipt_success_only.patch
+
+build/tests/media_receipt_success_only.o: build/tests/media_receipt_success_only.c \
+		src/media_receipt.h $(RAOP_MEDIA_STAMP) Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -Isrc -Dfcntl=mr_test_fcntl \
+		-Dfflush=mr_test_fflush -Dwrite=mr_test_write $< -c -o $@
+
+build/tests/test_media_receipt_success_only: tests/test_media_receipt.c \
+		build/tests/media_receipt_success_only.o Makefile
+	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_media_receipt.c \
+		build/tests/media_receipt_success_only.o $(EXTRA_LDFLAGS) -o $@
+
+test-media-receipt-red: directory build/tests/test_media_receipt_success_only
+	@set +e; build/tests/test_media_receipt_success_only > build/tests/media-receipt-red.log 2>&1; \
+		rc=$$?; set -e; \
+		if test $$rc -ne 1 || \
+			grep -Eq 'Sanitizer|runtime error:' build/tests/media-receipt-red.log || \
+			! grep -Eq '^FAIL line [0-9]+: mr.fault && mr.fresh_units == 1$$' build/tests/media-receipt-red.log; then \
+			printf 'Media receipt negative control rejected: exit=%s\n' "$$rc" >&2; \
+			LC_ALL=C awk 'NR <= 20 { gsub(/\/[^[:space:]]+/, "<path>"); print substr($$0, 1, 240) } NR == 21 { exit }' build/tests/media-receipt-red.log >&2; \
+			exit 1; \
+		fi; \
+		printf 'Success-only baseline: select-error fault assertion failed (exit 1)\n'
+
+test: test-media-receipt test-media-receipt-red
+.PHONY: test-media-receipt test-media-receipt-red
+
+CLI_MEDIA_RECEIPT_TEST = build/tests/test_cli_media_receipt
+$(CLI_MEDIA_RECEIPT_TEST): tests/test_cli_media_receipt.c src/cliairplay.c \
+		$(filter-out $(BUILDDIR)/cliairplay.o,$(OBJECTS_ALL)) $(LIBCODECS_PATCHED) Makefile
+	@mkdir -p build/tests
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o build/tests/test_cli_media_receipt.o
+	$(CXX) build/tests/test_cli_media_receipt.o \
+		$(filter-out $(BUILDDIR)/cliairplay.o,$(OBJECTS_ALL)) $(LIBRARY) $(LDFLAGS) -o $@
+
+test-cli-media-receipt: directory $(CLI_MEDIA_RECEIPT_TEST)
+	$(CLI_MEDIA_RECEIPT_TEST)
+
+test: test-cli-media-receipt
+.PHONY: test-cli-media-receipt
+
+# Real patched libraop nested in the real ap2_client (AirPlay 2 RAOP-compatible
+# flow); a single translation unit, with only select/sendto routed via seams.
+COMPAT_MEDIA_TEST = build/tests/test_compat_media_receipt
+build/tests/test_compat_media_receipt.o: tests/test_compat_media_receipt.c src/ap2_client.c \
+		src/ap2_client.h src/media_receipt.h $(RAOP_MEDIA_STAMP) Makefile
+	@mkdir -p build/tests
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -std=gnu11 $< -c -o $@
+
+$(COMPAT_MEDIA_TEST): build/tests/test_compat_media_receipt.o build/tests/cross_ssl.o \
+		$(RAOP_MEDIA_TEST_OBJECTS) $(LIBCODECS_PATCHED) Makefile
+	$(CXX) build/tests/test_compat_media_receipt.o build/tests/cross_ssl.o \
+		$(RAOP_MEDIA_TEST_OBJECTS) $(filter-out $(OPENSSL)/libopenssl.a,$(LIBRARY)) \
+		$(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
+
+test-compat-media: directory $(COMPAT_MEDIA_TEST)
+	$(COMPAT_MEDIA_TEST)
+
+test: test-compat-media
+.PHONY: test-compat-media

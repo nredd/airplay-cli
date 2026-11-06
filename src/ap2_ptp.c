@@ -39,7 +39,7 @@
 
 #include "../libraop/crosstools/src/platform.h"
 #include "../libraop/crosstools/src/cross_net.h"
-#include "../libraop/src/raop_client.h"
+#include "raop_client.h"
 #include "cross_log.h"
 #include "ap2_ptp.h"
 #include "ap2_ptp_shm.h"

@@ -149,6 +149,16 @@ typedef struct {
     void (*stop)(void *transport);       /* silence the receiver, keep session */
     void (*status)(const char *line);    /* emit one [STATUS] line */
     uint64_t (*warm_head_unix_ms)(void *transport);  /* optional (may be NULL) */
+    /* Optional (may be NULL). Called exactly once per START that is actually
+     * applied: inside ap2_session_start, AFTER the transport commit returned
+     * OK and the session was re-checked for ENDED, immediately after `epoch`
+     * was incremented and PLAYING set, still holding BOTH the caller's quiesce
+     * (send) lock and the session lock, so no end/start can interleave and a
+     * commit followed by ENDED never reports. Never called for a failed or
+     * ended START. It must only store bounded scalars: no session or transport
+     * API call, no lock acquisition, allocation, logging or I/O. The lock order
+     * is send lock -> session lock; never take the send lock from here. */
+    void (*applied)(void *transport, uint64_t epoch);
     void *transport;
 } ap2_session_ops_t;
 

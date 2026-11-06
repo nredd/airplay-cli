@@ -43,7 +43,7 @@
 
 #include "../libraop/crosstools/src/platform.h"
 #include "../libraop/crosstools/src/cross_net.h"
-#include "../libraop/src/raop_client.h"
+#include "raop_client.h"
 #include "alac_wrapper.h"
 #include "cross_util.h"
 #include "cross_log.h"
@@ -384,6 +384,10 @@ struct ap2cl_s {
      * Pending frames never retain userdata or callback function pointers. */
     ap2_media_write_cb media_write_cb;
     void *media_write_ctx;
+    ap2_media_outcome_cb media_outcome_cb;
+    void *media_outcome_ctx;
+    uint32_t media_reg_gen;     /* bumped by every media hook set, never 0 */
+    uint16_t media_setup_port;  /* SETUP dataPort parsed separately, else 0 */
     ap2_media_write_t buffered_write;
     bool buffered_notify;
 
@@ -2306,6 +2310,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
                      p->dev_latency_min, p->dev_latency_max, p->lead_ms);
         }
 
+        p->media_setup_port = remote_data > 0 ? (uint16_t)remote_data : 0;
         if (remote_data > 0) {
             memset(&p->data_addr, 0, sizeof(p->data_addr));
             p->data_addr.sin_family = AF_INET;
@@ -3259,6 +3264,8 @@ static void ap2_raop_session_cleanup(struct ap2cl_s *p)
 {
     ap2_raop_head_reset(p);
     if (p->raopcl) {
+        /* Clear the nested media hook before destruction (idempotent). */
+        raopcl_set_media_outcome_cb(p->raopcl, NULL, NULL);
         raopcl_destroy(p->raopcl);
         p->raopcl = NULL;
     }
@@ -4139,6 +4146,48 @@ void ap2cl_set_media_write_cb(struct ap2cl_s *p, ap2_media_write_cb cb, void *ct
     p->buffered_notify = false;
     p->media_write_cb = cb;
     p->media_write_ctx = cb ? ctx : NULL;
+    if (++p->media_reg_gen == 0) p->media_reg_gen = 1;
+}
+
+void ap2cl_set_media_outcome_cb(struct ap2cl_s *p, ap2_media_outcome_cb cb,
+                                void *ctx)
+{
+    if (!p) return;
+    /* Same caller-owned media serialization as ap2cl_set_media_write_cb. */
+    p->media_outcome_cb = cb;
+    p->media_outcome_ctx = cb ? ctx : NULL;
+    if (++p->media_reg_gen == 0) p->media_reg_gen = 1;
+}
+
+ap2_media_path_t ap2cl_media_path(struct ap2cl_s *p)
+{
+    if (!p) return AP2_MEDIA_PATH_UNKNOWN;
+    if (p->flow == FLOW_NATIVE_AP2)
+        return p->use_buffered ? AP2_MEDIA_PATH_NATIVE_BUFFERED
+                               : AP2_MEDIA_PATH_NATIVE_UDP;
+    return p->raopcl ? AP2_MEDIA_PATH_RAOP_COMPAT : AP2_MEDIA_PATH_UNKNOWN;
+}
+
+uint16_t ap2cl_media_setup_port(struct ap2cl_s *p)
+{
+    if (!p) return 0;
+    if (p->flow == FLOW_NATIVE_AP2) return p->media_setup_port;
+    return p->raopcl ? raopcl_media_setup_port(p->raopcl) : 0;
+}
+
+uint32_t ap2cl_media_registration_generation(struct ap2cl_s *p)
+{
+    if (!p) return 0;
+    if (p->flow == FLOW_NATIVE_AP2) return p->media_reg_gen;
+    return p->raopcl ? raopcl_media_registration_generation(p->raopcl) : 0;
+}
+
+bool ap2cl_set_raop_media_outcome_cb(struct ap2cl_s *p,
+                                     raop_media_outcome_cb cb, void *ctx)
+{
+    if (!p || p->flow == FLOW_NATIVE_AP2 || !p->raopcl) return false;
+    raopcl_set_media_outcome_cb(p->raopcl, cb, ctx);
+    return true;
 }
 
 ap2_send_result_t ap2cl_send_chunk(struct ap2cl_s *p, uint8_t *sample,
@@ -4147,19 +4196,36 @@ ap2_send_result_t ap2cl_send_chunk(struct ap2cl_s *p, uint8_t *sample,
     return ap2cl_send_chunk_tagged(p, sample, frames, AP2_MEDIA_UNKNOWN, 0);
 }
 
+/* One failure outcome per failed native content invocation; a success is
+ * reported by the write hook instead, never both. */
+static void ap2_media_outcome_notify(struct ap2cl_s *p, ap2_send_result_t result,
+                                     ap2_media_origin_t origin, uint64_t tag)
+{
+    if (!p->media_outcome_cb || result == AP2_SEND_SENT) return;
+    p->media_outcome_cb(p->media_outcome_ctx,
+                        result == AP2_SEND_DROPPED ? AP2_MEDIA_OUTCOME_DROPPED
+                                                   : AP2_MEDIA_OUTCOME_FATAL,
+                        origin, tag);
+}
+
 ap2_send_result_t ap2cl_send_chunk_tagged(struct ap2cl_s *p, uint8_t *sample,
                                         int frames, ap2_media_origin_t origin,
                                         uint64_t tag)
 {
     if (!p || p->state != AP2_STREAMING) {
         LOG_ERROR("[AP2] Audio send attempted outside a streaming session");
+        if (p) ap2_media_outcome_notify(p, AP2_SEND_FATAL, origin, tag);
         return AP2_SEND_FATAL;
     }
     if (p->flow == FLOW_NATIVE_AP2) {
-        if (atomic_load(&p->rtsp_dead)) return AP2_SEND_FATAL;
+        if (atomic_load(&p->rtsp_dead)) {
+            ap2_media_outcome_notify(p, AP2_SEND_FATAL, origin, tag);
+            return AP2_SEND_FATAL;
+        }
         ap2_send_result_t result = ap2_native_send_chunk(p, sample, frames, origin, tag);
         if (result == AP2_SEND_FATAL)
             atomic_store(&p->media_healthy, false);
+        ap2_media_outcome_notify(p, result, origin, tag);
         return result;
     }
     if (!p->raopcl) return AP2_SEND_FATAL;

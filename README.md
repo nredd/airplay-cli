@@ -45,8 +45,11 @@ Protocol and architecture detail lives in `DESIGN.md`; open work in `TODO.md`.
 The CLI-local `patches/libraop-media-write-callback.patch` is applied to build-local
 copies after the existing thread-join fix. The pinned submodule and its gitlink
 remain unchanged. Both public `raop_client.h` copies are patched identically;
-compilation uses the generated header. There is no CLI consumer or new status
-output. Native AirPlay 2 has a separate optional hook described below.
+compilation uses the generated header (`ap2_client.c`, `ap2_ptp.c` and
+`cliairplay.c` include that generated `raop_client.h`, not the pinned copy). The
+success callback has no CLI consumer of its own: the optional private receipt
+collector below uses the separate outcome hook the same patch adds. Native
+AirPlay 2 has a separate optional hook described below.
 
 `raopcl_set_media_write_cb(client, callback, ctx)` defaults to NULL. Install before
 media starts. The synchronous callback reports only full successful audio
@@ -153,6 +156,110 @@ and no sanitizer report. Rejected controls print the exit status and at most
 remains in `build/tests/ap2-media-red.log`.
 Both targets run under the unchanged normal and Linux sanitizer `make test`
 gates; architecture CI gates remain unchanged.
+
+## Optional private media-write receipt (`--private-media-receipt`)
+
+Disabled by default: without the flag no hook is registered, no applied-epoch
+observer is installed, ordinary stdout stays blocking and nothing is emitted.
+With it, one fixed collector (`src/media_receipt.c`, no allocation or I/O from
+callbacks, saturating `uint32` counters) counts full sender-side datagram writes
+for **one** STOP-terminated applied session epoch and emits one closed record on
+stdout at the very end of the process. It is a source-level mechanism for a
+private owned child, not a binary adoption, a deployment or audio acceptance.
+
+What a record is, and is not:
+
+- Kernel write acceptance by this process for the serialized qualifying writes
+  after the *actually applied* START (`ap2_session_ops_t::applied`, called inside
+  `ap2_session_start` after the epoch increments and PLAYING is set, under the
+  existing send and session locks, never for a failed or ended START) and before
+  the STOP freeze (taken under the send lock BEFORE the transport is stopped).
+  It is not egress, delivery, receiver playback or independent-observer
+  evidence. `fault=false` means coverage was installed throughout and no unknown
+  or error outcome was seen, not network losslessness.
+- Child-reported scalars from the same trusted child, no crypto and no
+  caller-token echo. The destination is the actual `sendto` address (copied in
+  the callback) and must equal the SETUP media port, parsed separately
+  (`raopcl_media_setup_port`, `ap2cl_media_setup_port`), plus a single stored
+  IPv4 address. The parent still compares the address to its own admitted target.
+
+Coverage and accounting (each path is a real call path, not a test-only hook):
+
+- Legacy RAOP and the nested client of the AirPlay 2 RAOP-compatible flow use a
+  separate RAOP *outcome* hook (`raopcl_set_media_outcome_cb`) next to the
+  unchanged success hook. Every audio attempt, fresh or backlog, yields exactly
+  one outcome: `SENT`, `NOT_READY`, `SELECT_ERROR`, `SEND_ERROR` or `UNAVAILABLE`.
+  A select error is reported even when the legacy path still sent, and is never
+  a qualifying write. Legacy send behavior and return values are unchanged.
+  `ap2cl_set_raop_media_outcome_cb` bridges the nested client and is cleared in
+  `ap2_raop_session_cleanup` before the nested destroy.
+- Native realtime UDP keeps the success hook and adds `ap2cl_set_media_outcome_cb`
+  for `DROPPED` and `FATAL` (state, sync, encode, encrypt, allocation or send).
+  Each content invocation yields one full-write event or one failure outcome.
+  `ap2cl_send_chunk_tagged` carries an explicit `FRESH` (tag = applied epoch) or
+  `IDLE` origin; `BACKLOG` and `IDLE` units are counted separately, never fresh.
+- Actual buffered TCP is explicitly **unsupported**: nothing is registered, the
+  record reports `route=buffered` and `fault=true`, transport behavior is
+  unchanged. A parked frame is never counted (`audio_packets_sent` advances at
+  queue time); supporting it needs a separate design for queue-time generation
+  and every completion/discard path.
+- One lifecycle: WAIT -> ACTIVE (epoch 1) -> FROZEN. A second applied START, an
+  unknown origin or destination, a second destination, a port mismatch, a
+  registration change (`*_media_registration_generation`, bumped by every hook
+  set) or counter saturation sets a sticky fault. After the freeze a sticky
+  terminal-invalid latches on any START (successful or failed, even one already
+  buffered behind STOP), FLUSH/STANDBY/PAUSE/PLAY/DISCONNECT/ANNOUNCE, a second
+  STOP, a missing client, a changed registration, a signal, a failed playback
+  loop or a session ended without STOP. The owner's one explicit unregister after
+  the command thread joins is normal and only in that teardown phase.
+
+The record is written exactly once, from `main`, after the command thread
+joined, the callbacks were cleared and `ap2cl_destroy`/`raopcl_destroy` returned.
+That also joins the AirPlay 2 feedback worker, the only thread that can reach
+`remote_command_event`, so no other stdout writer exists. In order: stdout must
+be a pipe with `PIPE_BUF >= 512`; `O_NONBLOCK` is set (after `F_GETFL`) BEFORE
+any flush; one `fflush(stdout)` must succeed with no stream error; the record is
+formatted into a fixed 512-byte buffer; one `write(2)` with no retry for `EINTR`,
+`EAGAIN` or a partial write. Any failure omits the record and never waits; the
+pipe stays non-blocking. This is not a wall-clock deadline: scheduling, STOP and
+transport teardown, destructor joins and stdio internals can all be late, so a
+consumer must validate EOF against its own drain/observe deadlines and treat a
+late or missing record as incomplete.
+
+```
+@MEDIA1 {"v":1,"terminal":"stop","route":"raop","epoch":1,"fresh_units":1,"fresh_bytes":128,"idle_units":0,"backlog_units":0,"fault":false,"overflow":false,"addr":"192.0.2.10","port":6001,"setup_port":6001}
+```
+
+One ASCII line, at most 512 bytes including prefix and LF, fixed key order, no
+other `@MEDIA` lines, never on stderr. `terminal` is `stop|abnormal` (only `stop`
+qualifies); `route` is `raop|compat|udp|buffered|unknown`; `epoch` is 0 or 1;
+counts and bytes include the RTP header; `addr` is null with no fresh unit. A
+post-freeze invalidation, signal or failure is merged into `fault`. The endpoint
+is private: keep it out of logs, public text and fixtures (tests use
+documentation addresses only).
+
+Tests use production code paths with owned loopback sockets, no receiver:
+
+- `make test-raop-media test-raop-media-red STATIC=1`: the patched libraop
+  outcome matrix (fresh/backlog, negative/short/EINTR send, nonready, select
+  error with a still-successful send, unavailable), exactly one per attempt,
+  setup-port parsing and the generation counter.
+- `make test-ap2-media STATIC=1`: native UDP drop/fatal/encode/state failures
+  with one-event-per-invocation, the real collector adapters, freeze, port
+  binding, and buffered TCP never counted.
+- `make test-compat-media STATIC=1`: the real nested client through the
+  `ap2cl` bridge (fresh, backlog, select error, re-registration, cleanup clear).
+- `make test-media-receipt test-media-receipt-red STATIC=1`: state machine,
+  exact record, and the emitter against real pipes (including a full pipe, a
+  `fcntl`/flush failure and `EINTR`/partial/`EAGAIN` writes); the red target
+  swaps in a success-only observer and must fail the select-error assertion.
+- `make test-cli-media-receipt STATIC=1`: the production `cliairplay.c` command
+  path with the real session engine: applied epoch, STOP freeze before the
+  transport stop, post-freeze START success and failure, registration changes,
+  one final line after a real stdout writer thread was joined, and a control
+  where an unjoined writer blocks the emitter.
+- `tests/test_ap2_session.c` covers the applied observer (failed commit, commit
+  then ENDED, second START, send lock held).
 
 ## Usage
 
@@ -357,6 +464,12 @@ cliairplay [options] --cmdpipe <path> <host_ip>
 | `--ptp-shared` | Prefer the shared PTP daemon clock (multi-room): attach the daemon's shm instead of running an engine; fall back to the in-process engine when no daemon is live. Picks the clock *source*, not the timing mode — pair it with `--ptp` or a `--txt` advertising SupportsPTP. |
 | `CLIAIRPLAY_PTP_FOLLOW=0\|1` (env) | Override for following a receiver's **own** PTP clock instead of serving it ours. Default: auto — a standalone HomePod on HomePod OS 27+ (`model=AudioAccessory*`, `igl=1`, no `pgid`, no `tsid`, `osvers`>=27) is followed, because it keeps announcing its own grandmaster for the whole session and never renders audio anchored to the sender's timeline; every other receiver is served our grandmaster as before. `0` never follows (kill switch), `1` follows every receiver. Per receiver: the engine (or the `--ptp-daemon`) stays grandmaster for the other peers, so mixed multi-room keeps working. |
 | `CLIAIRPLAY_PTP_STRICT_PEERS=1` (private trial env) | On context creation, admit PTP receive-side effects only from the current registered timing peers: Delay/Pdelay replies, exchange accounting, BMCA, followed-clock dispatch and unicast grants. Exact `1` enables it; unset or every other value preserves ordinary PTP behavior. `SETPEERS` and daemon registration updates are serialized with admission, so a peer retired before admission cannot act. The `--ptp-daemon` ready line attests the effective value as `strict-peers=on` or `strict-peers=off` so a supervisor can verify the gate is live rather than trust the environment it passed. This filters source IPv4 addresses, not cryptographic identities, and does not prevent IP spoofing or isolate discovery or other lifecycle traffic. Admission is not draining: a previously admitted packet may finish after removal returns. Keep it off outside the private trial. See `DESIGN.md` for boundaries and offline regression coverage. |
+
+### Private diagnostics
+
+| Option | Description |
+|--------|-------------|
+| `--private-media-receipt` | Enable the private bounded media-write receipt collector and its single terminal `@MEDIA1` stdout record (default off). See [Optional private media-write receipt](#optional-private-media-write-receipt---private-media-receipt). |
 
 ### Utility / daemon modes
 

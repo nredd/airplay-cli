@@ -19,6 +19,7 @@ ssize_t media_test_send(int, const void *, size_t, int);
 #define send media_test_send
 #include "../src/ap2_client.c"
 #undef send
+#include "../src/media_receipt.h"
 
 /* Assertions must remain active even though production objects use NDEBUG. */
 #define CHECK(expr) do { if (!(expr)) { \
@@ -410,6 +411,203 @@ static void test_tcp(bool false_counter_claim)
     puts("native media TCP production final-byte, attribution and discard paths passed");
 }
 
+/* Native UDP failure outcomes and the real collector adapters, through the
+ * production send path. Each content invocation produces exactly ONE of: a
+ * full-write event or a failure outcome. */
+typedef struct {
+    unsigned writes, failures, dropped, fatal;
+} tally_t;
+
+static void tally_write(void *ctx, const ap2_media_write_t *write)
+{
+    (void)write;
+    ((tally_t *)ctx)->writes++;
+}
+
+static void tally_outcome(void *ctx, ap2_media_outcome_t outcome,
+                          ap2_media_origin_t origin, uint64_t tag)
+{
+    (void)origin;
+    (void)tag;
+    tally_t *t = ctx;
+    t->failures++;
+    if (outcome == AP2_MEDIA_OUTCOME_DROPPED) t->dropped++;
+    if (outcome == AP2_MEDIA_OUTCOME_FATAL) t->fatal++;
+}
+
+static void test_native_outcomes(void)
+{
+    struct sockaddr_in peer;
+    int sink = loopback_socket(SOCK_DGRAM, &peer);
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    CHECK(fd >= 0);
+    struct ap2cl_s *p = client(false, fd, peer);
+    reset_hooks(fd);
+    CHECK(ap2cl_media_path(p) == AP2_MEDIA_PATH_NATIVE_UDP);
+    CHECK(ap2cl_media_registration_generation(p) == 0);
+    CHECK(ap2cl_media_setup_port(p) == 0); /* the fixture never parsed SETUP */
+    p->media_setup_port = ntohs(peer.sin_port);
+    CHECK(ap2cl_media_setup_port(p) == ntohs(peer.sin_port));
+
+    tally_t t = {0};
+    CHECK(!p->media_outcome_cb);
+    CHECK(push(p, AP2_MEDIA_FRESH, 1) == AP2_SEND_SENT); /* default off */
+    read_unit(sink, false);
+    ap2cl_set_media_write_cb(p, tally_write, &t);
+    CHECK(ap2cl_media_registration_generation(p) == 1);
+    ap2cl_set_media_outcome_cb(p, tally_outcome, &t);
+    CHECK(ap2cl_media_registration_generation(p) == 2);
+
+    unsigned pushes = 0;
+#define EXPECT_ONE(result, writes_, failures_, dropped_, fatal_) do { \
+        CHECK(push(p, AP2_MEDIA_FRESH, 1) == (result)); pushes++; \
+        CHECK(t.writes == (writes_) && t.failures == (failures_)); \
+        CHECK(t.dropped == (dropped_) && t.fatal == (fatal_)); \
+        CHECK(t.writes + t.failures == pushes); \
+    } while (0)
+    EXPECT_ONE(AP2_SEND_SENT, 1, 0, 0, 0);
+    read_unit(sink, false);
+    error_once = EINTR; /* retried inside the IO layer: not a drop */
+    EXPECT_ONE(AP2_SEND_SENT, 2, 0, 0, 0);
+    read_unit(sink, false);
+    persistent_error = EAGAIN;
+    poll_timeout = true;
+    EXPECT_ONE(AP2_SEND_DROPPED, 2, 1, 1, 0);
+    reset_hooks(fd);
+    short_udp = true;
+    EXPECT_ONE(AP2_SEND_FATAL, 2, 2, 1, 1);
+    reset_hooks(fd);
+    persistent_error = EIO;
+    EXPECT_ONE(AP2_SEND_FATAL, 2, 3, 1, 2);
+    reset_hooks(fd);
+    /* Caller-side failures before any send: encoder, key, state, socket. */
+    void *alac = p->alac;
+    p->alac = NULL;
+    EXPECT_ONE(AP2_SEND_FATAL, 2, 4, 1, 3);
+    p->alac = alac;
+    void *hap = p->hap;
+    p->hap = NULL;
+    EXPECT_ONE(AP2_SEND_FATAL, 2, 5, 1, 4);
+    p->hap = hap;
+    atomic_store(&p->rtsp_dead, true);
+    EXPECT_ONE(AP2_SEND_FATAL, 2, 6, 1, 5);
+    atomic_store(&p->rtsp_dead, false);
+    p->state = AP2_CONNECTED;
+    EXPECT_ONE(AP2_SEND_FATAL, 2, 7, 1, 6);
+    p->state = AP2_STREAMING;
+    EXPECT_ONE(AP2_SEND_SENT, 3, 7, 1, 6);
+    read_unit(sink, false);
+
+    /* Clearing is an explicit registration change. */
+    uint32_t generation = ap2cl_media_registration_generation(p);
+    ap2cl_set_media_outcome_cb(p, NULL, &t);
+    CHECK(!p->media_outcome_cb && !p->media_outcome_ctx);
+    CHECK(ap2cl_media_registration_generation(p) == generation + 1);
+    persistent_error = EIO;
+    CHECK(push(p, AP2_MEDIA_FRESH, 1) == AP2_SEND_FATAL);
+    CHECK(t.failures == 7);
+    reset_hooks(fd);
+    ap2cl_set_media_write_cb(p, NULL, NULL);
+
+    /* Real collector through the same production path. */
+    media_receipt_t mr;
+    mr_init(&mr, true);
+    mr_configure(&mr, MR_ROUTE_UDP, ap2cl_media_setup_port(p), 3);
+    ap2cl_set_media_write_cb(p, mr_ap2_write_cb, &mr);
+    ap2cl_set_media_outcome_cb(p, mr_ap2_outcome_cb, &mr);
+    CHECK(!mr.fault);
+    /* Before the applied transition only silence is expected. */
+    CHECK(push(p, AP2_MEDIA_IDLE, 0) == AP2_SEND_SENT);
+    size_t unit = read_unit(sink, false);
+    CHECK(!mr.fault && mr.fresh_units == 0 && mr.idle_units == 0);
+    mr_applied(&mr, 1);
+    CHECK(push(p, AP2_MEDIA_FRESH, mr_current_epoch(&mr)) == AP2_SEND_SENT);
+    CHECK(read_unit(sink, false) == unit);
+    CHECK(push(p, AP2_MEDIA_IDLE, 0) == AP2_SEND_SENT);
+    read_unit(sink, false);
+    CHECK(push(p, AP2_MEDIA_BACKLOG, 0) == AP2_SEND_SENT);
+    read_unit(sink, false);
+    CHECK(mr.fresh_units == 1 && mr.fresh_bytes == unit);
+    CHECK(mr.idle_units == 1 && mr.backlog_units == 1 && !mr.fault);
+    CHECK(mr.dest.sin_addr.s_addr == peer.sin_addr.s_addr);
+    CHECK(mr.dest.sin_port == peer.sin_port);
+    /* A stale tag (old epoch) is not a fresh unit. */
+    CHECK(push(p, AP2_MEDIA_FRESH, 7) == AP2_SEND_SENT);
+    read_unit(sink, false);
+    CHECK(mr.fault && mr.fresh_units == 1);
+    mr_init(&mr, true);
+    mr_configure(&mr, MR_ROUTE_UDP, ap2cl_media_setup_port(p), 3);
+    mr_applied(&mr, 1);
+    /* A drop while ACTIVE is a fault, never a count. */
+    persistent_error = EAGAIN;
+    poll_timeout = true;
+    CHECK(push(p, AP2_MEDIA_FRESH, 1) == AP2_SEND_DROPPED);
+    CHECK(mr.fault && mr.fresh_units == 0);
+    reset_hooks(fd);
+    /* Frozen: later writes and failures never enter the counts. */
+    mr_init(&mr, true);
+    mr_configure(&mr, MR_ROUTE_UDP, ap2cl_media_setup_port(p), 3);
+    mr_applied(&mr, 1);
+    CHECK(push(p, AP2_MEDIA_FRESH, 1) == AP2_SEND_SENT);
+    read_unit(sink, false);
+    mr_freeze_for_stop(&mr, 3);
+    CHECK(push(p, AP2_MEDIA_FRESH, 1) == AP2_SEND_SENT);
+    read_unit(sink, false);
+    persistent_error = EIO;
+    CHECK(push(p, AP2_MEDIA_FRESH, 1) == AP2_SEND_FATAL);
+    reset_hooks(fd);
+    CHECK(mr.fresh_units == 1 && !mr.fault);
+    /* SETUP port mismatch against the actual send address is a fault. */
+    mr_init(&mr, true);
+    mr_configure(&mr, MR_ROUTE_UDP, (uint16_t)(ntohs(peer.sin_port) + 1), 3);
+    mr_applied(&mr, 1);
+    CHECK(push(p, AP2_MEDIA_FRESH, 1) == AP2_SEND_SENT);
+    read_unit(sink, false);
+    CHECK(mr.fault && mr.fresh_units == 0);
+    ap2cl_set_media_write_cb(p, NULL, NULL);
+    ap2cl_set_media_outcome_cb(p, NULL, NULL);
+#undef EXPECT_ONE
+    CHECK(ap2cl_destroy(p));
+    CHECK(close(sink) == 0);
+    puts("native media outcomes: one per invocation, drop/fatal/encode, collector adapters, freeze, port binding");
+}
+
+/* Buffered TCP is explicitly unsupported: a queued parked frame never counts. */
+static void test_buffered_is_unsupported(void)
+{
+    struct sockaddr_in peer;
+    int sink;
+    int fd = tcp_pair(&sink, &peer);
+    struct ap2cl_s *p = client(true, fd, peer);
+    reset_hooks(fd);
+    CHECK(ap2cl_media_path(p) == AP2_MEDIA_PATH_NATIVE_BUFFERED);
+    media_receipt_t mr;
+    mr_init(&mr, true);
+    mr_configure(&mr, MR_ROUTE_BUFFERED, 7000, 1);
+    CHECK(mr.fault && mr.route == MR_ROUTE_BUFFERED);
+    mr_applied(&mr, 1);
+    ap2cl_set_media_write_cb(p, mr_ap2_write_cb, &mr);
+    ap2cl_set_media_outcome_cb(p, mr_ap2_outcome_cb, &mr);
+    /* The old cumulative counter advances for a parked tail; the collector
+     * counts nothing, and the late completion is never a fresh unit. */
+    park_partial(p, 1);
+    CHECK(p->audio_packets_sent == 1 && mr.fresh_units == 0);
+    reset_hooks(fd);
+    ap2cl_accept_frames(p);
+    read_unit(sink, true);
+    CHECK(mr.fresh_units == 0 && mr.backlog_units == 0 && mr.fault);
+    char line[MEDIA_RECEIPT_MAX_LINE];
+    mr_freeze_for_stop(&mr, 0);
+    CHECK(mr_format(&mr, true, line, sizeof(line)) > 0);
+    CHECK(strstr(line, "\"route\":\"buffered\"") && strstr(line, "\"fault\":true"));
+    CHECK(strstr(line, "\"fresh_units\":0"));
+    ap2cl_set_media_write_cb(p, NULL, NULL);
+    ap2cl_set_media_outcome_cb(p, NULL, NULL);
+    CHECK(ap2cl_destroy(p));
+    CHECK(close(sink) == 0);
+    puts("native media buffered TCP: unsupported, never counted fresh, record incomplete");
+}
+
 /* Existing external serialization, not a new library lock: clear waits for an
  * in-flight callback because setter and sender take the same caller mutex. */
 static pthread_mutex_t media_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -532,6 +730,8 @@ int main(int argc, char **argv)
     bool false_counter_claim = argc == 2 &&
         strcmp(argv[1], "--counter-is-completion") == 0;
     test_udp();
+    test_native_outcomes();
+    test_buffered_is_unsupported();
     test_tcp(false_counter_claim);
     test_real_backpressure();
     test_lifetime();

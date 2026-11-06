@@ -601,8 +601,140 @@ static void test_flush_ack_carries_warm_head(void)
     assert(close(input[1]) == 0);
 }
 
+/* Applied-epoch observer: reports only an ACTUALLY applied START, under the
+ * caller's quiesce (send) lock, never for a failed or ended one. */
+typedef struct {
+    pthread_mutex_t send_lock;
+    struct ap2_session_s *session;
+    ap2_commit_result_t commit_result;
+    bool end_during_commit;
+    unsigned applied_calls;
+    uint64_t applied_epoch[4];
+    bool send_lock_held_in_applied;
+} applied_state_t;
+
+static void applied_quiesce(void *transport)
+{
+    pthread_mutex_lock(&((applied_state_t *)transport)->send_lock);
+}
+
+static void applied_resume(void *transport)
+{
+    pthread_mutex_unlock(&((applied_state_t *)transport)->send_lock);
+}
+
+static bool applied_flush(void *transport)
+{
+    (void)transport;
+    return true;
+}
+
+static ap2_commit_result_t applied_commit(void *transport,
+                                          uint64_t start_unix_ms,
+                                          uint64_t *at_unix_ms)
+{
+    applied_state_t *state = transport;
+    if (at_unix_ms) *at_unix_ms = start_unix_ms;
+    /* A DISCONNECT landing between a successful transport commit and the
+     * session's re-check: the START must fail and never report. */
+    if (state->end_during_commit) ap2_session_end(state->session);
+    return state->commit_result;
+}
+
+static void applied_cb(void *transport, uint64_t epoch)
+{
+    applied_state_t *state = transport;
+    /* The quiesce lock is held by the START: a trylock must fail. */
+    if (pthread_mutex_trylock(&state->send_lock) == 0) {
+        pthread_mutex_unlock(&state->send_lock);
+    } else {
+        state->send_lock_held_in_applied = true;
+    }
+    if (state->applied_calls < 4) state->applied_epoch[state->applied_calls] = epoch;
+    state->applied_calls++;
+}
+
+static void applied_stop(void *transport) { (void)transport; }
+static void applied_status(const char *line) { (void)line; }
+
+static struct ap2_session_s *applied_session(applied_state_t *state,
+                                             bool with_callback, int *write_fd)
+{
+    memset(state, 0, sizeof(*state));
+    pthread_mutex_init(&state->send_lock, NULL);
+    state->commit_result = AP2_COMMIT_OK;
+    ap2_session_ops_t ops = {
+        .quiesce = applied_quiesce,
+        .flush = applied_flush,
+        .commit = applied_commit,
+        .resume = applied_resume,
+        .stop = applied_stop,
+        .status = applied_status,
+        .applied = with_callback ? applied_cb : NULL,
+        .transport = state,
+    };
+    int input[2];
+    assert(pipe(input) == 0);
+    state->session = ap2_session_create(&ops, 1000, 1, 0, input[0]);
+    assert(state->session);
+    assert(close(input[0]) == 0);
+    *write_fd = input[1];
+    return state->session;
+}
+
+static void test_applied_reports_only_applied_starts(void)
+{
+    applied_state_t state;
+    int fd;
+    struct ap2_session_s *s = applied_session(&state, true, &fd);
+    uint64_t at = 0;
+
+    /* A failed commit never reports and does not advance the epoch. */
+    state.commit_result = AP2_COMMIT_FAILED;
+    assert(ap2_session_start(s, 1, &at) == AP2_COMMIT_FAILED);
+    assert(state.applied_calls == 0 && ap2_session_epoch(s) == 0);
+
+    /* Success reports the new epoch exactly once, under the send lock. */
+    state.commit_result = AP2_COMMIT_OK;
+    assert(ap2_session_start(s, 1, &at) == AP2_COMMIT_OK);
+    assert(state.applied_calls == 1 && state.applied_epoch[0] == 1);
+    assert(state.send_lock_held_in_applied);
+    assert(ap2_session_state(s) == AP2_SESSION_PLAYING);
+
+    /* A second START is a distinct applied epoch, so a one-start consumer can
+     * detect it. */
+    assert(ap2_session_start(s, 1, &at) == AP2_COMMIT_OK);
+    assert(state.applied_calls == 2 && state.applied_epoch[1] == 2);
+
+    /* Ended session: refused before the transport is touched, never reports. */
+    ap2_session_end(s);
+    assert(ap2_session_start(s, 1, &at) == AP2_COMMIT_FAILED);
+    assert(state.applied_calls == 2);
+    ap2_session_destroy(s);
+    assert(close(fd) == 0);
+
+    /* Successful commit followed by ENDED: a failed START that must never
+     * activate a receipt epoch. */
+    s = applied_session(&state, true, &fd);
+    state.end_during_commit = true;
+    assert(ap2_session_start(s, 1, &at) == AP2_COMMIT_FAILED);
+    assert(state.applied_calls == 0 && ap2_session_epoch(s) == 0);
+    assert(ap2_session_state(s) == AP2_SESSION_ENDED);
+    ap2_session_destroy(s);
+    assert(close(fd) == 0);
+
+    /* Optional: no observer is the unchanged default. */
+    s = applied_session(&state, false, &fd);
+    assert(ap2_session_start(s, 1, &at) == AP2_COMMIT_OK);
+    assert(state.applied_calls == 0 && ap2_session_epoch(s) == 1);
+    ap2_session_destroy(s);
+    assert(close(fd) == 0);
+    pthread_mutex_destroy(&state.send_lock);
+}
+
 int main(void)
 {
+    test_applied_reports_only_applied_starts();
     test_start_streams_the_input();
     test_flush_ack_carries_warm_head();
     test_ready_and_reads_wait_for_a_complete_packet();

@@ -241,6 +241,31 @@ authority. The engine (`ap2_ptp.c`) implements:
   from the SETPEERS timing-peer list — i.e. us — so giving up the timeline
   mutes them. The BMCA/slave path remains for diagnostics and the synthetic
   harness.
+- **Private strict-peer trial** — only when context-creation environment
+  `CLIAIRPLAY_PTP_STRICT_PEERS` is exactly `1`, receive-side effects are
+  admitted solely from the live `SETPEERS`/daemon registration set. This gates
+  Delay/Pdelay response, exchange accounting, Announce/BMCA, followed-clock
+  processing and Signaling grants before dispatch. Membership testing shares
+  the peer-set lock with replacement/removal, so retirement before admission
+  wins. Admission is the linearization point, not a drain: a packet admitted
+  before concurrent removal may finish its effects after removal returns.
+  Membership compares the received source IPv4 address, not a claimed clock
+  identity; it is not cryptographic authentication or protection from IP
+  spoofing. It is deliberately default-off: ordinary PTP can legitimately
+  observe a shared grandmaster outside a session receiver list. It does not
+  isolate discovery, other lifecycle traffic or the local control channel.
+  The ready line reads the effective policy from the same initialized context.
+
+  `tests/test_ap2_ptp_policy.c` exercises the actual receive dispatcher through
+  inert socket/thread boundaries: all six dispatch families, followed-clock
+  processing, empty/registered/removed/mismatching membership and strict/default
+  behavior (72 cases), daemon peer refcounts, exact environment values and
+  in-process initial membership. It captures the actual production logger's
+  daemon-ready output for both policies, including an environment change after
+  engine initialization. These are emitted protocol-field assertions, not an
+  implementation or integration test of a downstream provider parser. The
+  fixture starts no daemon or network service and does not prove receiver clock
+  lock or audio readiness.
 
 ## 5. Shared clock daemon (multi-room)
 

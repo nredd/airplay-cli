@@ -87,7 +87,6 @@ static unsigned tagged_calls;
 static bool destroy_result = true;
 static void (*destroy_hook)(void);
 static unsigned destroy_calls;
-static bool real_destroy(struct ap2cl_s *p); /* the unrenamed production call */
 static bool use_real_destroy;
 
 static bool emulate_nested_raop;

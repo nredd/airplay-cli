@@ -5775,6 +5775,13 @@ void ap2cl_test_set_mrp(struct ap2cl_s *p, struct ap2_mrp_ctx *m)
     pthread_mutex_unlock(&p->mrp_lock);
 }
 
+/* Start the production feedback worker (the one thread that drives MRP remote
+ * commands into the CLI's stdout writer) without a paired session. */
+bool ap2cl_test_start_feedback(struct ap2cl_s *p)
+{
+    return ap2_feedback_start(p);
+}
+
 void ap2cl_test_lock_mrp(struct ap2cl_s *p)
 {
     pthread_mutex_lock(&p->mrp_lock);

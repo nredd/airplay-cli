@@ -215,6 +215,15 @@ CROSS_NET_PATCHED = build/patched/cross_net.c
 CROSS_LOG_PATCH = patches/libraop-logtime-bounds.patch
 CROSS_LOG_PATCHED = build/patched/cross_log.c
 
+# The waiver in .gitattributes covers only unified-diff context encoding; an
+# ADDED source line with trailing whitespace is still a real defect.
+check-patch-whitespace:
+	@if grep -nE '^\+.*[[:space:]]+$$' patches/*.patch; then \
+		echo "trailing whitespace on an added patch line"; exit 1; fi
+
+test: check-patch-whitespace
+.PHONY: check-patch-whitespace
+
 all: directory $(EXECUTABLE)
 
 # libraop's raopcl_get_ntp reads crosstools' gettime_us. Rename crosstools'
@@ -420,7 +429,7 @@ $(TIMELINE_TEST): tests/test_ap2_timeline.c src/ap2_timeline.h Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(TEST_CFLAGS) -Isrc $< $(EXTRA_LDFLAGS) -o $@
 
-$(EVENT_TEST): tests/test_ap2_event.c $(BUILDDIR)/ap2_mrp.o \
+$(EVENT_TEST): tests/test_ap2_event.c tests/mrp_event_fixture.h $(BUILDDIR)/ap2_mrp.o \
 		$(BUILDDIR)/ap2_io.o $(BUILDDIR)/ap2_plist.o \
 		$(BUILDDIR)/ap2_bplist.o $(BUILDDIR)/bplist.o \
 		$(BUILDDIR)/cross_log.o Makefile
@@ -672,12 +681,17 @@ test: test-media-receipt test-media-receipt-red
 .PHONY: test-media-receipt test-media-receipt-red
 
 CLI_MEDIA_RECEIPT_TEST = build/tests/test_cli_media_receipt
+# The AP2_TESTING ap2_client.o carries the hook that starts the production
+# feedback worker, which the real-worker teardown cases need.
 $(CLI_MEDIA_RECEIPT_TEST): tests/test_cli_media_receipt.c src/cliairplay.c \
-		$(filter-out $(BUILDDIR)/cliairplay.o,$(OBJECTS_ALL)) $(LIBCODECS_PATCHED) Makefile
+		tests/mrp_event_fixture.h build/tests/ap2_client.o \
+		$(filter-out $(BUILDDIR)/cliairplay.o $(BUILDDIR)/ap2_client.o,$(OBJECTS_ALL)) \
+		$(LIBCODECS_PATCHED) Makefile
 	@mkdir -p build/tests
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o build/tests/test_cli_media_receipt.o
-	$(CXX) build/tests/test_cli_media_receipt.o \
-		$(filter-out $(BUILDDIR)/cliairplay.o,$(OBJECTS_ALL)) $(LIBRARY) $(LDFLAGS) -o $@
+	$(CXX) build/tests/test_cli_media_receipt.o build/tests/ap2_client.o \
+		$(filter-out $(BUILDDIR)/cliairplay.o $(BUILDDIR)/ap2_client.o,$(OBJECTS_ALL)) \
+		$(LIBRARY) $(LDFLAGS) -o $@
 
 test-cli-media-receipt: directory $(CLI_MEDIA_RECEIPT_TEST)
 	$(CLI_MEDIA_RECEIPT_TEST)
@@ -704,3 +718,19 @@ test-compat-media: directory $(COMPAT_MEDIA_TEST)
 
 test: test-compat-media
 .PHONY: test-compat-media
+
+# The real executable, driven through a real command FIFO, PCM pipe and stdout
+# pipe against an owned loopback RTSP/UDP fixture (legacy RAOP route).
+CLI_REAL_RECEIPT_TEST = build/tests/test_cli_real_receipt
+$(CLI_REAL_RECEIPT_TEST): tests/test_cli_real_receipt.c Makefile
+	@mkdir -p build/tests
+	$(CC) $(TEST_CFLAGS) $< -lpthread -o $@
+
+# Under ThreadSanitizer only, four upstream libraop races (unchanged lines)
+# are suppressed by name; see tests/tsan-libraop-preexisting.supp.
+test-cli-real-receipt: directory $(EXECUTABLE) $(CLI_REAL_RECEIPT_TEST)
+	$(if $(filter thread,$(SANITIZE)),TSAN_OPTIONS=suppressions=tests/tsan-libraop-preexisting.supp:halt_on_error=1) \
+		$(CLI_REAL_RECEIPT_TEST) $(EXECUTABLE)
+
+test: test-cli-real-receipt
+.PHONY: test-cli-real-receipt

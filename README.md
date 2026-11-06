@@ -243,6 +243,16 @@ transport teardown, destructor joins and stdio internals can all be late, so a
 consumer must validate EOF against its own drain/observe deadlines and treat a
 late or missing record as incomplete.
 
+`O_NONBLOCK` is only established at this terminal step; the child's *earlier*
+stdout writes (the `[STATUS] route` line at startup, and on AirPlay 2 the MRP
+status and remote-command lines) are ordinary blocking `printf` + `fflush`. A
+reader that stalls long enough to fill the pipe can therefore hold the child in
+one of those writes before the terminal step is ever reached; the record is then
+missing and the consumer's own deadline and forced containment apply. The legacy
+RAOP route has no stdout writer between the route line and the final.
+`make test-cli-real-receipt` demonstrates both halves against the real binary
+(`early-full-stdout-blocks` is a manual experiment, not in the default run).
+
 ```
 @MEDIA1 {"v":1,"terminal":"stop","route":"raop","epoch":1,"fresh_units":1,"fresh_bytes":128,"idle_units":0,"backlog_units":0,"fault":false,"overflow":false,"addr":"192.0.2.10","port":6001,"setup_port":6001}
 ```
@@ -277,8 +287,21 @@ Tests use production code paths with owned loopback sockets, no receiver:
   under the lock, a stand-in remote-command stdout writer joined by the client
   destroy, then exactly one final line on a real pipe, with a failed destroy and
   a failed result merged, plus a control where an unjoined writer blocks the
-  emitter. These are in-process fake clients and pipes, not a subprocess run
-  against a receiver.
+  emitter. The same sequence also runs with the PRODUCTION feedback worker: a
+  real `ap2cl` whose real worker services a real encrypted MRP event channel
+  and writes through `remote_command_event`, joined by the real `ap2cl_destroy`
+  before exactly one last final line, with a control where skipping the join
+  lets a remote command follow the final. That is the real worker and MRP code
+  on a scripted channel, not a paired AirPlay 2 session.
+- `make test-cli-real-receipt STATIC=1`: the REAL `cliairplay` executable
+  (legacy RAOP route) spawned with a real command FIFO, PCM stdin pipe and
+  stdout pipe against an owned loopback RTSP/UDP fixture: START, PCM, STOP gives
+  one `@MEDIA1` whose unit and byte counts, target and setup port equal what the
+  fixture's UDP socket received; no flag emits nothing; STOP without START never
+  qualifies; a buffered `STOP\nSTART\n` read leaves an invalid record; and a
+  stdout pipe too full for the record lets the child exit without blocking, with
+  the record omitted. Under `SANITIZE=thread` four upstream libraop races on
+  unchanged lines are suppressed by name (`tests/tsan-libraop-preexisting.supp`).
 - `tests/test_ap2_session.c` covers the applied observer (failed commit, commit
   then ENDED, second START, send lock held).
 

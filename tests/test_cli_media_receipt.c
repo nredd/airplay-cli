@@ -36,7 +36,16 @@
 #include "../src/cliairplay.c"
 #undef main
 
+#undef ap2cl_destroy
+bool ap2cl_destroy(struct ap2cl_s *p); /* the header's was renamed above */
+static bool real_destroy(struct ap2cl_s *p) { return ap2cl_destroy(p); }
+
 #include <sched.h>
+#include "mrp_event_fixture.h"
+bool ap2cl_test_start_feedback(struct ap2cl_s *p);
+void ap2cl_test_set_mrp(struct ap2cl_s *p, struct ap2_mrp_ctx *m);
+void ap2cl_test_attach_rtsp_socket(struct ap2cl_s *p, int fd);
+void ap2cl_force_native(struct ap2cl_s *p);
 #define say(text) fprintf(stderr, "%s\n", text)
 #define CHECK(c) do { if (!(c)) { \
     fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #c); exit(1); \
@@ -67,6 +76,8 @@ static unsigned tagged_calls;
 static bool destroy_result = true;
 static void (*destroy_hook)(void);
 static unsigned destroy_calls;
+static bool real_destroy(struct ap2cl_s *p); /* the unrenamed production call */
+static bool use_real_destroy;
 
 ap2_send_result_t test_send_tagged(struct ap2cl_s *p, uint8_t *sample, int frames,
                                    ap2_media_origin_t origin, uint64_t tag)
@@ -86,7 +97,7 @@ bool test_destroy(struct ap2cl_s *p)
     (void)p;
     destroy_calls++;
     if (destroy_hook) destroy_hook();
-    return destroy_result;
+    return use_real_destroy ? real_destroy(p) : destroy_result;
 }
 
 bool test_raopcl_disconnect(struct raopcl_s *p) { (void)p; return true; }
@@ -643,6 +654,180 @@ static void test_unjoined_writer_control(void)
     say("cli receipt: control, emission waits behind an unjoined stdout writer (join required)");
 }
 
+
+/* ---- terminal emission with the PRODUCTION feedback worker ---- */
+
+typedef struct {
+    int fd;                 /* sender end of the encrypted event channel */
+    uint8_t key[KEY_SIZE];
+    atomic_bool run;
+    atomic_uint sent;
+} command_peer_t;
+
+/* A receiver pushing /command remote commands at the real MRP event channel;
+ * its responses are drained unread so neither side can stall. */
+static void *command_peer_main(void *opaque)
+{
+    command_peer_t *peer = opaque;
+    uint64_t counter = 0;
+    uint8_t sink[4096];
+
+    while (atomic_load(&peer->run)) {
+        uint8_t frame[1200];
+        int len = build_command_request(frame, sizeof(frame), peer->key,
+                                        counter, (int)counter + 1, "play");
+        if (write(peer->fd, frame, (size_t)len) != len)
+            break;
+        counter++;
+        atomic_store(&peer->sent, (unsigned)counter);
+        while (recv(peer->fd, sink, sizeof(sink), MSG_DONTWAIT) > 0)
+            ;
+        usleep(2000);
+    }
+    return NULL;
+}
+
+typedef struct {
+    struct ap2cl_s *client;
+    command_peer_t peer;
+    pthread_t peer_thread;
+    int rtsp[2];
+    int events[2];
+} real_feedback_t;
+
+/* A real ap2cl whose real feedback worker services a real MRP context and
+ * writes through the production remote_command_event callback. */
+static void real_feedback_start(real_feedback_t *rf)
+{
+    uint8_t secret[KEY_SIZE];
+    ap2_device_info_t device = { .name = "loopback", .address = "127.0.0.1",
+                                 .port = 7000 };
+    ap2_audio_format_t format = { .sample_rate = 44100, .bit_depth = 16,
+                                  .channels = 2 };
+    for (int i = 0; i < KEY_SIZE; i++) secret[i] = (uint8_t)i;
+    memset(rf, 0, sizeof(*rf));
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, rf->events) == 0);
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, rf->rtsp) == 0);
+    struct ap2_mrp_ctx *mrp = create_mrp_with_callback(
+        secret, rf->events[0], remote_command_event, NULL);
+    rf->client = ap2cl_create(&device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    CHECK(rf->client != NULL);
+    ap2cl_force_native(rf->client);
+    ap2cl_test_set_mrp(rf->client, mrp);
+    ap2cl_set_remote_command_callback(rf->client, remote_command_event, NULL);
+    ap2cl_test_attach_rtsp_socket(rf->client, rf->rtsp[0]);
+    derive_key(secret, "Events-Write-Encryption-Key", rf->peer.key);
+    rf->peer.fd = rf->events[1];
+    atomic_store(&rf->peer.run, true);
+    CHECK(pthread_create(&rf->peer_thread, NULL, command_peer_main, &rf->peer) == 0);
+    CHECK(ap2cl_test_start_feedback(rf->client));
+}
+
+static void real_feedback_peer_stop(real_feedback_t *rf)
+{
+    atomic_store(&rf->peer.run, false);
+    CHECK(pthread_join(rf->peer_thread, NULL) == 0);
+    close(rf->events[1]);
+    close(rf->rtsp[1]);
+}
+
+/* Read stdout until `events` event lines were seen, all into `out`. */
+static unsigned wait_events(char *out, size_t size, unsigned events)
+{
+    size_t used = 0;
+
+    for (int i = 0; i < 400; i++) {
+        used += drain_stdout(out + used, size - used);
+        unsigned seen = 0;
+        for (const char *p = out; (p = strstr(p, "[EVENT] remote command=")); p++)
+            seen++;
+        if (seen >= events)
+            return (unsigned)used;
+        usleep(10 * 1000);
+    }
+    CHECK(0 && "the real feedback worker never delivered the remote commands");
+    return 0;
+}
+
+/* The production end-of-run sequence, STOP landing while the REAL feedback
+ * worker is driving remote commands into the real stdout pipe. The real
+ * ap2cl_destroy joins that worker; only then may the final go out. */
+static void test_real_feedback_teardown(void)
+{
+    char out[65536], tail[65536];
+    real_feedback_t rf;
+    char discard[16384];
+
+    (void)drain_stdout(discard, sizeof(discard));
+    begin_session(true);
+    g_ap2cl = NULL;
+    real_feedback_start(&rf);
+    g_ap2cl = rf.client;
+    mr_install_ap2(rf.client);
+    handle_command("ACTION", "START", &cfg);
+    sender_content(4, AP2_MEDIA_FRESH);
+    unsigned used = wait_events(out, sizeof(out), 5);
+    handle_command("ACTION", "STOP", &cfg);     /* STOP while it writes */
+    real_feedback_peer_stop(&rf);
+    use_real_destroy = true;
+    destroy_calls = 0;
+    cfg.cmdpipe = NULL;
+    CHECK(finish_run(&cfg, 0));
+    use_real_destroy = false;
+    CHECK(destroy_calls == 1 && g_ap2cl == NULL);
+    end_session();
+    used += drain_stdout(tail, sizeof(tail));
+    CHECK(used + 1 < sizeof(out));
+    memcpy(out + (used - strlen(tail)), tail, strlen(tail) + 1);
+    char *last = NULL;
+    unsigned records = 0;
+    unsigned lines = split_lines(out, &last, &records);
+    CHECK(records == 1 && lines >= 6);
+    CHECK(strncmp(last, "@MEDIA1 {", 9) == 0);          /* terminal, whole line */
+    CHECK(strstr(last, "\"terminal\":\"stop\"") && strstr(last, "\"fault\":false"));
+    CHECK(strstr(last, "\"fresh_units\":4,\"fresh_bytes\":4000"));
+    say("cli receipt: real feedback worker writing remote commands joined by the real ap2cl_destroy, then exactly one final line, last");
+}
+
+/* Control: the same real worker, but the join is skipped (the final goes out
+ * while the worker is alive). A remote command then follows the final, which is
+ * what the real destroy-then-emit order prevents. */
+static void test_real_feedback_unjoined_control(void)
+{
+    char out[65536];
+    real_feedback_t rf;
+    char discard[16384];
+
+    (void)drain_stdout(discard, sizeof(discard));
+    begin_session(true);
+    g_ap2cl = NULL;
+    real_feedback_start(&rf);
+    g_ap2cl = rf.client;
+    mr_install_ap2(rf.client);
+    handle_command("ACTION", "START", &cfg);
+    sender_content(1, AP2_MEDIA_FRESH);
+    handle_command("ACTION", "STOP", &cfg);
+    mr_teardown(rf.client, NULL);
+    CHECK(mr_emit(&g_mr, true, stdout));        /* worker still running */
+    size_t used = 0;
+    bool event_after_final = false;
+    for (int i = 0; i < 300 && !event_after_final; i++) {
+        used += drain_stdout(out + used, sizeof(out) - used);
+        const char *record = strstr(out, "@MEDIA1 ");
+        const char *nl = record ? strchr(record, '\n') : NULL;
+        event_after_final = nl && strstr(nl, "[EVENT] remote command=");
+        usleep(10 * 1000);
+    }
+    real_feedback_peer_stop(&rf);
+    use_real_destroy = true;
+    g_ap2cl = NULL;
+    CHECK(real_destroy(rf.client));
+    use_real_destroy = false;
+    end_session();
+    CHECK(event_after_final);
+    say("cli receipt: control, with the real worker not joined a remote command follows the final");
+}
+
 int main(void)
 {
     alarm(60);
@@ -669,6 +854,8 @@ int main(void)
     test_silence_origin();
     test_final_after_writers_joined();
     test_unjoined_writer_control();
+    test_real_feedback_teardown();
+    test_real_feedback_unjoined_control();
     free(fake_client);
     say("CLI media receipt tests passed");
     return 0;

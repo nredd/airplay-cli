@@ -1,2 +1,6 @@
-# Patch files carry their context lines verbatim, including leading-space-tab.
-*.patch -whitespace
+# Unified-diff encoding, not source whitespace: every context line of a patch
+# gets a leading space, so tab-indented C context reads as space-before-tab and
+# a blank context line is a lone space. Waived for this ONE file and only for
+# those two checks; added (`+`) lines are verified separately by
+# `make check-patch-whitespace`. Everything else keeps the default checks.
+patches/libraop-media-write-callback.patch whitespace=-space-before-tab,-blank-at-eol

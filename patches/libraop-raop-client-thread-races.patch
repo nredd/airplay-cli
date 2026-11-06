@@ -8,7 +8,7 @@
  #include <time.h>
  #include <stdlib.h>
  #include <limits.h>
-@@ -130,7 +131,7 @@
+@@ -130,7 +131,7 @@ typedef struct {
  typedef struct raopcl_s {
  	struct rtspcl_s *rtspcl;
  	raop_state_t state;
@@ -17,7 +17,7 @@
  	char DACP_id[17], active_remote[11];
  	struct {
  		unsigned int ctrl, time;
-@@ -173,7 +174,8 @@
+@@ -173,7 +174,8 @@ typedef struct raopcl_s {
  	uint32_t media_reg_gen;
  	// SETUP server_port parsed separately and strictly, 0 when absent/invalid
  	uint16_t media_setup_port;
@@ -27,30 +27,45 @@
  	int sample_rate, sample_size, channels;
  	raop_codec_t codec;
  	struct alac_codec_s *alac_codec;
-@@ -1353,9 +1355,6 @@
- 	addr.sin_family = AF_INET;
+@@ -288,8 +290,12 @@ bool raopcl_is_playing(struct raopcl_s *p)
+ 
+ 	if (!p) return false;
+ 
+-	if (p->pause_ts || now_ts < p->head_ts + raopcl_latency(p)) return true;
+-	else return false;
++	// pause_ts/head_ts/latency_frames are written under the mutex by the sender
++	// and the command thread; read them under it as well
++	pthread_mutex_lock(&p->mutex);
++	bool playing = p->pause_ts || now_ts < p->head_ts + raopcl_latency(p);
++	pthread_mutex_unlock(&p->mutex);
++	return playing;
+ }
+ 
+ /*----------------------------------------------------------------------------*/
+@@ -1354,9 +1360,6 @@ void _raopcl_send_sync(struct raopcl_s *raopcld, bool first)
  	addr.sin_addr = raopcld->peer_addr;
  	addr.sin_port = htons(raopcld->rtp_ports.ctrl.rport);
--
+ 
 -	// do not send timesync on FLUSHED
 -	if (raopcld->state != RAOP_STREAMING) return;
- 
+-
  	rsp.hdr.proto = 0x80 | (first ? 0x10 : 0x00);
  	rsp.hdr.type = 0x54 | 0x80;
-@@ -1365,6 +1364,12 @@
- 
+ 	// seems that seq=7 shall be forced
+@@ -1366,6 +1369,12 @@ void _raopcl_send_sync(struct raopcl_s *raopcld, bool first)
  	// first sync is called with mutex locked, so don't block
  	if (!first) pthread_mutex_lock(&raopcld->mutex);
-+
+ 
 +	// do not send timesync on FLUSHED; state is only stable under the mutex
 +	if (raopcld->state != RAOP_STREAMING) {
 +		if (!first) pthread_mutex_unlock(&raopcld->mutex);
 +		return;
 +	}
- 
++
  	timestamp = raopcld->head_ts;
  	now = TS2NTP(timestamp, raopcld->sample_rate);
-@@ -1395,7 +1400,10 @@
+ 
+@@ -1395,7 +1404,10 @@ void *_rtp_timing_thread(void *args)
  
  	addr.sin_family = AF_INET;
  	addr.sin_addr = raopcld->peer_addr;

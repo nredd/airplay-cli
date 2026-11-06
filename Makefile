@@ -310,6 +310,13 @@ $(BUILDDIR)/raop_client.o: $(RAOP_CLIENT_PATCHED)
 $(OBJECTS_ALL) build/tests/ap2_client.o build/tests/test_ap2_client_main.o \
 		build/tests/cross_ssl.o: $(RAOP_MEDIA_STAMP)
 
+# The generic rules above track no header dependencies. These are the headers
+# of the media receipt API (media_receipt.h pulls in ap2_client.h; the applied
+# callback lives in ap2_session.h): an edit must rebuild every consumer.
+RECEIPT_HEADERS = src/media_receipt.h src/ap2_client.h src/ap2_session.h
+$(BUILDDIR)/cliairplay.o $(BUILDDIR)/media_receipt.o $(BUILDDIR)/ap2_client.o \
+		$(BUILDDIR)/ap2_session.o build/tests/ap2_client.o: $(RECEIPT_HEADERS)
+
 $(BUILDDIR)/%.o: %.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
 
@@ -601,7 +608,7 @@ AP2_MEDIA_OBJECTS = $(filter-out $(BUILDDIR)/ap2_io.o,$(CLIENT_TEST_OBJECTS))
 
 # Include the production client unit to exercise its private pending/quiesce
 # paths; compile the real IO unit with only syscall boundaries interposed.
-build/tests/test_ap2_media_write.o: tests/test_ap2_media_write.c src/ap2_client.c src/ap2_client.h $(RAOP_MEDIA_STAMP) Makefile
+build/tests/test_ap2_media_write.o: tests/test_ap2_media_write.c src/ap2_client.c $(RECEIPT_HEADERS) $(RAOP_MEDIA_STAMP) Makefile
 	@mkdir -p build/tests
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -std=gnu11 $< -c -o $@
 
@@ -641,12 +648,13 @@ test: test-ap2-media test-ap2-media-red
 # through test hooks; the real syscalls still back every positive case.
 MEDIA_RECEIPT_TEST = build/tests/test_media_receipt
 MR_SEAM_DEFS = -Dfcntl=mr_test_fcntl -Dfflush=mr_test_fflush -Dwrite=mr_test_write
-build/tests/media_receipt_seams.o: src/media_receipt.c src/media_receipt.h \
+build/tests/media_receipt_seams.o: src/media_receipt.c $(RECEIPT_HEADERS) \
 		$(RAOP_MEDIA_STAMP) Makefile
 	@mkdir -p build/tests
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $(MR_SEAM_DEFS) $< -c -o $@
 
-$(MEDIA_RECEIPT_TEST): tests/test_media_receipt.c build/tests/media_receipt_seams.o Makefile
+$(MEDIA_RECEIPT_TEST): tests/test_media_receipt.c $(RECEIPT_HEADERS) \
+		build/tests/media_receipt_seams.o Makefile
 	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_media_receipt.c \
 		build/tests/media_receipt_seams.o $(EXTRA_LDFLAGS) -o $@
 
@@ -686,7 +694,7 @@ test: test-media-receipt test-media-receipt-red
 CLI_MEDIA_RECEIPT_TEST = build/tests/test_cli_media_receipt
 # The AP2_TESTING ap2_client.o carries the hook that starts the production
 # feedback worker, which the real-worker teardown cases need.
-$(CLI_MEDIA_RECEIPT_TEST): tests/test_cli_media_receipt.c src/cliairplay.c \
+$(CLI_MEDIA_RECEIPT_TEST): tests/test_cli_media_receipt.c src/cliairplay.c $(RECEIPT_HEADERS) \
 		tests/mrp_event_fixture.h build/tests/ap2_client.o \
 		$(filter-out $(BUILDDIR)/cliairplay.o $(BUILDDIR)/ap2_client.o,$(OBJECTS_ALL)) \
 		$(LIBCODECS_PATCHED) Makefile
@@ -706,7 +714,7 @@ test: test-cli-media-receipt
 # flow); a single translation unit, with only select/sendto routed via seams.
 COMPAT_MEDIA_TEST = build/tests/test_compat_media_receipt
 build/tests/test_compat_media_receipt.o: tests/test_compat_media_receipt.c src/ap2_client.c \
-		src/ap2_client.h src/media_receipt.h $(RAOP_MEDIA_STAMP) Makefile
+		$(RECEIPT_HEADERS) $(RAOP_MEDIA_STAMP) Makefile
 	@mkdir -p build/tests
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -std=gnu11 $< -c -o $@
 

@@ -720,6 +720,34 @@ static int pad_final_pcm_chunk(uint8_t *buf, int bytes, int chunk_bytes,
     return chunk_bytes;
 }
 
+/* Receipt origin of one realtime chunk. FRESH only when the whole chunk is real
+ * input: no splice pad silence at its head and every one of its `chunk_bytes`
+ * read from the input. A chunk of pad only, pad followed by content, or the
+ * final short chunk at input EOF (zero-filled afterwards) is labelled IDLE, so
+ * silence is never counted as fresh. Only the label changes, never pacing or
+ * data. */
+static ap2_media_origin_t ap2_chunk_origin(int pad_bytes, int content_bytes,
+                                           int chunk_bytes)
+{
+    return pad_bytes == 0 && content_bytes == chunk_bytes ? AP2_MEDIA_FRESH
+                                                          : AP2_MEDIA_IDLE;
+}
+
+/* One realtime chunk with its explicit caller origin. The tag is the applied
+ * epoch for FRESH and 0 otherwise (native route). The same origin is scoped for
+ * the nested RAOP outcome hook, which only reports FRESH/BACKLOG (compat). The
+ * send lock is held. */
+static ap2_send_result_t ap2_send_tagged(uint8_t *data, int frames,
+                                         ap2_media_origin_t origin)
+{
+    mr_origin_scope_enter(&g_mr, mr_origin_from_ap2(origin));
+    ap2_send_result_t result = ap2cl_send_chunk_tagged(
+        g_ap2cl, data, frames, origin,
+        origin == AP2_MEDIA_FRESH ? mr_current_epoch(&g_mr) : 0);
+    mr_origin_scope_exit(&g_mr);
+    return result;
+}
+
 /* ---- Command pipe handler ---- */
 
 static struct {
@@ -1582,6 +1610,10 @@ static int run_raop(cli_config_t *cfg)
                 usleep(1000);
                 continue;
             }
+            /* Label before the EOF pad: only a whole chunk read from the input
+             * is content; the zero-filled short tail is IDLE. */
+            const ap2_media_origin_t origin = ap2_chunk_origin(
+                0, n, DEFAULT_FRAMES_PER_CHUNK * input_bpf);
             n = pad_final_pcm_chunk(
                 buf, n, DEFAULT_FRAMES_PER_CHUNK * input_bpf, input_bpf);
 
@@ -1598,8 +1630,14 @@ static int run_raop(cli_config_t *cfg)
                 send_buf = alac_buf;
             }
             uint64_t playtime;
-            if (!raopcl_send_chunk(
-                    g_raopcl, send_buf, audio_frames, &playtime)) {
+            /* The RAOP hook cannot tell a zero-padded EOF tail from content:
+             * scope the CLI-owned origin around the actual send. */
+            mr_origin_scope_enter(&g_mr,
+                                  mr_origin_from_ap2(origin));
+            const bool sent = raopcl_send_chunk(
+                g_raopcl, send_buf, audio_frames, &playtime);
+            mr_origin_scope_exit(&g_mr);
+            if (!sent) {
                 status_error("RAOP audio send failed");
                 playback_failed = true;
                 pthread_mutex_unlock(&g_audio_send_lock);
@@ -1639,11 +1677,6 @@ static int run_raop(cli_config_t *cfg)
 static bool ap2_send_silence_chunk(const cli_config_t *cfg, uint8_t *buf,
                                    uint8_t *alac_buf, int input_bpf)
 {
-    /* The nested RAOP hook cannot label idle silence (it reports FRESH), so an
-     * idle send on that lane would be miscounted: make the receipt incomplete
-     * instead. Silence needs a hot splice line, which only the native flow has,
-     * so this is a guard for a path that does not occur today. Send lock held. */
-    if (g_mr.enabled && g_mr.route == MR_ROUTE_COMPAT) mr_failure(&g_mr);
     memset(buf, 0, (size_t)AP2_FRAMES_PER_CHUNK * input_bpf);
     /* The input_ended drain keeps an active clip playing over the silence
      * bed; the paused/standby call site can never carry one (those actions
@@ -1655,21 +1688,8 @@ static bool ap2_send_silence_chunk(const cli_config_t *cfg, uint8_t *buf,
         truncate_32to24(buf, AP2_FRAMES_PER_CHUNK * input_bpf, alac_buf);
         send = alac_buf;
     }
-    return ap2cl_send_chunk_tagged(g_ap2cl, send, AP2_FRAMES_PER_CHUNK,
-                                   AP2_MEDIA_IDLE, 0) != AP2_SEND_FATAL;
-}
-
-/* Receipt origin of one realtime chunk. FRESH only when the whole chunk is real
- * input: no splice pad silence at its head and every one of its `chunk_bytes`
- * read from the input. A chunk of pad only, pad followed by content, or the
- * final short chunk at input EOF (zero-filled afterwards) is labelled IDLE, so
- * silence is never counted as fresh. Only the label changes, never pacing or
- * data. */
-static ap2_media_origin_t ap2_chunk_origin(int pad_bytes, int content_bytes,
-                                           int chunk_bytes)
-{
-    return pad_bytes == 0 && content_bytes == chunk_bytes ? AP2_MEDIA_FRESH
-                                                          : AP2_MEDIA_IDLE;
+    return ap2_send_tagged(send, AP2_FRAMES_PER_CHUNK, AP2_MEDIA_IDLE) !=
+           AP2_SEND_FATAL;
 }
 
 /* STOP and the health decision share the send lock: a completed STOP makes
@@ -2058,9 +2078,7 @@ static int run_airplay2(cli_config_t *cfg)
                 truncate_32to24(buf, n, ap2_alac_buf);
                 send = ap2_alac_buf;
             }
-            ap2_send_result_t result = ap2cl_send_chunk_tagged(
-                g_ap2cl, send, af, origin,
-                origin == AP2_MEDIA_FRESH ? mr_current_epoch(&g_mr) : 0);
+            ap2_send_result_t result = ap2_send_tagged(send, af, origin);
             if (result == AP2_SEND_FATAL) {
                 status_error("AirPlay 2 realtime send failed");
                 playback_failed = true;

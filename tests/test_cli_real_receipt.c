@@ -922,6 +922,55 @@ static bool case_native_splice_pad(const char *binary)
     return true;
 }
 
+/* Finite, UNALIGNED real PCM on the real stdin pipe, then EOF before START:
+ * exactly CONTENT_CHUNKS whole chunks plus a 1003-byte tail (250 whole frames
+ * and 3 stray bytes). The tail is zero-padded to a full datagram by the CLI, so
+ * it carries no whole chunk of input and must be IDLE on EVERY route (legacy
+ * RAOP and compat via the scoped origin, native via the tag), never fresh. The
+ * receiver sees every datagram: fresh + idle (+ backlog) == receiver units. */
+#define CONTENT_CHUNKS 20
+#define CHUNK_BYTES (352 * 4)
+static bool case_finite_unaligned_eof(const char *binary)
+{
+    static peer_t peer;
+    static child_t c;
+    static uint8_t pcm[CONTENT_CHUNKS * CHUNK_BYTES + 1003];
+    record_t r;
+    int status;
+
+    memset(pcm, 0x11, sizeof(pcm));   /* non-silent: content, not pad */
+    CHECK(peer_start(&peer));
+    CHECK(child_start(&c, binary, peer_rtsp(&peer), true, false, false));
+    CHECK(wait_err(&c, "[STATUS] connected", 15000));
+    CHECK(write(c.stdin_w, pcm, sizeof(pcm)) == (ssize_t)sizeof(pcm));
+    CHECK(close(c.stdin_w) == 0);     /* real EOF */
+    c.stdin_w = -1;
+    CHECK(send_command(&c, "ACTION=START\n"));
+    CHECK(wait_err(&c, "[STATUS] started", 10000));
+    CHECK(wait_units(&peer, CONTENT_CHUNKS + 1, 20000));
+    CHECK(send_command(&c, "ACTION=STOP\n"));
+    CHECK(child_wait(&c, 20000, &status, true));
+    drain_stdout(&c);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(parse_record(c.out, &r));
+    CHECK(wait_receiver_settled(&peer, r.fresh_units + r.idle_units +
+                                           r.backlog_units));
+    CHECK(r.records == 1 && r.last_is_final && r.stop && !r.fault && !r.overflow);
+    CHECK(r.epoch == 1 && r.backlog_units == 0);
+    fprintf(stderr, "sender fresh %u idle %u, receiver %u units\n", r.fresh_units,
+            r.idle_units, peer_units(&peer));
+    CHECK(r.fresh_units == CONTENT_CHUNKS);      /* the padded tail is NOT fresh */
+    CHECK(r.fresh_bytes <= peer_bytes(&peer));
+    CHECK(r.idle_units >= 1);                    /* the zero-padded EOF tail */
+    CHECK(r.fresh_units + r.idle_units == peer_units(&peer));
+    fprintf(stderr, "ok: real CLI finite unaligned PCM -> %u fresh + %u idle "
+            "(padded tail) == %u receiver datagrams\n", r.fresh_units,
+            r.idle_units, peer_units(&peer));
+    child_cleanup(&c);
+    peer_stop(&peer);
+    return true;
+}
+
 typedef bool (*case_fn)(const char *);
 
 /* usage: driver <binary> [case] [route]; no case/route runs every one. */
@@ -934,6 +983,7 @@ int main(int argc, char **argv)
         { "sigterm", case_sigterm, false },
         { "buffered-stop-start", case_buffered_stop_start, false },
         { "full-stdout", case_full_stdout, false },
+        { "finite-unaligned-eof", case_finite_unaligned_eof, false },
         { "native-splice-pad", case_native_splice_pad, true },
     };
 

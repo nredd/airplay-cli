@@ -121,10 +121,21 @@ static struct ap2cl_s *compat_client(struct raopcl_s *nested)
     return p;
 }
 
-static void content(struct ap2cl_s *p, uint64_t epoch)
+/* The collector the production CLI scopes its input origin on, per send. */
+static media_receipt_t *scoped_mr;
+
+static void send_origin(struct ap2cl_s *p, ap2_media_origin_t origin,
+                        uint64_t tag, bool scoped)
 {
     uint8_t pcm[4] = {0};
-    CHECK(ap2cl_send_chunk_tagged(p, pcm, 1, AP2_MEDIA_FRESH, epoch) == AP2_SEND_SENT);
+    if (scoped) mr_origin_scope_enter(scoped_mr, mr_origin_from_ap2(origin));
+    CHECK(ap2cl_send_chunk_tagged(p, pcm, 1, origin, tag) == AP2_SEND_SENT);
+    if (scoped) mr_origin_scope_exit(scoped_mr);
+}
+
+static void content(struct ap2cl_s *p, uint64_t epoch)
+{
+    send_origin(p, AP2_MEDIA_FRESH, epoch, true);
 }
 
 /* Exercise the actual public resume caller with one stored chunk. */
@@ -148,6 +159,7 @@ static void test_compat_path(uint16_t port)
 
     media_receipt_t mr;
     mr_init(&mr, true);
+    scoped_mr = &mr;
     CHECK(ap2cl_set_raop_media_outcome_cb(p, mr_raop_outcome_cb, &mr));
     uint32_t generation = ap2cl_media_registration_generation(p);
     CHECK(generation == 1);
@@ -157,6 +169,7 @@ static void test_compat_path(uint16_t port)
     CHECK(mr.fault);
 
     mr_init(&mr, true);
+    scoped_mr = &mr;
     CHECK(ap2cl_set_raop_media_outcome_cb(p, mr_raop_outcome_cb, &mr));
     generation = ap2cl_media_registration_generation(p);
     mr_configure(&mr, MR_ROUTE_COMPAT, ap2cl_media_setup_port(p), generation);
@@ -169,11 +182,31 @@ static void test_compat_path(uint16_t port)
     CHECK(mr.have_dest && mr.dest.sin_port == htons(port));
     CHECK(mr.dest.sin_addr.s_addr == htonl(INADDR_LOOPBACK) && !mr.fault);
 
+    /* Explicit IDLE through the same real nested send: the nested hook says
+     * FRESH, the scoped caller origin makes it idle, never fresh. */
+    before = writes;
+    send_origin(p, AP2_MEDIA_IDLE, 0, true);
+    CHECK(writes == before + 1 && mr.idle_units == 1 && mr.fresh_units == 1);
+    CHECK(!mr.fault && atomic_load(&mr.caller_origin) == MR_ORIGIN_UNKNOWN);
+
     /* The nested BACKLOG lane through ap2cl_accept_frames, never fresh. */
     before = writes;
     backlog(p, nested);
     CHECK(writes == before + 1);
     CHECK(mr.backlog_units == 1 && mr.fresh_units == 1 && !mr.fault);
+
+    /* A send with no CLI scope is unclassified: fault, not fresh. */
+    media_receipt_t unscoped;
+    mr_init(&unscoped, true);
+    scoped_mr = &unscoped;
+    CHECK(ap2cl_set_raop_media_outcome_cb(p, mr_raop_outcome_cb, &unscoped));
+    mr_configure(&unscoped, MR_ROUTE_COMPAT, ap2cl_media_setup_port(p),
+                 ap2cl_media_registration_generation(p));
+    mr_applied(&unscoped, 1);
+    send_origin(p, AP2_MEDIA_FRESH, 1, false);
+    CHECK(unscoped.fault && unscoped.fresh_units == 0);
+    CHECK(ap2cl_set_raop_media_outcome_cb(p, mr_raop_outcome_cb, &mr));
+    scoped_mr = &mr;
 
     /* A select error with a still-successful legacy send: not a count. */
     uint32_t units = mr.fresh_units;
@@ -184,6 +217,7 @@ static void test_compat_path(uint16_t port)
 
     /* A clean collector: STOP freeze before the transport stop closes it. */
     mr_init(&mr, true);
+    scoped_mr = &mr;
     CHECK(ap2cl_set_raop_media_outcome_cb(p, mr_raop_outcome_cb, &mr));
     generation = ap2cl_media_registration_generation(p);
     mr_configure(&mr, MR_ROUTE_COMPAT, ap2cl_media_setup_port(p), generation);

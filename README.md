@@ -207,9 +207,16 @@ Coverage and accounting (each path is a real call path, not a test-only hook):
   is all pad (the pad is at least one chunk), pad followed by content, or the
   final short chunk at input EOF (zero-filled afterwards) is `IDLE`. A fresh
   unit on this lane therefore always carries a whole chunk of real PCM.
-  The legacy RAOP and compat lanes cannot make that distinction: their hook
-  labels every non-backlog send fresh, including a zero-filled EOF chunk. Only
-  the label changes, never pacing or data.
+  The legacy RAOP and compat lanes use the same rule without a libraop ABI change:
+  libraop's hook only distinguishes `FRESH` ("not backlog") from `BACKLOG`, so the
+  CLI brackets the actual synchronous send (`raopcl_send_chunk` in `run_raop`,
+  `ap2cl_send_chunk_tagged` via `ap2_send_tagged` for compat and native) with
+  `mr_origin_scope_enter/exit` under `g_audio_send_lock`, and the collector maps
+  the hook's non-backlog outcome to that scoped origin. A zero-padded EOF chunk,
+  pad-only/mixed chunk or idle silence is therefore `IDLE` on every supported
+  route. `BACKLOG` keeps its own label, the scope resets on every path, and a
+  non-backlog outcome with no scope is unclassified: sticky fault. Only the label
+  changes, never pacing, data or return values.
 - Actual buffered TCP is explicitly **unsupported**: nothing is registered, the
   record reports `route=buffered` and `fault=true`, transport behavior is
   unchanged. A parked frame is never counted (`audio_packets_sent` advances at
@@ -219,9 +226,12 @@ Coverage and accounting (each path is a real call path, not a test-only hook):
   CLI resolved up front (`ap2_resolve_route` plus the buffered decision) is
   compared with it and a disagreement latches a fault (a buffered request that
   falls back to realtime UDP is such a disagreement, so that run is incomplete).
-- One lifecycle: WAIT -> ACTIVE (epoch 1) -> FROZEN. A second START attempt while
-  one is applied (checked at command entry, so a failed commit or early return
-  counts), an unknown origin or destination, a second destination, a port mismatch, a
+- One lifecycle: WAIT -> ACTIVE (epoch 1) -> FROZEN. Exactly ONE START
+  command attempt is allowed: the first, applied or failed, leaves the collector
+  clean (a failed first START never activates an epoch), but ANY later START entry
+  (counted atomically at command entry, saturating, so a retry after a failed first
+  START, a failed commit or an early return all count) sets terminal-invalid,
+  and a second applied START sets the fault. Also, an unknown origin or destination, a second destination, a port mismatch, a
   registration change (`*_media_registration_generation`, bumped by every hook
   set) or counter saturation sets a sticky fault. After the freeze a sticky
   terminal-invalid latches on any START (successful or failed, even one already
@@ -231,11 +241,6 @@ Coverage and accounting (each path is a real call path, not a test-only hook):
   playback loop instead supplies `playback_ok=false`, producing an abnormal,
   faulted record without setting that latch. The owner's one explicit unregister after the
   command thread joins is normal and only in that teardown phase.
-- The nested RAOP hook reports every non-backlog send as fresh and cannot label
-  idle silence. Silence needs a hot splice line, which only the native flow has,
-  so the compat lane never sends it today; if it ever did, `ap2_send_silence_chunk`
-  makes an ACTIVE collector incomplete rather than counting it as fresh. That one
-  case therefore does not use the RAOP hook's origin.
 - Two more places depart from the original design, both on purpose. Native
   failure outcomes are reported from `ap2cl_send_chunk_tagged` (one failure per
   failed content invocation, including state/socket failures before any send),
@@ -330,7 +335,11 @@ receivers; nothing external is contacted:
   lets the child exit without blocking, record omitted. The native route adds a
   splice-pad case: the test stops its own PCM feeder until the client logs a
   `REANCHOR`, so the loop owes the wire whole pad chunks; those count as
-  `idle_units`, and `fresh + idle` equals every datagram the receiver got.
+  `idle_units`, and `fresh + idle` equals every datagram the receiver got. On
+  all three routes a finite unaligned PCM input (20 whole chunks plus a 1003 byte
+  tail, real EOF) must report exactly 20 fresh units, the zero-padded tail as
+  idle, and `fresh + idle` equal to the receiver's count (the pre-fix legacy and
+  compat binaries reported the tail as a 21st fresh unit).
   It runs under `SANITIZE=thread` too, unsuppressed. Not covered: buffered
   (type 103) TCP stays unsupported and incomplete.
 - `make test-cli-media-receipt STATIC=1` also forces both orderings of a

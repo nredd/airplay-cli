@@ -27,6 +27,8 @@ void mr_init(media_receipt_t *mr, bool enabled)
     mr->enabled = enabled;
     atomic_init(&mr->state, MR_WAIT);
     atomic_init(&mr->terminal_invalid, false);
+    atomic_init(&mr->start_attempts, 0);
+    atomic_init(&mr->caller_origin, MR_ORIGIN_UNKNOWN);
     atomic_init(&mr->torn_down, false);
 }
 
@@ -167,14 +169,28 @@ void mr_note_command(media_receipt_t *mr)
     if (mr_state(mr) == MR_FROZEN) atomic_store(&mr->terminal_invalid, true);
 }
 
+void mr_origin_scope_enter(media_receipt_t *mr, mr_origin_t origin)
+{
+    if (!mr->enabled) return;
+    atomic_store(&mr->caller_origin, origin);
+}
+
+void mr_origin_scope_exit(media_receipt_t *mr)
+{
+    if (!mr->enabled) return;
+    atomic_store(&mr->caller_origin, MR_ORIGIN_UNKNOWN);
+}
+
 void mr_note_start(media_receipt_t *mr)
 {
     if (!mr->enabled) return;
-    /* Entry of any START while a START is already applied (ACTIVE): the
-     * one-start profile is broken whatever the attempt does next. A failed
-     * commit or an early ENDED return never reaches mr_applied, yet the
-     * transport may already have quiesced, re-anchored and flushed. */
-    if (mr_state(mr) == MR_ACTIVE) atomic_store(&mr->terminal_invalid, true);
+    /* Exactly one START command attempt: any second entry is incomplete, even
+     * when the first failed before activating an epoch. */
+    uint32_t seen = atomic_load(&mr->start_attempts);
+    while (seen < UINT32_MAX &&
+           !atomic_compare_exchange_weak(&mr->start_attempts, &seen, seen + 1))
+        ;
+    if (seen >= 1) atomic_store(&mr->terminal_invalid, true);
 }
 
 void mr_latch_invalid(media_receipt_t *mr)
@@ -276,7 +292,7 @@ static mr_origin_t map_raop_origin(raop_media_origin_t origin)
     }
 }
 
-static mr_origin_t map_ap2_origin(ap2_media_origin_t origin)
+mr_origin_t mr_origin_from_ap2(ap2_media_origin_t origin)
 {
     switch (origin) {
     case AP2_MEDIA_FRESH: return MR_ORIGIN_FRESH;
@@ -297,8 +313,13 @@ void mr_raop_outcome_cb(void *ctx, raop_media_outcome_t outcome,
         return;
     }
     /* The RAOP lanes carry no tag: the producer is under the send lock with the
-     * applied epoch current, so the collector's own epoch is the fresh tag. */
-    mr_sent(mr, map_raop_origin(origin), datagram_bytes, destination,
+     * applied epoch current, so the collector's own epoch is the fresh tag.
+     * Libraop's FRESH only means "not backlog": the CLI's scoped input origin
+     * is the real label (UNKNOWN, hence a fault, when no send scope is open). */
+    mr_origin_t label = map_raop_origin(origin);
+    if (label == MR_ORIGIN_FRESH)
+        label = (mr_origin_t)atomic_load(&mr->caller_origin);
+    mr_sent(mr, label, datagram_bytes, destination,
             setup_port, mr_current_epoch(mr));
 }
 
@@ -310,7 +331,7 @@ void mr_ap2_write_cb(void *ctx, const ap2_media_write_t *write)
         mr_failure(mr);
         return;
     }
-    mr_sent(mr, map_ap2_origin(write->origin), write->bytes, &write->destination,
+    mr_sent(mr, mr_origin_from_ap2(write->origin), write->bytes, &write->destination,
             mr->setup_port, write->tag);
 }
 

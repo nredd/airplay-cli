@@ -136,6 +136,36 @@ static void test_counting(void)
     puts("receipt: fresh/idle/backlog accounting and freeze");
 }
 
+/* The libraop FRESH label only means "not backlog": the CLI's scoped origin is
+ * the real one, backlog always keeps its own, and nothing leaks. */
+static void test_origin_scope(void)
+{
+    media_receipt_t mr = active(MR_ROUTE_RAOP);
+    CHECK(atomic_load(&mr.caller_origin) == MR_ORIGIN_UNKNOWN);
+    mr_origin_scope_enter(&mr, MR_ORIGIN_IDLE);
+    mr_raop_outcome_cb(&mr, RAOP_MEDIA_OUTCOME_SENT, RAOP_MEDIA_FRESH, 128,
+                       target(6001), 6001);
+    CHECK(mr.idle_units == 1 && mr.fresh_units == 0 && !mr.fault);
+    mr_raop_outcome_cb(&mr, RAOP_MEDIA_OUTCOME_SENT, RAOP_MEDIA_BACKLOG, 128,
+                       target(6001), 6001);
+    CHECK(mr.backlog_units == 1 && !mr.fault); /* independent of the scope */
+    mr_origin_scope_exit(&mr);
+    CHECK(atomic_load(&mr.caller_origin) == MR_ORIGIN_UNKNOWN);
+    mr_origin_scope_enter(&mr, MR_ORIGIN_FRESH);
+    mr_raop_outcome_cb(&mr, RAOP_MEDIA_OUTCOME_SENT, RAOP_MEDIA_FRESH, 128,
+                       target(6001), 6001);
+    CHECK(mr.fresh_units == 1 && !mr.fault);
+    mr_origin_scope_exit(&mr);
+    /* After exit a FRESH outcome is unclassified: sticky fault, not counted. */
+    mr_raop_outcome_cb(&mr, RAOP_MEDIA_OUTCOME_SENT, RAOP_MEDIA_FRESH, 128,
+                       target(6001), 6001);
+    CHECK(mr.fault && mr.fresh_units == 1);
+    /* Disabled collector ignores scoping. */
+    mr_init(&mr, false);
+    mr_origin_scope_enter(&mr, MR_ORIGIN_FRESH);
+    CHECK(atomic_load(&mr.caller_origin) == MR_ORIGIN_UNKNOWN);
+}
+
 static void test_faults(void)
 {
     media_receipt_t mr;
@@ -144,10 +174,12 @@ static void test_faults(void)
      * is a fault, and the naive "count every sent" baseline would have
      * reported fresh_units == 1. */
     mr = active(MR_ROUTE_RAOP);
+    mr_origin_scope_enter(&mr, MR_ORIGIN_FRESH);
     mr_raop_outcome_cb(&mr, RAOP_MEDIA_OUTCOME_SELECT_ERROR, RAOP_MEDIA_FRESH,
                        0, NULL, 6001);
     mr_raop_outcome_cb(&mr, RAOP_MEDIA_OUTCOME_SENT, RAOP_MEDIA_FRESH, 128,
                        target(6001), 6001);
+    mr_origin_scope_exit(&mr);
     CHECK(mr.fault && mr.fresh_units == 1); /* sticky fault, success counted */
 
     static const raop_media_outcome_t failures[] = {
@@ -251,13 +283,22 @@ static void test_lifecycle_invalidation(void)
     mr_note_command(&mr); /* buffered post-freeze START/FLUSH/... */
     CHECK(atomic_load(&mr.terminal_invalid));
 
-    /* mr_note_start: only a START entered while one is applied latches. */
+    /* mr_note_start: exactly one START attempt; any second entry latches, in
+     * WAIT (first failed) or ACTIVE alike. */
     mr_init(&mr, true);
     mr_note_start(&mr);
     CHECK(!atomic_load(&mr.terminal_invalid));
+    mr_note_start(&mr); /* retry after a failed first START, still WAIT */
+    CHECK(atomic_load(&mr.terminal_invalid));
+    CHECK(atomic_load(&mr.state) == MR_WAIT);
     mr = active(MR_ROUTE_UDP);
+    mr_note_start(&mr); /* the applied START's own entry */
+    CHECK(!atomic_load(&mr.terminal_invalid));
     mr_note_start(&mr);
     CHECK(atomic_load(&mr.terminal_invalid));
+    atomic_store(&mr.start_attempts, UINT32_MAX); /* saturates, never wraps */
+    mr_note_start(&mr);
+    CHECK(atomic_load(&mr.start_attempts) == UINT32_MAX);
     mr_init(&mr, false);
     mr_note_start(&mr);
     CHECK(!atomic_load(&mr.terminal_invalid));
@@ -529,6 +570,7 @@ int main(void)
     test_expect_route();
     test_default_off();
     test_counting();
+    test_origin_scope();
     test_faults();
     test_lifecycle_invalidation();
     test_format();

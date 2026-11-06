@@ -81,6 +81,8 @@ typedef struct {
     _Atomic int state;            /* mr_state_t */
     _Atomic bool terminal_invalid;/* sticky until sealed */
     _Atomic bool torn_down;       /* explicit owner unregister phase began */
+    _Atomic int caller_origin;    /* mr_origin_t scoped around one RAOP send */
+    _Atomic uint32_t start_attempts; /* START entries seen, saturating */
     volatile sig_atomic_t signaled;
 
     bool stop_frozen;             /* the freeze came from a commanded STOP */
@@ -127,9 +129,12 @@ void mr_freeze_for_stop(media_receipt_t *mr, uint32_t current_generation);
 void mr_note_command(media_receipt_t *mr);
 
 /* Entry of every START attempt, BEFORE any transport side effect, on the
- * command thread that also runs the applied observer: latches terminal_invalid
- * when a START is already applied (ACTIVE), whether or not the attempt commits.
- * The first START, failed or not, is unaffected. */
+ * command thread that also runs the applied observer. The profile allows exactly
+ * ONE START command attempt: the first (applied or failed, in WAIT) is
+ * unaffected, but ANY later entry latches terminal_invalid whatever the first
+ * did, because a failed commit may already have quiesced, re-anchored or flushed
+ * the transport. A failed first START never activates an epoch; a retry is never
+ * clean. The counter is bounded (saturating) and atomic. */
 void mr_note_start(media_receipt_t *mr);
 
 /* Latch terminal_invalid (idempotent, sticky). */
@@ -142,6 +147,21 @@ void mr_signal(media_receipt_t *mr);
  * before the owner clears its callbacks): checks the registration, then makes
  * the expected clear a normal event. Idempotent. */
 void mr_begin_teardown(media_receipt_t *mr, uint32_t current_generation);
+
+/* CLI-owned input origin for ONE synchronous RAOP-lane send (legacy
+ * `raopcl_send_chunk`, compat `ap2cl_send_chunk_tagged`). The libraop outcome
+ * hook only knows FRESH vs BACKLOG, so a short/zero-padded EOF chunk or idle
+ * silence would be mislabelled FRESH. enter/exit bracket the actual send under
+ * the media send lock (the hook runs synchronously inside it, under the RAOP
+ * mutex, on the same thread); exit always resets to UNKNOWN on every path so
+ * nothing leaks into a later send, a backlog replay or a failed attempt. A
+ * non-BACKLOG RAOP outcome with no scope is unclassified: sticky fault. BACKLOG
+ * (old queued frames replayed by libraop) always keeps its own label. */
+void mr_origin_scope_enter(media_receipt_t *mr, mr_origin_t origin);
+void mr_origin_scope_exit(media_receipt_t *mr);
+
+/* Receipt origin for a CLI AP2 origin label. */
+mr_origin_t mr_origin_from_ap2(ap2_media_origin_t origin);
 
 /* Producers' view of the applied epoch for tagging, 0 while waiting. */
 uint64_t mr_current_epoch(const media_receipt_t *mr);

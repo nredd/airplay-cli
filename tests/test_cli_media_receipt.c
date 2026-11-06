@@ -90,6 +90,9 @@ static unsigned destroy_calls;
 static bool real_destroy(struct ap2cl_s *p); /* the unrenamed production call */
 static bool use_real_destroy;
 
+static bool emulate_nested_raop;
+static mr_origin_t scope_seen;
+
 ap2_send_result_t test_send_tagged(struct ap2cl_s *p, uint8_t *sample, int frames,
                                    ap2_media_origin_t origin, uint64_t tag)
 {
@@ -97,6 +100,16 @@ ap2_send_result_t test_send_tagged(struct ap2cl_s *p, uint8_t *sample, int frame
     tagged_calls++;
     last_origin = origin;
     last_tag = tag;
+    scope_seen = (mr_origin_t)atomic_load(&g_mr.caller_origin);
+    if (emulate_nested_raop) {
+        /* The nested RAOP client's hook reports every non-backlog write as
+         * FRESH; only the CLI's scoped origin can say otherwise. */
+        struct sockaddr_in d = {.sin_family = AF_INET,
+                                .sin_port = htons(g_mr.setup_port)};
+        d.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        mr_raop_outcome_cb(&g_mr, RAOP_MEDIA_OUTCOME_SENT, RAOP_MEDIA_FRESH,
+                           100, &d, g_mr.setup_port);
+    }
     return AP2_SEND_SENT;
 }
 
@@ -422,7 +435,7 @@ static bool receipt_fault_now(void)
     return fault;
 }
 
-/* Every second START attempt while ACTIVE is a fault, even one whose commit
+/* Every second START attempt is a fault, even after a failed first START or one whose commit
  * fails or that returns early (no applied callback, so the applied observer
  * never sees it) while its transport side effects already ran. */
 static void test_second_start_invalidates(void)
@@ -451,18 +464,29 @@ static void test_second_start_invalidates(void)
     CHECK(receipt_fault_now());
     end_session();
 
-    /* Controls: the first START, failed or not, stays clean. */
+    /* First START failed (WAIT, never activates), then a retry: the retry
+     * entry itself latches; a failed first alone is clean until it ends. */
     begin_session(true);
     next_commit = AP2_COMMIT_FAILED;
     handle_command("ACTION", "START", &cfg);
     CHECK(!atomic_load(&g_mr.terminal_invalid));
+    CHECK(atomic_load(&g_mr.state) == MR_WAIT && g_mr.applied_count == 0);
     next_commit = AP2_COMMIT_OK;
+    handle_command("ACTION", "START", &cfg);
+    CHECK(atomic_load(&g_mr.terminal_invalid));
+    sender_content(2, AP2_MEDIA_FRESH);
+    handle_command("ACTION", "STOP", &cfg);
+    CHECK(receipt_fault_now());
+    end_session();
+
+    /* Control: a single successful START stays clean. */
+    begin_session(true);
     handle_command("ACTION", "START", &cfg);
     sender_content(2, AP2_MEDIA_FRESH);
     handle_command("ACTION", "STOP", &cfg);
     CHECK(!atomic_load(&g_mr.terminal_invalid) && !receipt_fault_now());
     end_session();
-    say("cli receipt: a second START (failed commit or early ended) faults, the first never");
+    say("cli receipt: any second START attempt (failed first, failed commit, early ended) faults");
 }
 
 static void test_registration_changes(void)
@@ -640,8 +664,9 @@ static void test_final_after_writers_joined(void)
     say("cli receipt: finish_run emits one final line after STOP, hooks cleared, feedback writer joined by destroy, failed destroy/result merged");
 }
 
-/* Idle silence keeps its explicit IDLE label on the native lane; the nested
- * RAOP lane cannot label it, so an ACTIVE collector goes incomplete. */
+/* Idle silence keeps its explicit IDLE label on both AP2 lanes. The nested
+ * RAOP hook reports FRESH, so the compat lane relies on the CLI's scoped origin:
+ * the silence is counted IDLE, never fresh, and the scope never leaks. */
 static void test_silence_origin(void)
 {
     uint8_t buf[352 * 4];
@@ -652,12 +677,16 @@ static void test_silence_origin(void)
     CHECK(ap2_send_silence_chunk(&cfg, buf, NULL, 4));
     pthread_mutex_unlock(&g_audio_send_lock);
     CHECK(tagged_calls == 1 && last_origin == AP2_MEDIA_IDLE && last_tag == 0);
+    CHECK(scope_seen == MR_ORIGIN_IDLE);
+    CHECK(atomic_load(&g_mr.caller_origin) == MR_ORIGIN_UNKNOWN);
     CHECK(!g_mr.fault);
     end_session();
 
     begin_session(true);
     media_path = AP2_MEDIA_PATH_RAOP_COMPAT;
     mr_install_ap2(fake_client);
+    emulate_nested_raop = true;
+    g_mr.setup_port = 6001;
     pthread_mutex_lock(&g_audio_send_lock);
     CHECK(ap2_send_silence_chunk(&cfg, buf, NULL, 4)); /* WAIT: not part of it */
     pthread_mutex_unlock(&g_audio_send_lock);
@@ -666,9 +695,20 @@ static void test_silence_origin(void)
     pthread_mutex_lock(&g_audio_send_lock);
     CHECK(ap2_send_silence_chunk(&cfg, buf, NULL, 4));
     pthread_mutex_unlock(&g_audio_send_lock);
+    CHECK(g_mr.idle_units == 1 && g_mr.fresh_units == 0 && !g_mr.fault);
+    /* Content on the same lane stays FRESH with the applied epoch tag. */
+    pthread_mutex_lock(&g_audio_send_lock);
+    CHECK(ap2_send_tagged(buf, 352, AP2_MEDIA_FRESH) == AP2_SEND_SENT);
+    pthread_mutex_unlock(&g_audio_send_lock);
+    CHECK(g_mr.fresh_units == 1 && last_tag == 1 && !g_mr.fault);
+    /* An unscoped non-backlog RAOP outcome is unclassified: fault. */
+    struct sockaddr_in d = {.sin_family = AF_INET, .sin_port = htons(6001)};
+    d.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    mr_raop_outcome_cb(&g_mr, RAOP_MEDIA_OUTCOME_SENT, RAOP_MEDIA_FRESH, 100, &d, 6001);
     CHECK(g_mr.fault);
+    emulate_nested_raop = false;
     end_session();
-    say("cli receipt: idle silence keeps its IDLE label; unlabelled compat lane goes incomplete");
+    say("cli receipt: idle silence is IDLE on native and compat; scope never leaks; unscoped RAOP FRESH faults");
 }
 
 /* A chunk is FRESH only when it carries no splice pad silence and the whole

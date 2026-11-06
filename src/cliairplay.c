@@ -1621,6 +1621,11 @@ static int run_raop(cli_config_t *cfg)
 static bool ap2_send_silence_chunk(const cli_config_t *cfg, uint8_t *buf,
                                    uint8_t *alac_buf, int input_bpf)
 {
+    /* The nested RAOP hook cannot label idle silence (it reports FRESH), so an
+     * idle send on that lane would be miscounted: make the receipt incomplete
+     * instead. Silence needs a hot splice line, which only the native flow has,
+     * so this is a guard for a path that does not occur today. Send lock held. */
+    if (g_mr.enabled && g_mr.route == MR_ROUTE_COMPAT) mr_failure(&g_mr);
     memset(buf, 0, (size_t)AP2_FRAMES_PER_CHUNK * input_bpf);
     /* The input_ended drain keeps an active clip playing over the silence
      * bed; the paused/standby call site can never carry one (those actions
@@ -2314,6 +2319,38 @@ static bool parse_attestation_fd(const char *value, int *fd)
     return true;
 }
 
+/* Teardown shared by every run: join the command thread, retire the transport
+ * clients and, last, emit the private receipt. Returns false when the command
+ * thread cannot be joined, before anything was destroyed (no final record). */
+static bool finish_run(const cli_config_t *cfg, int result)
+{
+    request_command_stop();
+    if (!join_command_thread()) return false;
+    struct ap2cl_s *ap2_client = atomic_exchange(&g_ap2cl, NULL);
+    struct raopcl_s *raop_client = atomic_exchange(&g_raopcl, NULL);
+    /* Explicit owner unregister phase; the clients are still alive here. */
+    mr_teardown(ap2_client, raop_client);
+    if (cfg->cmdpipe) {
+        if (g_cmdpipe_fd >= 0) close(g_cmdpipe_fd);
+        unlink(cfg->cmdpipe);
+    }
+    /* A failed destroy/disconnect is an observed cleanup failure that merges
+     * into the receipt's fault; the process result itself is unchanged. */
+    bool cleanup_ok = true;
+    if (ap2_client) cleanup_ok = ap2cl_destroy(ap2_client);
+    if (raop_client) {
+        cleanup_ok &= raopcl_disconnect(raop_client);
+        cleanup_ok &= raopcl_destroy(raop_client);
+    }
+    /* Terminal receipt: the command thread is joined, the callbacks cleared and
+     * the clients destroyed (their feedback/MRP workers joined), so no other
+     * stdout writer exists. No media or session lock is held. */
+    if (!cleanup_ok) mr_latch_invalid(&g_mr);
+    if (g_mr.enabled && !mr_emit(&g_mr, result == 0, stdout))
+        LOG_WARN("Media receipt omitted");
+    return true;
+}
+
 int main(int argc, char *argv[])
 {
     cli_config_t cfg = {
@@ -2677,26 +2714,7 @@ int main(int argc, char *argv[])
         ? run_raop(&cfg) : run_airplay2(&cfg);
 
     /* Cleanup */
-    request_command_stop();
-    if (!join_command_thread()) return 1;
-    struct ap2cl_s *ap2_client = atomic_exchange(&g_ap2cl, NULL);
-    struct raopcl_s *raop_client = atomic_exchange(&g_raopcl, NULL);
-    /* Explicit owner unregister phase; the clients are still alive here. */
-    mr_teardown(ap2_client, raop_client);
-    if (cfg.cmdpipe) {
-        if (g_cmdpipe_fd >= 0) close(g_cmdpipe_fd);
-        unlink(cfg.cmdpipe);
-    }
-    if (ap2_client) ap2cl_destroy(ap2_client);
-    if (raop_client) {
-        raopcl_disconnect(raop_client);
-        raopcl_destroy(raop_client);
-    }
-    /* Terminal receipt: the command thread is joined, the callbacks cleared and
-     * the clients destroyed (their feedback/MRP workers joined), so no other
-     * stdout writer exists. No media or session lock is held. */
-    if (g_mr.enabled && !mr_emit(&g_mr, result == 0, stdout))
-        LOG_WARN("Media receipt omitted");
+    if (!finish_run(&cfg, result)) return 1;
     free(g_metadata.title);
     free(g_metadata.artist);
     free(g_metadata.album);

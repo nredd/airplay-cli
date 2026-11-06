@@ -21,6 +21,11 @@
 #define ap2cl_set_media_outcome_cb test_set_outcome_cb
 #define ap2cl_set_raop_media_outcome_cb test_set_raop_outcome_cb
 #define ap2cl_clock_watch_restart test_clock_watch_restart
+#define ap2cl_send_chunk_tagged test_send_tagged
+#define ap2cl_head_audible_unix_ms test_head_audible
+#define ap2cl_destroy test_destroy
+#define raopcl_disconnect test_raopcl_disconnect
+#define raopcl_destroy test_raopcl_destroy
 #define ap2cl_flush test_flush
 #define ap2cl_standby test_standby
 #define ap2cl_play test_play
@@ -55,6 +60,37 @@ bool test_flush(struct ap2cl_s *p) { (void)p; return true; }
 void test_standby(struct ap2cl_s *p) { (void)p; }
 void test_play(struct ap2cl_s *p) { (void)p; }
 void test_pause(struct ap2cl_s *p) { (void)p; }
+
+static ap2_media_origin_t last_origin;
+static uint64_t last_tag;
+static unsigned tagged_calls;
+static bool destroy_result = true;
+static void (*destroy_hook)(void);
+static unsigned destroy_calls;
+
+ap2_send_result_t test_send_tagged(struct ap2cl_s *p, uint8_t *sample, int frames,
+                                   ap2_media_origin_t origin, uint64_t tag)
+{
+    (void)p; (void)sample; (void)frames;
+    tagged_calls++;
+    last_origin = origin;
+    last_tag = tag;
+    return AP2_SEND_SENT;
+}
+
+uint64_t test_head_audible(struct ap2cl_s *p) { (void)p; return 0; }
+
+/* ap2cl_destroy joins the feedback worker first; the hook stands in for that. */
+bool test_destroy(struct ap2cl_s *p)
+{
+    (void)p;
+    destroy_calls++;
+    if (destroy_hook) destroy_hook();
+    return destroy_result;
+}
+
+bool test_raopcl_disconnect(struct raopcl_s *p) { (void)p; return true; }
+bool test_raopcl_destroy(struct raopcl_s *p) { (void)p; return true; }
 bool test_connected(struct ap2cl_s *p) { (void)p; return connected; }
 bool test_healthy(struct ap2cl_s *p) { (void)p; return healthy; }
 void test_publish(struct ap2cl_s *p) { (void)p; }
@@ -429,7 +465,43 @@ static unsigned drain_stdout(char *out, size_t size)
     return (unsigned)used;
 }
 
-static void test_final_after_writers_joined(void)
+static writer_t *destroy_writer;
+static pthread_t destroy_feedback;
+static bool destroy_saw_cleared, destroy_lock_free, destroy_saw_record;
+static char destroy_pre[16384];
+static unsigned destroy_pre_len;
+
+/* What ap2cl_destroy does first: stop and join the feedback worker. By then the
+ * owner has cleared every hook, holds no media lock, and nothing was emitted. */
+static void destroy_join_feedback(void)
+{
+    destroy_saw_cleared = set_write_cleared && set_outcome_cleared && set_raop_cleared;
+    destroy_lock_free = pthread_mutex_trylock(&g_audio_send_lock) == 0;
+    if (destroy_lock_free) pthread_mutex_unlock(&g_audio_send_lock);
+    atomic_store(&destroy_writer->run, false);
+    CHECK(pthread_join(destroy_feedback, NULL) == 0);
+    destroy_pre_len = drain_stdout(destroy_pre, sizeof(destroy_pre));
+    destroy_saw_record = strstr(destroy_pre, "@MEDIA1") != NULL;
+}
+
+static unsigned split_lines(char *out, char **last, unsigned *records)
+{
+    unsigned lines = 0;
+    char *saveptr = NULL;
+    *records = 0;
+    for (char *line = strtok_r(out, "\n", &saveptr); line; line = strtok_r(NULL, "\n", &saveptr)) {
+        lines++;
+        *last = line;
+        if (strncmp(line, "@MEDIA1 {", 9) == 0) (*records)++;
+        else CHECK(strncmp(line, "[EVENT] remote command=", 23) == 0);
+    }
+    return lines;
+}
+
+/* The production end-of-run sequence (finish_run, as main calls it) after a
+ * real STOP, with a remote-command writer still running until the client
+ * destroy joins it. */
+static void run_finish_scenario(bool destroy_ok, char *out, size_t size)
 {
     begin_session(true);
     handle_command("ACTION", "START", &cfg);
@@ -437,36 +509,91 @@ static void test_final_after_writers_joined(void)
 
     writer_t writer = { .hold_lock = false };
     atomic_store(&writer.run, true);
-    pthread_t feedback;
-    CHECK(pthread_create(&feedback, NULL, feedback_standin, &writer) == 0);
+    CHECK(pthread_create(&destroy_feedback, NULL, feedback_standin, &writer) == 0);
+    destroy_writer = &writer;
     while (atomic_load(&writer.events) < 5) sched_yield();
-    handle_command("ACTION", "STOP", &cfg); /* STOP/teardown while it writes */
-    mr_teardown(fake_client, NULL);
-    /* ap2cl_destroy's feedback join: after this no stdout writer exists. */
-    atomic_store(&writer.run, false);
-    CHECK(pthread_join(feedback, NULL) == 0);
+    handle_command("ACTION", "STOP", &cfg); /* STOP while it writes */
+    destroy_result = destroy_ok;
+    destroy_hook = destroy_join_feedback;
+    destroy_calls = 0;
+    destroy_saw_cleared = destroy_lock_free = destroy_saw_record = false;
+    cfg.cmdpipe = NULL;
+    CHECK(finish_run(&cfg, 0));
+    destroy_hook = NULL;
+    destroy_result = true;
+    CHECK(destroy_calls == 1 && g_ap2cl == NULL);
+    /* Ordering inside the production sequence. */
+    CHECK(destroy_saw_cleared && destroy_lock_free && !destroy_saw_record);
     end_session();
+    /* Everything the stand-in writer printed before the join, then the rest. */
+    CHECK(destroy_pre_len + 1 < size);
+    memcpy(out, destroy_pre, destroy_pre_len);
+    CHECK(drain_stdout(out + destroy_pre_len, size - destroy_pre_len) > 0);
+}
 
-    CHECK(mr_emit(&g_mr, true, stdout));
+static void test_final_after_writers_joined(void)
+{
     char out[16384];
-    unsigned used = drain_stdout(out, sizeof(out));
-    CHECK(used > 0);
-    unsigned records = 0, lines = 0;
-    char *saveptr = NULL;
     char *last = NULL;
-    for (char *line = strtok_r(out, "\n", &saveptr); line; line = strtok_r(NULL, "\n", &saveptr)) {
-        lines++;
-        last = line;
-        if (strncmp(line, "@MEDIA1 {", 9) == 0) records++;
-        else CHECK(strcmp(line, "[EVENT] remote command=play") == 0 ||
-                   strncmp(line, "[EVENT] remote command=", 23) == 0);
-    }
-    CHECK(records == 1 && lines >= 6);
+    unsigned records = 0;
+    char discard[16384];
+    (void)drain_stdout(discard, sizeof(discard));
+    run_finish_scenario(true, out, sizeof(out));
+    unsigned lines = split_lines(out, &last, &records);
+    CHECK(records == 1 && lines >= 2);
     CHECK(strncmp(last, "@MEDIA1 {", 9) == 0); /* single line, after the writer */
     CHECK(strstr(last, "\"terminal\":\"stop\"") && strstr(last, "\"fault\":false"));
     CHECK(strstr(last, "\"fresh_units\":4,\"fresh_bytes\":4000"));
     CHECK(strstr(last, "\"addr\":\"192.0.2.10\",\"port\":6001,\"setup_port\":6001"));
-    say("cli receipt: one final line after STOP/teardown and a joined stdout writer, real pipe");
+
+    /* A failed client destroy is an observed cleanup failure: merged fault. */
+    run_finish_scenario(false, out, sizeof(out));
+    (void)split_lines(out, &last, &records);
+    CHECK(records == 1 && strncmp(last, "@MEDIA1 {", 9) == 0);
+    CHECK(strstr(last, "\"terminal\":\"stop\"") && strstr(last, "\"fault\":true"));
+
+    /* A failed process result is a playback failure: abnormal. */
+    begin_session(true);
+    handle_command("ACTION", "START", &cfg);
+    sender_content(1, AP2_MEDIA_FRESH);
+    handle_command("ACTION", "STOP", &cfg);
+    CHECK(finish_run(&cfg, 1));
+    end_session();
+    CHECK(drain_stdout(out, sizeof(out)) > 0);
+    (void)split_lines(out, &last, &records);
+    CHECK(strstr(last, "\"terminal\":\"abnormal\"") && strstr(last, "\"fault\":true"));
+    say("cli receipt: finish_run emits one final line after STOP, hooks cleared, feedback writer joined by destroy, failed destroy/result merged");
+}
+
+/* Idle silence keeps its explicit IDLE label on the native lane; the nested
+ * RAOP lane cannot label it, so an ACTIVE collector goes incomplete. */
+static void test_silence_origin(void)
+{
+    uint8_t buf[352 * 4];
+    begin_session(true);
+    handle_command("ACTION", "START", &cfg);
+    tagged_calls = 0;
+    pthread_mutex_lock(&g_audio_send_lock);
+    CHECK(ap2_send_silence_chunk(&cfg, buf, NULL, 4));
+    pthread_mutex_unlock(&g_audio_send_lock);
+    CHECK(tagged_calls == 1 && last_origin == AP2_MEDIA_IDLE && last_tag == 0);
+    CHECK(!g_mr.fault);
+    end_session();
+
+    begin_session(true);
+    media_path = AP2_MEDIA_PATH_RAOP_COMPAT;
+    mr_install_ap2(fake_client);
+    pthread_mutex_lock(&g_audio_send_lock);
+    CHECK(ap2_send_silence_chunk(&cfg, buf, NULL, 4)); /* WAIT: not part of it */
+    pthread_mutex_unlock(&g_audio_send_lock);
+    CHECK(!g_mr.fault);
+    handle_command("ACTION", "START", &cfg);
+    pthread_mutex_lock(&g_audio_send_lock);
+    CHECK(ap2_send_silence_chunk(&cfg, buf, NULL, 4));
+    pthread_mutex_unlock(&g_audio_send_lock);
+    CHECK(g_mr.fault);
+    end_session();
+    say("cli receipt: idle silence keeps its IDLE label; unlabelled compat lane goes incomplete");
 }
 
 typedef struct {
@@ -539,6 +666,7 @@ int main(void)
     test_stop_freezes_before_transport();
     test_commit_failure_never_activates();
     test_registration_changes();
+    test_silence_origin();
     test_final_after_writers_joined();
     test_unjoined_writer_control();
     free(fake_client);

@@ -210,10 +210,16 @@ Coverage and accounting (each path is a real call path, not a test-only hook):
   terminal-invalid latches on any START (successful or failed, even one already
   buffered behind STOP), FLUSH/STANDBY/PAUSE/PLAY/DISCONNECT/ANNOUNCE, a second
   STOP, a missing client, a changed registration, a signal, a failed playback
-  loop or a session ended without STOP. The owner's one explicit unregister after
-  the command thread joins is normal and only in that teardown phase.
+  loop, a session ended without STOP or a failed client destroy/disconnect
+  observed by `finish_run`. The owner's one explicit unregister after the
+  command thread joins is normal and only in that teardown phase.
+- The nested RAOP hook reports every non-backlog send as fresh and cannot label
+  idle silence. Silence needs a hot splice line, which only the native flow has,
+  so the compat lane never sends it today; if it ever did, `ap2_send_silence_chunk`
+  makes an ACTIVE collector incomplete rather than counting it as fresh. This
+  narrows the contract's "use the RAOP hook's origin" for that one case.
 
-The record is written exactly once, from `main`, after the command thread
+The record is written exactly once, by `finish_run` (called from `main`), after the command thread
 joined, the callbacks were cleared and `ap2cl_destroy`/`raopcl_destroy` returned.
 That also joins the AirPlay 2 feedback worker, the only thread that can reach
 `remote_command_event`, so no other stdout writer exists. In order: stdout must
@@ -256,8 +262,12 @@ Tests use production code paths with owned loopback sockets, no receiver:
 - `make test-cli-media-receipt STATIC=1`: the production `cliairplay.c` command
   path with the real session engine: applied epoch, STOP freeze before the
   transport stop, post-freeze START success and failure, registration changes,
-  one final line after a real stdout writer thread was joined, and a control
-  where an unjoined writer blocks the emitter.
+  and the production `finish_run` sequence after a real STOP: hooks cleared
+  under the lock, a stand-in remote-command stdout writer joined by the client
+  destroy, then exactly one final line on a real pipe, with a failed destroy and
+  a failed result merged, plus a control where an unjoined writer blocks the
+  emitter. These are in-process fake clients and pipes, not a subprocess run
+  against a receiver.
 - `tests/test_ap2_session.c` covers the applied observer (failed commit, commit
   then ENDED, second START, send lock held).
 

@@ -4138,6 +4138,12 @@ ap2_commit_result_t ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms,
     return AP2_COMMIT_OK;
 }
 
+/* Every media hook set, even an identical one, changes the generation. */
+static void ap2_media_registration_bump(struct ap2cl_s *p)
+{
+    if (++p->media_reg_gen == 0) p->media_reg_gen = 1;
+}
+
 void ap2cl_set_media_write_cb(struct ap2cl_s *p, ap2_media_write_cb cb, void *ctx)
 {
     if (!p) return;
@@ -4146,7 +4152,7 @@ void ap2cl_set_media_write_cb(struct ap2cl_s *p, ap2_media_write_cb cb, void *ct
     p->buffered_notify = false;
     p->media_write_cb = cb;
     p->media_write_ctx = cb ? ctx : NULL;
-    if (++p->media_reg_gen == 0) p->media_reg_gen = 1;
+    ap2_media_registration_bump(p);
 }
 
 void ap2cl_set_media_outcome_cb(struct ap2cl_s *p, ap2_media_outcome_cb cb,
@@ -4156,7 +4162,7 @@ void ap2cl_set_media_outcome_cb(struct ap2cl_s *p, ap2_media_outcome_cb cb,
     /* Same caller-owned media serialization as ap2cl_set_media_write_cb. */
     p->media_outcome_cb = cb;
     p->media_outcome_ctx = cb ? ctx : NULL;
-    if (++p->media_reg_gen == 0) p->media_reg_gen = 1;
+    ap2_media_registration_bump(p);
 }
 
 ap2_media_path_t ap2cl_media_path(struct ap2cl_s *p)

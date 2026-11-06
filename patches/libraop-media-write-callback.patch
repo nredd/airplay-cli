@@ -1,5 +1,5 @@
 diff --git a/src/raop_client.c b/src/raop_client.c
-index 00acfad..472e2dd 100644
+index 00acfad..18c39a9 100644
 --- a/src/raop_client.c
 +++ b/src/raop_client.c
 @@ -165,6 +165,14 @@ typedef struct raopcl_s {
@@ -98,7 +98,7 @@ index 00acfad..472e2dd 100644
  		LOG_ERROR("[%p]: audio socket closed", p);
  		p->sane.audio.select++;
  	}
-@@ -646,20 +673,85 @@ bool _raopcl_send_audio(struct raopcl_s *p, rtp_audio_pkt_t *packet, int size)
+@@ -646,20 +673,92 @@ bool _raopcl_send_audio(struct raopcl_s *p, rtp_audio_pkt_t *packet, int size)
  		if (n != size) {
  			LOG_DEBUG("[%p]: error sending audio packet", p);
  			ret = false;
@@ -133,6 +133,13 @@ index 00acfad..472e2dd 100644
  }
  
 +/*----------------------------------------------------------------------------*/
++/* Every media hook set, even an identical one, changes the generation. */
++static void _raopcl_media_registration_bump(struct raopcl_s *p)
++{
++	if (++p->media_reg_gen == 0) p->media_reg_gen = 1;
++}
++
++/*----------------------------------------------------------------------------*/
 +void raopcl_set_media_write_cb(struct raopcl_s *p, raop_media_write_cb callback, void *ctx)
 +{
 +	if (!p) return;
@@ -140,7 +147,7 @@ index 00acfad..472e2dd 100644
 +	pthread_mutex_lock(&p->mutex);
 +	p->media_write_cb = callback;
 +	p->media_write_ctx = callback ? ctx : NULL;
-+	if (++p->media_reg_gen == 0) p->media_reg_gen = 1;
++	_raopcl_media_registration_bump(p);
 +	pthread_mutex_unlock(&p->mutex);
 +}
 +
@@ -152,7 +159,7 @@ index 00acfad..472e2dd 100644
 +	pthread_mutex_lock(&p->mutex);
 +	p->media_outcome_cb = callback;
 +	p->media_outcome_ctx = callback ? ctx : NULL;
-+	if (++p->media_reg_gen == 0) p->media_reg_gen = 1;
++	_raopcl_media_registration_bump(p);
 +	pthread_mutex_unlock(&p->mutex);
 +}
 +
@@ -185,7 +192,7 @@ index 00acfad..472e2dd 100644
  /*----------------------------------------------------------------------------*/
  struct raopcl_s *raopcl_create(struct in_addr host, uint16_t port_base, uint16_t port_range,
  							   char *DACP_id, char *active_remote,
-@@ -941,11 +1033,17 @@ static bool raopcl_analyse_setup(struct raopcl_s *p, key_data_t *setup_kd)
+@@ -941,11 +1040,17 @@ static bool raopcl_analyse_setup(struct raopcl_s *p, key_data_t *setup_kd)
  		rc = false;
  	}
  

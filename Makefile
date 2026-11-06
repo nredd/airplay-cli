@@ -628,11 +628,11 @@ test: test-ap2-media test-ap2-media-red
 # The terminal emitter and collector with its fcntl/fflush/write seams routed
 # through test hooks; the real syscalls still back every positive case.
 MEDIA_RECEIPT_TEST = build/tests/test_media_receipt
+MR_SEAM_DEFS = -Dfcntl=mr_test_fcntl -Dfflush=mr_test_fflush -Dwrite=mr_test_write
 build/tests/media_receipt_seams.o: src/media_receipt.c src/media_receipt.h \
 		$(RAOP_MEDIA_STAMP) Makefile
 	@mkdir -p build/tests
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -Dfcntl=mr_test_fcntl \
-		-Dfflush=mr_test_fflush -Dwrite=mr_test_write $< -c -o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $(MR_SEAM_DEFS) $< -c -o $@
 
 $(MEDIA_RECEIPT_TEST): tests/test_media_receipt.c build/tests/media_receipt_seams.o Makefile
 	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_media_receipt.c \
@@ -649,8 +649,7 @@ build/tests/media_receipt_success_only.c: src/media_receipt.c tests/media_receip
 
 build/tests/media_receipt_success_only.o: build/tests/media_receipt_success_only.c \
 		src/media_receipt.h $(RAOP_MEDIA_STAMP) Makefile
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -Isrc -Dfcntl=mr_test_fcntl \
-		-Dfflush=mr_test_fflush -Dwrite=mr_test_write $< -c -o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -Isrc $(MR_SEAM_DEFS) $< -c -o $@
 
 build/tests/test_media_receipt_success_only: tests/test_media_receipt.c \
 		build/tests/media_receipt_success_only.o Makefile

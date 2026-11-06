@@ -380,6 +380,12 @@ struct ap2cl_s {
     uint8_t *buffered_pending;  /* unwritten tail of the last framed packet */
     int buffered_pending_len;
     int buffered_pending_off;
+    /* Caller's media serialization owns registration and pending attribution.
+     * Pending frames never retain userdata or callback function pointers. */
+    ap2_media_write_cb media_write_cb;
+    void *media_write_ctx;
+    ap2_media_write_t buffered_write;
+    bool buffered_notify;
 
     /* Frozen realtime anchor line (PTP): the rtp<->wall mapping is fixed once
      * at stream start and every periodic time-announce extrapolates along it.
@@ -2844,7 +2850,14 @@ static int ap2_buffered_flush_pending(struct ap2cl_s *p)
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
             return 0;   /* SO_SNDTIMEO expired with a full kernel buffer */
         LOG_ERROR("[AP2] Buffered TCP write failed: %s", strerror(errno));
+        p->buffered_notify = false;
         return -1;
+    }
+    if (p->buffered_pending_len > 0 && p->buffered_notify) {
+        /* Clear before invoking: subsequent accept/quiesce calls cannot repeat
+         * the event. Setter invalidation prevents old-frame context adoption. */
+        p->buffered_notify = false;
+        p->media_write_cb(p->media_write_ctx, &p->buffered_write);
     }
     p->buffered_pending_len = 0;
     p->buffered_pending_off = 0;
@@ -2857,7 +2870,8 @@ static int ap2_buffered_flush_pending(struct ap2cl_s *p)
  * provides reliability; the pacing gate (ap2cl_accept_frames) provides flow
  * control, holding new frames while an unwritten tail is parked here. */
 static ap2_send_result_t ap2_buffered_send_chunk(
-    struct ap2cl_s *p, uint8_t *sample, int frames)
+    struct ap2cl_s *p, uint8_t *sample, int frames,
+    ap2_media_origin_t origin, uint64_t caller_tag)
 {
     if (p->buffered_sock < 0 || !p->alac) {
         LOG_ERROR("[AP2] Buffered audio channel is unavailable");
@@ -2945,6 +2959,23 @@ static ap2_send_result_t ap2_buffered_send_chunk(
     p->buffered_pending = frame;
     p->buffered_pending_len = total;
     p->buffered_pending_off = 0;
+    p->buffered_notify = p->media_write_cb != NULL;
+    p->buffered_write = (ap2_media_write_t){
+        .route = AP2_MEDIA_BUFFERED_TCP, .origin = origin,
+        .tag = caller_tag, .bytes = (size_t)total,
+    };
+    if (p->buffered_notify) {
+        socklen_t len = sizeof(p->buffered_write.destination);
+        p->buffered_write.destination_known =
+            getpeername(p->buffered_sock,
+                        (struct sockaddr *)&p->buffered_write.destination,
+                        &len) == 0 &&
+            len == sizeof(p->buffered_write.destination) &&
+            p->buffered_write.destination.sin_family == AF_INET;
+        if (!p->buffered_write.destination_known)
+            memset(&p->buffered_write.destination, 0,
+                   sizeof(p->buffered_write.destination));
+    }
     if (ap2_buffered_flush_pending(p) < 0) {
         free(p->buffered_pending);
         p->buffered_pending = NULL;
@@ -2969,9 +3000,11 @@ static ap2_send_result_t ap2_buffered_send_chunk(
 }
 
 static ap2_send_result_t ap2_native_send_chunk(
-    struct ap2cl_s *p, uint8_t *sample, int frames)
+    struct ap2cl_s *p, uint8_t *sample, int frames,
+    ap2_media_origin_t origin, uint64_t caller_tag)
 {
-    if (p->use_buffered) return ap2_buffered_send_chunk(p, sample, frames);
+    if (p->use_buffered)
+        return ap2_buffered_send_chunk(p, sample, frames, origin, caller_tag);
     if (p->data_sock < 0 || !p->alac || !p->hap) {
         LOG_ERROR("[AP2] Realtime audio session is incomplete");
         return AP2_SEND_FATAL;
@@ -3070,6 +3103,14 @@ static ap2_send_result_t ap2_native_send_chunk(
     free(pkt);
 
     if (result == AP2_SEND_SENT) {
+        if (p->media_write_cb) {
+            const ap2_media_write_t write = {
+                .route = AP2_MEDIA_REALTIME_UDP, .origin = origin,
+                .tag = caller_tag, .bytes = (size_t)actual_pkt_size,
+                .destination_known = true, .destination = p->data_addr,
+            };
+            p->media_write_cb(p->media_write_ctx, &write);
+        }
         p->audio_packets_sent++;
     } else if (result == AP2_SEND_DROPPED) {
         p->audio_packets_dropped++;
@@ -4090,8 +4131,25 @@ ap2_commit_result_t ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms,
     return AP2_COMMIT_OK;
 }
 
+void ap2cl_set_media_write_cb(struct ap2cl_s *p, ap2_media_write_cb cb, void *ctx)
+{
+    if (!p) return;
+    /* Existing native media serialization must be held by the caller. No
+     * queued frame can outlive its registration into a replacement context. */
+    p->buffered_notify = false;
+    p->media_write_cb = cb;
+    p->media_write_ctx = cb ? ctx : NULL;
+}
+
 ap2_send_result_t ap2cl_send_chunk(struct ap2cl_s *p, uint8_t *sample,
                                    int frames)
+{
+    return ap2cl_send_chunk_tagged(p, sample, frames, AP2_MEDIA_UNKNOWN, 0);
+}
+
+ap2_send_result_t ap2cl_send_chunk_tagged(struct ap2cl_s *p, uint8_t *sample,
+                                        int frames, ap2_media_origin_t origin,
+                                        uint64_t tag)
 {
     if (!p || p->state != AP2_STREAMING) {
         LOG_ERROR("[AP2] Audio send attempted outside a streaming session");
@@ -4099,7 +4157,7 @@ ap2_send_result_t ap2cl_send_chunk(struct ap2cl_s *p, uint8_t *sample,
     }
     if (p->flow == FLOW_NATIVE_AP2) {
         if (atomic_load(&p->rtsp_dead)) return AP2_SEND_FATAL;
-        ap2_send_result_t result = ap2_native_send_chunk(p, sample, frames);
+        ap2_send_result_t result = ap2_native_send_chunk(p, sample, frames, origin, tag);
         if (result == AP2_SEND_FATAL)
             atomic_store(&p->media_healthy, false);
         return result;

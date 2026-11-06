@@ -583,3 +583,39 @@ test-raop-media-red: directory build/tests/test_raop_media_no_notification
 
 test: test-raop-media test-raop-media-red
 .PHONY: test-raop-media test-raop-media-red
+
+AP2_MEDIA_TEST = build/tests/test_ap2_media_write
+AP2_MEDIA_OBJECTS = $(filter-out $(BUILDDIR)/ap2_io.o,$(CLIENT_TEST_OBJECTS))
+
+# Include the production client unit to exercise its private pending/quiesce
+# paths; compile the real IO unit with only syscall boundaries interposed.
+build/tests/test_ap2_media_write.o: tests/test_ap2_media_write.c src/ap2_client.c src/ap2_client.h $(RAOP_MEDIA_STAMP) Makefile
+	@mkdir -p build/tests
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -std=gnu11 $< -c -o $@
+
+build/tests/ap2_media_io.o: src/ap2_io.c src/ap2_io.h Makefile
+	@mkdir -p build/tests
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -Dsend=media_test_send \
+		-Dsendto=media_test_sendto -Dpoll=media_test_poll $< -c -o $@
+
+$(AP2_MEDIA_TEST): build/tests/test_ap2_media_write.o build/tests/ap2_media_io.o \
+		build/tests/cross_ssl.o $(AP2_MEDIA_OBJECTS) $(LIBCODECS_PATCHED) Makefile
+	$(CXX) build/tests/test_ap2_media_write.o build/tests/ap2_media_io.o \
+		build/tests/cross_ssl.o $(AP2_MEDIA_OBJECTS) \
+		$(filter-out $(OPENSSL)/libopenssl.a,$(LIBRARY)) \
+		$(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
+
+test-ap2-media: directory $(AP2_MEDIA_TEST)
+	$(AP2_MEDIA_TEST)
+
+# Same compiled production path: demonstrate the queued counter cannot stand
+# in for completion. Require the specific assertion, never a build failure.
+test-ap2-media-red: directory $(AP2_MEDIA_TEST)
+	@set +e; $(AP2_MEDIA_TEST) --counter-is-completion > build/tests/ap2-media-red.log 2>&1; \
+		rc=$$?; set -e; test $$rc -eq 1; \
+		if grep -Eq 'Sanitizer|runtime error:' build/tests/ap2-media-red.log; then exit 1; fi; \
+		grep -Eq '^FAIL line [0-9]+: c.count == 1$$' build/tests/ap2-media-red.log; \
+		printf 'Queued counter advanced with unwritten tail: intended completion assertion failed (exit 1)\n'
+
+test: test-ap2-media test-ap2-media-red
+.PHONY: test-ap2-media test-ap2-media-red

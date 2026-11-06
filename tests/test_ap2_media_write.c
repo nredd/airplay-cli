@@ -290,7 +290,17 @@ static void test_tcp(bool false_counter_claim)
     /* Paired negative: the old queued-packet counter has advanced, but the
      * callback MUST still be zero while the final byte is unwritten. */
     CHECK(p->audio_packets_sent == queued_before + 1);
-    if (false_counter_claim) CHECK(c.count == 1);
+    if (false_counter_claim) {
+        /* Retire the fixture before the intentional assertion exits. Linux
+         * LeakSanitizer must still reject real leaks, not our skipped cleanup.
+         * Clearing suppresses the pending partial frame without completing it;
+         * c.count remains the observation made with the tail still unwritten. */
+        ap2cl_set_media_write_cb(p, NULL, NULL);
+        CHECK(ap2cl_destroy(p));
+        CHECK(close(sink) == 0);
+        CHECK(c.count == 1);
+        return;
+    }
     CHECK(c.count == 0);
     CHECK(!ap2cl_accept_frames(p));
     CHECK(c.count == 0);

@@ -612,9 +612,14 @@ test-ap2-media: directory $(AP2_MEDIA_TEST)
 # in for completion. Require the specific assertion, never a build failure.
 test-ap2-media-red: directory $(AP2_MEDIA_TEST)
 	@set +e; $(AP2_MEDIA_TEST) --counter-is-completion > build/tests/ap2-media-red.log 2>&1; \
-		rc=$$?; set -e; test $$rc -eq 1; \
-		if grep -Eq 'Sanitizer|runtime error:' build/tests/ap2-media-red.log; then exit 1; fi; \
-		grep -Eq '^FAIL line [0-9]+: c.count == 1$$' build/tests/ap2-media-red.log; \
+		rc=$$?; set -e; \
+		if test $$rc -ne 1 || \
+			grep -Eq 'Sanitizer|runtime error:' build/tests/ap2-media-red.log || \
+			! grep -Eq '^FAIL line [0-9]+: c.count == 1$$' build/tests/ap2-media-red.log; then \
+			printf 'Native AP2 negative control rejected: exit=%s\n' "$$rc" >&2; \
+			LC_ALL=C awk 'NR <= 20 { gsub(/\/[^[:space:]]+/, "<path>"); print substr($$0, 1, 240) } NR == 21 { print "[negative log truncated]"; exit }' build/tests/ap2-media-red.log >&2; \
+			exit 1; \
+		fi; \
 		printf 'Queued counter advanced with unwritten tail: intended completion assertion failed (exit 1)\n'
 
 test: test-ap2-media test-ap2-media-red

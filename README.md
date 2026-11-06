@@ -145,6 +145,12 @@ flush/resume, quiesce/discard, reconnect/cancel and serialized context clearing.
 `make test-ap2-media-red STATIC=1` runs the same built fixture with an intentional
 false completion assertion: the queued counter advances with an unwritten tail
 while the new callback remains zero. It must fail at that assertion, not build.
+The negative fixture clears registration, destroys its client and closes the
+peer before the intentional assertion exits, so Linux LeakSanitizer can retain
+its normal leak checks. The target still requires exit 1, the exact assertion
+and no sanitizer report. Rejected controls print the exit status and at most
+20 log lines of 240 characters, with path tokens redacted; the full local log
+remains in `build/tests/ap2-media-red.log`.
 Both targets run under the unchanged normal and Linux sanitizer `make test`
 gates; architecture CI gates remain unchanged.
 
